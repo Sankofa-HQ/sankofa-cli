@@ -1,0 +1,35 @@
+{
+  "name": "sankofa-cli",
+  "version": "0.1.0",
+  "description": "Sankofa Deploy CLI — push OTA updates to your React Native apps",
+  "bin": {
+    "sankofa": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "type": "module",
+  "keywords": ["sankofa", "ota", "deploy", "react-native", "codepush"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "commander": "^12.0.0",
+    "chalk": "^5.3.0",
+    "ora": "^8.0.0",
+    "inquirer": "^9.2.0",
+    "form-data": "^4.0.0",
+    "node-fetch": "^3.3.0",
+    "cli-progress": "^3.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/inquirer": "^9.0.0",
+    "@types/cli-progress": "^3.11.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0"
+  }
+}
