@@ -2,6 +2,7 @@
 export interface GlobalConfig {
     apiKey?: string;
     endpoint?: string;
+    projectId?: string;
 }
 /** Per-project config stored in .sankofa.json in the project root */
 export interface ProjectConfig {
@@ -22,4 +23,5 @@ export declare function saveProjectConfig(cfg: ProjectConfig): void;
 export declare function resolveAuth(): {
     apiKey: string;
     endpoint: string;
+    projectId: string;
 };

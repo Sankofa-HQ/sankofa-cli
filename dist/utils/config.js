@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join, resolve } from 'path';
 const GLOBAL_DIR = join(homedir(), '.sankofa');
@@ -14,7 +14,6 @@ export function loadGlobalConfig() {
     return {};
 }
 export function saveGlobalConfig(cfg) {
-    const { mkdirSync } = require('fs');
     mkdirSync(GLOBAL_DIR, { recursive: true });
     writeFileSync(GLOBAL_CREDS, JSON.stringify(cfg, null, 2));
 }
@@ -50,13 +49,15 @@ export function saveProjectConfig(cfg) {
 export function resolveAuth() {
     const envKey = process.env.SANKOFA_API_KEY;
     const envEndpoint = process.env.SANKOFA_ENDPOINT;
+    const envProject = process.env.SANKOFA_PROJECT_ID;
     const project = findProjectConfig();
     const global = loadGlobalConfig();
     const apiKey = envKey || project?.apiKey || global.apiKey;
     const endpoint = envEndpoint || project?.endpoint || global.endpoint || 'https://api.sankofa.dev';
+    const projectId = envProject || project?.projectId || global.projectId || '';
     if (!apiKey) {
         throw new Error('No API key found. Run `sankofa login` or set SANKOFA_API_KEY env var.');
     }
-    return { apiKey, endpoint };
+    return { apiKey, endpoint, projectId };
 }
 //# sourceMappingURL=config.js.map

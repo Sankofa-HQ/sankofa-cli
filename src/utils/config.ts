@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join, resolve } from 'path';
 
@@ -6,6 +6,7 @@ import { join, resolve } from 'path';
 export interface GlobalConfig {
   apiKey?: string;
   endpoint?: string;
+  projectId?: string;
 }
 
 /** Per-project config stored in .sankofa.json in the project root */
@@ -29,7 +30,6 @@ export function loadGlobalConfig(): GlobalConfig {
 }
 
 export function saveGlobalConfig(cfg: GlobalConfig): void {
-  const { mkdirSync } = require('fs');
   mkdirSync(GLOBAL_DIR, { recursive: true });
   writeFileSync(GLOBAL_CREDS, JSON.stringify(cfg, null, 2));
 }
@@ -63,15 +63,17 @@ export function saveProjectConfig(cfg: ProjectConfig): void {
  * 2. .sankofa.json in the project root
  * 3. ~/.sankofa/credentials.json (global login)
  */
-export function resolveAuth(): { apiKey: string; endpoint: string } {
+export function resolveAuth(): { apiKey: string; endpoint: string; projectId: string } {
   const envKey = process.env.SANKOFA_API_KEY;
   const envEndpoint = process.env.SANKOFA_ENDPOINT;
+  const envProject = process.env.SANKOFA_PROJECT_ID;
 
   const project = findProjectConfig();
   const global = loadGlobalConfig();
 
   const apiKey = envKey || project?.apiKey || global.apiKey;
   const endpoint = envEndpoint || project?.endpoint || global.endpoint || 'https://api.sankofa.dev';
+  const projectId = envProject || project?.projectId || global.projectId || '';
 
   if (!apiKey) {
     throw new Error(
@@ -79,5 +81,5 @@ export function resolveAuth(): { apiKey: string; endpoint: string } {
     );
   }
 
-  return { apiKey, endpoint };
+  return { apiKey, endpoint, projectId };
 }

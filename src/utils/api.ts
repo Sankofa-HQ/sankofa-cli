@@ -24,19 +24,27 @@ async function apiFetch(path: string, opts: FetchOptions = {}): Promise<Response
   });
 }
 
+/** Build standard auth headers for dashboard API calls */
+function getAuthHeaders(): Record<string, string> {
+  const { apiKey, projectId } = resolveAuth();
+  return {
+    'Authorization': `Bearer ${apiKey}`,
+    'x-api-key': apiKey,
+    ...(projectId ? { 'x-project-id': projectId } : {}),
+  };
+}
+
 /** List releases for the current project */
 export async function listReleases(env: string = 'live', platform?: string): Promise<any[]> {
-  const { apiKey, endpoint } = resolveAuth();
-  const params = new URLSearchParams({ environment: env });
+  const { apiKey, endpoint, projectId } = resolveAuth();
+  if (!projectId) {
+    throw new Error('No project selected. Run `sankofa login` and select a project.');
+  }
+  const params = new URLSearchParams({ projectId, environment: env });
   if (platform) params.set('platform', platform);
 
-  // Dashboard API uses JWT but CLI uses API key → use the SDK-facing approach
-  // We query via the dashboard API with the API key as bearer token
   const res = await fetch(`${endpoint}/api/v1/deploy/releases?${params}`, {
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'x-api-key': apiKey,
-    },
+    headers: getAuthHeaders(),
   });
 
   if (!res.ok) {
@@ -60,7 +68,10 @@ export async function uploadRelease(
   },
   onProgress?: (uploaded: number, total: number) => void,
 ): Promise<any> {
-  const { apiKey, endpoint } = resolveAuth();
+  const { apiKey, endpoint, projectId } = resolveAuth();
+  if (!projectId) {
+    throw new Error('No project selected. Run `sankofa login` and select a project.');
+  }
 
   const stats = statSync(bundlePath);
   const totalSize = stats.size;
@@ -78,11 +89,10 @@ export async function uploadRelease(
     rollout_percentage: metadata.rollout_percentage ?? 100,
   }));
 
-  const res = await fetch(`${endpoint}/api/v1/deploy/releases`, {
+  const res = await fetch(`${endpoint}/api/v1/deploy/releases?projectId=${projectId}`, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'x-api-key': apiKey,
+      ...getAuthHeaders(),
       ...form.getHeaders(),
     },
     body: form as any,
@@ -105,12 +115,11 @@ export async function updateRelease(
     is_disabled?: boolean;
   },
 ): Promise<any> {
-  const { apiKey, endpoint } = resolveAuth();
-  const res = await fetch(`${endpoint}/api/v1/deploy/releases/${releaseId}`, {
+  const { endpoint, projectId } = resolveAuth();
+  const res = await fetch(`${endpoint}/api/v1/deploy/releases/${releaseId}?projectId=${projectId}`, {
     method: 'PATCH',
     headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'x-api-key': apiKey,
+      ...getAuthHeaders(),
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(updates),
