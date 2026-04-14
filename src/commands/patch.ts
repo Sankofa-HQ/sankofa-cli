@@ -1,10 +1,10 @@
 import { Command } from 'commander';
 import { join } from 'path';
-import { existsSync, mkdirSync } from 'fs';
 import {
   bundleJS,
-  detectEntryFile,
+  clearBuildArtifacts,
   computeSHA256,
+  detectEntryFile,
   formatBytes,
   getFileSize,
 } from '../utils/bundler.js';
@@ -119,7 +119,14 @@ export const patchCommand = new Command('patch')
 
     // 4. Bundle JS
     const outputDir = opts.outputDir;
-    if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
+    const cleanSpinner = ora('Clearing build caches...').start();
+    try {
+      clearBuildArtifacts(outputDir);
+      cleanSpinner.succeed('Build caches cleared');
+    } catch (err: any) {
+      cleanSpinner.fail(`Failed to clear build caches: ${err.message}`);
+      process.exit(1);
+    }
 
     const bundlePath = join(outputDir, `patch.${platform}.jsbundle`);
     const bundleSpinner = ora('Bundling JavaScript...').start();

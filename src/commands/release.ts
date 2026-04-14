@@ -1,12 +1,12 @@
 import { Command } from 'commander';
 import { join } from 'path';
-import { existsSync, mkdirSync } from 'fs';
 import {
+  buildNativePreviewArtifact,
+  bundleJS,
+  clearBuildArtifacts,
+  computeSHA256,
   detectAppVersion,
   detectEntryFile,
-  bundleJS,
-  buildNativePreviewArtifact,
-  computeSHA256,
   formatBytes,
   getFileSize,
   type NativePreviewArtifact,
@@ -86,7 +86,14 @@ export const releaseCommand = new Command('release')
     // 3. Build the native preview artifact. This does not install, launch, or
     // start Metro; it only creates the deployed artifact used by `preview`.
     const outputDir = opts.outputDir;
-    if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
+    const cleanSpinner = ora('Clearing build caches...').start();
+    try {
+      clearBuildArtifacts(outputDir);
+      cleanSpinner.succeed('Build caches cleared');
+    } catch (err: any) {
+      cleanSpinner.fail(`Failed to clear build caches: ${err.message}`);
+      process.exit(1);
+    }
 
     let nativeArtifact: NativePreviewArtifact | null = null;
     if (opts.nativeArtifact !== false) {

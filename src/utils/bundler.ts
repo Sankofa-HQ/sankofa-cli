@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'fs';
 import { basename, dirname, join } from 'path';
 import { createHash } from 'crypto';
 
@@ -148,6 +148,35 @@ export function detectAppId(platform: Platform): string | null {
   return null;
 }
 
+/**
+ * Nuke every piece of cached state that has ever caused a release or patch to
+ * ship stale JS or native code: the CLI's own output directory, Metro/Expo
+ * transformer caches, iOS build/DerivedData, and Android's build + Gradle
+ * caches. Called unconditionally before every release and patch — users have
+ * been burned enough times by "I ran patch and nothing changed" to justify
+ * the extra rebuild cost.
+ */
+export function clearBuildArtifacts(outputDir: string): void {
+  const cwd = process.cwd();
+  const targets = [
+    outputDir,
+    join(cwd, 'node_modules', '.cache'),
+    join(cwd, '.expo'),
+    join(cwd, 'ios', 'build'),
+    join(cwd, 'android', 'app', 'build'),
+    join(cwd, 'android', 'build'),
+    join(cwd, 'android', '.gradle'),
+  ];
+  for (const target of targets) {
+    if (existsSync(target)) {
+      try {
+        rmSync(target, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+  mkdirSync(outputDir, { recursive: true });
+}
+
 function projectUsesExpo(): boolean {
   if (existsSync(join(process.cwd(), 'node_modules', 'expo'))) return true;
   const pkgPath = join(process.cwd(), 'package.json');
@@ -178,7 +207,7 @@ export function bundleJS(
   const cli = isExpo ? 'expo export:embed' : 'react-native bundle';
   try {
     execSync(
-      `npx --no-install ${cli} --platform ${platform} --entry-file ${entryFile} --bundle-output ${outputPath} --dev false`,
+      `npx --no-install ${cli} --platform ${platform} --entry-file ${entryFile} --bundle-output ${outputPath} --dev false --reset-cache`,
       { stdio: 'inherit' },
     );
   } catch (err: any) {
@@ -255,6 +284,29 @@ function findAppInDirectory(root: string): string | null {
   return findFirstPath(root, (path) => path.endsWith('.app'));
 }
 
+function collectJSBundles(root: string): string[] {
+  const found: string[] = [];
+  const walk = (dir: string) => {
+    if (!existsSync(dir)) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(path);
+      } else if (entry.isFile() && entry.name.endsWith('.jsbundle')) {
+        found.push(path);
+      }
+    }
+  };
+  walk(root);
+  return found;
+}
+
 /**
  * Build an installable native preview artifact without installing or launching.
  * The artifact is uploaded with a Deploy release so `sankofa preview` can install
@@ -300,8 +352,10 @@ export function buildNativePreviewArtifact(
 
   const gradlew = join(process.cwd(), 'android', 'gradlew');
   const gradleExecutable = existsSync(gradlew) ? './gradlew' : 'gradle';
+  const androidDir = join(process.cwd(), 'android');
+  execSync(`${gradleExecutable} clean`, { cwd: androidDir, stdio: 'inherit' });
   execSync(`${gradleExecutable} assembleRelease`, {
-    cwd: join(process.cwd(), 'android'),
+    cwd: androidDir,
     stdio: 'inherit',
   });
 
@@ -361,13 +415,33 @@ export function installAndLaunchNativePreviewArtifact(
       throw new Error(`Unsupported iOS preview artifact kind: ${opts.artifactKind || 'missing'}`);
     }
     const extractDir = join(dirname(opts.artifactPath), `${basename(opts.artifactPath).replace(/[^A-Za-z0-9._-]/g, '_')}.unzipped`);
+    if (existsSync(extractDir)) {
+      rmSync(extractDir, { recursive: true, force: true });
+    }
     mkdirSync(extractDir, { recursive: true });
     execSync(`ditto -x -k ${shellQuote(opts.artifactPath)} ${shellQuote(extractDir)}`, { stdio: 'inherit' });
     const appPath = findAppInDirectory(extractDir);
     if (!appPath) {
       throw new Error('Downloaded iOS preview artifact did not contain a .app bundle.');
     }
+
+    // Physically replace every embedded .jsbundle inside the .app with the patch
+    // bundle. This guarantees the patched JS runs even when the deployed native
+    // artifact predates the SankofaDeployBundleProvider hook in AppDelegate.
+    if (opts.previewBundlePath) {
+      const embedded = collectJSBundles(appPath);
+      const targets = embedded.length > 0 ? embedded : [join(appPath, 'main.jsbundle')];
+      for (const target of targets) {
+        copyFileSync(opts.previewBundlePath, target);
+      }
+    }
+
     const device = opts.device || 'booted';
+    // Uninstall first so the simulator never reuses a cached binary or stale
+    // embedded JS bundle from a previous preview run.
+    try {
+      execSync(`xcrun simctl uninstall ${shellQuote(device)} ${shellQuote(opts.appId)}`, { stdio: 'ignore' });
+    } catch {}
     execSync(`xcrun simctl install ${shellQuote(device)} ${shellQuote(appPath)}`, { stdio: 'inherit' });
     if (opts.previewBundlePath && opts.previewLabel) {
       seedIOSPreviewBundle(device, opts.appId, opts.previewBundlePath, opts.previewLabel);
