@@ -329,6 +329,16 @@ export function buildNativePreviewArtifact(
       throw new Error('Could not detect an iOS scheme to build.');
     }
 
+    // Re-run pod install so CocoaPods regenerates React codegen headers and
+    // Pods.xcconfig after `clearBuildArtifacts` wiped `ios/build`. Without
+    // this, Pods' ReactCodegen target compiles against stale generated files.
+    const iosDir = join(process.cwd(), 'ios');
+    const podfileExists = existsSync(join(iosDir, 'Podfile'));
+    if (podfileExists) {
+      const podCmd = existsSync(join(iosDir, 'Gemfile')) ? 'bundle exec pod install' : 'pod install';
+      execSync(podCmd, { cwd: iosDir, stdio: 'inherit' });
+    }
+
     const derivedDataPath = join(outputDir, 'sankofa-ios-preview-derived-data');
     const projectArg = workspace
       ? `-workspace ${shellQuote(workspace)}`
