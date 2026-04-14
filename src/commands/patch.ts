@@ -10,7 +10,12 @@ import {
 } from '../utils/bundler.js';
 import { listReleases, uploadRelease } from '../utils/api.js';
 import { resolveEnvironmentPrompt } from '../utils/prompts.js';
+import { resolveRNProjectRoot } from '../utils/project.js';
 import { escapeRegExp, normalizePlatform, parseRollout } from '../utils/validation.js';
+
+function isPatchRelease(release: any): boolean {
+  return /-patch\.\d+$/.test(String(release.label || ''));
+}
 
 export const patchCommand = new Command('patch')
   .description('Push an OTA patch to an existing release (JavaScript only — no native changes)')
@@ -22,6 +27,7 @@ export const patchCommand = new Command('patch')
   .option('--rollout <percent>', 'Initial rollout percentage (0-100)', '100')
   .option('--publish', 'Auto-publish without prompting')
   .option('--env <environment>', 'Target environment: live or test')
+  .option('--project <path>', 'Path to the React Native app directory (defaults to auto-detect)')
   .action(async (platformArg: string, opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
@@ -38,23 +44,34 @@ export const patchCommand = new Command('patch')
       console.error(chalk.red(err.message));
       process.exit(1);
     }
+
+    try {
+      const project = await resolveRNProjectRoot(opts.project);
+      process.chdir(project.root);
+    } catch (err: any) {
+      console.error(chalk.red(err.message));
+      process.exit(1);
+    }
+
     const entryFile = detectEntryFile(opts.entryFile);
 
     // 1. Fetch existing releases
     const spinner = ora('Fetching releases...').start();
     let releases: any[];
+    let baseReleases: any[];
     try {
       releases = await listReleases(environment, platform);
+      baseReleases = releases.filter((release: any) => !isPatchRelease(release));
     } catch (err: any) {
       spinner.fail(`Failed to fetch releases: ${err.message}`);
       process.exit(1);
     }
 
-    if (releases.length === 0) {
+    if (baseReleases.length === 0) {
       spinner.fail(`No releases found for ${platform}. Run ${chalk.cyan('sankofa release ' + platform)} first.`);
       process.exit(1);
     }
-    spinner.succeed(`Found ${releases.length} release(s)`);
+    spinner.succeed(`Found ${baseReleases.length} base release(s)`);
 
     // 2. Let user pick a release to patch
     const { selectedRelease } = await inquirer.prompt([
@@ -62,7 +79,7 @@ export const patchCommand = new Command('patch')
         type: 'list',
         name: 'selectedRelease',
         message: 'Select a release to patch:',
-        choices: releases.map((r: any) => ({
+        choices: baseReleases.map((r: any) => ({
           name: `${r.label} (${r.is_disabled ? 'Disabled' : 'Active'}, ${r.total_installs ?? 0} installs, target: ${r.target_binary_version})`,
           value: r,
         })),
@@ -121,7 +138,7 @@ export const patchCommand = new Command('patch')
     console.log(chalk.dim(`  Size:   ${formatBytes(size)}`));
 
     // 6. Generate patch label
-    const baseLabel = selectedRelease.label.replace(/-patch\.\d+$/, '');
+    const baseLabel = selectedRelease.label;
     const patchPattern = new RegExp(`^${escapeRegExp(baseLabel)}-patch\\.(\\d+)$`);
     const maxPatchNumber = releases
       .filter((r: any) =>

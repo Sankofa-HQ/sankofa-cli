@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'fs';
 import { basename, dirname, join } from 'path';
 import { createHash } from 'crypto';
 
@@ -148,28 +148,44 @@ export function detectAppId(platform: Platform): string | null {
   return null;
 }
 
+function projectUsesExpo(): boolean {
+  if (existsSync(join(process.cwd(), 'node_modules', 'expo'))) return true;
+  const pkgPath = join(process.cwd(), 'package.json');
+  if (!existsSync(pkgPath)) return false;
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    return !!deps.expo;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Bundle the JS using Metro (React Native's bundler).
  * Works for both Expo and bare RN projects.
+ *
+ * Uses `npx --no-install` so we fail loudly if the bundler is missing from the
+ * project, instead of letting npx auto-install `react-native` into the current
+ * working directory.
  */
 export function bundleJS(
   platform: Platform,
   entryFile: string,
   outputPath: string,
 ): void {
-  const isExpo = existsSync(join(process.cwd(), 'node_modules', 'expo'));
-
-  if (isExpo) {
-    // Expo: use npx expo export:embed
+  const isExpo = projectUsesExpo();
+  const cli = isExpo ? 'expo export:embed' : 'react-native bundle';
+  try {
     execSync(
-      `npx expo export:embed --platform ${platform} --entry-file ${entryFile} --bundle-output ${outputPath} --dev false`,
+      `npx --no-install ${cli} --platform ${platform} --entry-file ${entryFile} --bundle-output ${outputPath} --dev false`,
       { stdio: 'inherit' },
     );
-  } else {
-    // Bare RN: use react-native bundle
-    execSync(
-      `npx react-native bundle --platform ${platform} --entry-file ${entryFile} --bundle-output ${outputPath} --dev false`,
-      { stdio: 'inherit' },
+  } catch (err: any) {
+    const tool = isExpo ? 'expo' : 'react-native';
+    throw new Error(
+      `${tool} bundler is not available in ${process.cwd()}. ` +
+        `Install project dependencies (e.g. \`npm install\`) in the React Native app directory before running this command.`,
     );
   }
 }
@@ -334,6 +350,9 @@ export function installAndLaunchNativePreviewArtifact(
     appId: string;
     artifactPath: string;
     artifactKind: string;
+    previewBundlePath?: string;
+    previewLabel?: string;
+    clearDeployState?: boolean;
     device?: string;
   },
 ): void {
@@ -348,11 +367,14 @@ export function installAndLaunchNativePreviewArtifact(
     if (!appPath) {
       throw new Error('Downloaded iOS preview artifact did not contain a .app bundle.');
     }
-    installAndLaunchNativePreview(platform, {
-      appId: opts.appId,
-      binary: appPath,
-      device: opts.device,
-    });
+    const device = opts.device || 'booted';
+    execSync(`xcrun simctl install ${shellQuote(device)} ${shellQuote(appPath)}`, { stdio: 'inherit' });
+    if (opts.previewBundlePath && opts.previewLabel) {
+      seedIOSPreviewBundle(device, opts.appId, opts.previewBundlePath, opts.previewLabel);
+    } else if (opts.clearDeployState) {
+      clearIOSDeployState(device, opts.appId);
+    }
+    execSync(`xcrun simctl launch ${shellQuote(device)} ${shellQuote(opts.appId)}`, { stdio: 'inherit' });
     return;
   }
 
@@ -364,6 +386,52 @@ export function installAndLaunchNativePreviewArtifact(
     binary: opts.artifactPath,
     device: opts.device,
   });
+}
+
+function deleteIOSDefault(device: string, appId: string, key: string): void {
+  try {
+    execSync(`xcrun simctl spawn ${shellQuote(device)} defaults delete ${shellQuote(appId)} ${shellQuote(key)}`, { stdio: 'ignore' });
+  } catch {}
+}
+
+function clearIOSDeployState(device: string, appId: string): void {
+  for (const key of [
+    'sankofa_deploy_bundle_path',
+    'sankofa:deploy:current_label',
+    'sankofa:deploy:current_bundle_path',
+    'sankofa:deploy:previous_label',
+    'sankofa:deploy:previous_bundle_path',
+    'sankofa:deploy:pending_label',
+    'sankofa:deploy:pending_bundle_path',
+    'sankofa:deploy:rolled_back_label',
+    'sankofa:deploy:crash_count',
+    'sankofa:deploy:last_boot_time',
+    'sankofa:deploy:boot_confirmed',
+  ]) {
+    deleteIOSDefault(device, appId, key);
+  }
+}
+
+function seedIOSPreviewBundle(device: string, appId: string, bundlePath: string, label: string): void {
+  clearIOSDeployState(device, appId);
+
+  const dataContainer = execSync(
+    `xcrun simctl get_app_container ${shellQuote(device)} ${shellQuote(appId)} data`,
+    { encoding: 'utf-8' },
+  ).trim();
+  if (!dataContainer) {
+    throw new Error(`Could not resolve iOS simulator data container for ${appId}`);
+  }
+
+  const previewDir = join(dataContainer, 'Library', 'Application Support', 'SankofaDeployPreview');
+  mkdirSync(previewDir, { recursive: true });
+  const seededBundlePath = join(previewDir, `${safeArtifactName(label)}.jsbundle`);
+  copyFileSync(bundlePath, seededBundlePath);
+
+  execSync(`xcrun simctl spawn ${shellQuote(device)} defaults write ${shellQuote(appId)} sankofa_deploy_bundle_path -string ${shellQuote(seededBundlePath)}`);
+  execSync(`xcrun simctl spawn ${shellQuote(device)} defaults write ${shellQuote(appId)} 'sankofa:deploy:current_label' -string ${shellQuote(label)}`);
+  execSync(`xcrun simctl spawn ${shellQuote(device)} defaults write ${shellQuote(appId)} 'sankofa:deploy:current_bundle_path' -string ${shellQuote(seededBundlePath)}`);
+  execSync(`xcrun simctl spawn ${shellQuote(device)} defaults write ${shellQuote(appId)} 'sankofa:deploy:boot_confirmed' -string true`);
 }
 
 /**

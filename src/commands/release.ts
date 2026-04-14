@@ -13,6 +13,7 @@ import {
 } from '../utils/bundler.js';
 import { uploadRelease } from '../utils/api.js';
 import { resolveEnvironmentPrompt } from '../utils/prompts.js';
+import { resolveRNProjectRoot } from '../utils/project.js';
 import { normalizePlatform, parseRollout } from '../utils/validation.js';
 
 export const releaseCommand = new Command('release')
@@ -26,6 +27,7 @@ export const releaseCommand = new Command('release')
   .option('--rollout <percent>', 'Initial rollout percentage (0-100)', '100')
   .option('--publish', 'Auto-publish without prompting')
   .option('--env <environment>', 'Target environment: live or test')
+  .option('--project <path>', 'Path to the React Native app directory (defaults to auto-detect)')
   .action(async (platformArg: string, opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
@@ -41,6 +43,15 @@ export const releaseCommand = new Command('release')
       console.error(chalk.red(err.message));
       process.exit(1);
     }
+
+    try {
+      const project = await resolveRNProjectRoot(opts.project);
+      process.chdir(project.root);
+    } catch (err: any) {
+      console.error(chalk.red(err.message));
+      process.exit(1);
+    }
+
     const entryFile = detectEntryFile(opts.entryFile);
 
     // 1. Detect app version

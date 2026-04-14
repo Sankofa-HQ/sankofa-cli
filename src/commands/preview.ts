@@ -13,6 +13,7 @@ import {
 } from '../utils/bundler.js';
 import { getRelease, listReleases } from '../utils/api.js';
 import { resolveEnvironmentPrompt } from '../utils/prompts.js';
+import { resolveRNProjectRoot } from '../utils/project.js';
 import { normalizePlatform } from '../utils/validation.js';
 
 function safeFilePart(value: string): string {
@@ -45,6 +46,7 @@ export const previewCommand = new Command('preview')
   .option('--device <device>', 'iOS simulator UDID/name or Android device serial. Defaults to booted/default device')
   .option('--output-dir <dir>', 'Directory for downloaded release artifacts', './build')
   .option('--skip-install', 'Only download and verify the selected release bundle')
+  .option('--project <path>', 'Path to the React Native app directory (defaults to auto-detect)')
   .action(async (platformArg: string, opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
@@ -55,6 +57,14 @@ export const previewCommand = new Command('preview')
     try {
       platform = normalizePlatform(platformArg) as Platform;
       environment = await resolveEnvironmentPrompt(opts.env);
+    } catch (err: any) {
+      console.error(chalk.red(err.message));
+      process.exit(1);
+    }
+
+    try {
+      const project = await resolveRNProjectRoot(opts.project);
+      process.chdir(project.root);
     } catch (err: any) {
       console.error(chalk.red(err.message));
       process.exit(1);
@@ -165,6 +175,7 @@ export const previewCommand = new Command('preview')
     if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
 
     const artifactPath = join(outputDir, `${safeFilePart(selectedRelease.label)}.${platform}.jsbundle.gz`);
+    const activeBundlePath = join(outputDir, `${safeFilePart(selectedRelease.label)}.${platform}.jsbundle`);
     const downloadSpinner = ora('Downloading release bundle...').start();
     try {
       const response = await fetch(detail.download_url);
@@ -179,6 +190,7 @@ export const previewCommand = new Command('preview')
       if (selectedRelease.bundle_sha256 && actualSHA !== selectedRelease.bundle_sha256) {
         throw new Error(`SHA256 mismatch: expected=${selectedRelease.bundle_sha256} actual=${actualSHA}`);
       }
+      writeFileSync(activeBundlePath, uncompressed);
       downloadSpinner.succeed(`Downloaded and verified ${formatBytes(getFileSize(artifactPath))}`);
     } catch (err: any) {
       downloadSpinner.fail(`Failed to download release bundle: ${err.message}`);
@@ -220,7 +232,7 @@ export const previewCommand = new Command('preview')
     console.log(`  Platform:    ${chalk.bold(platform)}`);
     console.log(`  App version: ${chalk.bold(appVersion)}`);
     console.log(`  Environment: ${chalk.bold(environment)}`);
-    console.log(`  Bundle:      ${chalk.dim(artifactPath)}`);
+    console.log(`  Bundle:      ${isPatchRelease(selectedRelease) ? chalk.dim(activeBundlePath) : chalk.dim('embedded native bundle, then normal update check')}`);
     if (nativeArtifactPath) {
       console.log(`  Native app:  ${chalk.dim(nativeArtifactPath)}`);
     }
@@ -238,9 +250,16 @@ export const previewCommand = new Command('preview')
         appId,
         artifactPath: nativeArtifactPath,
         artifactKind: nativeArtifactKind,
+        previewBundlePath: isPatchRelease(selectedRelease) ? activeBundlePath : undefined,
+        previewLabel: isPatchRelease(selectedRelease) ? selectedRelease.label : undefined,
+        clearDeployState: !isPatchRelease(selectedRelease),
         device: opts.device,
       });
-      console.log(chalk.green('\n  Native preview app launched from the deployed Sankofa artifact.\n'));
+      if (isPatchRelease(selectedRelease)) {
+        console.log(chalk.green(`\n  Native preview app launched with ${selectedRelease.label} preloaded.\n`));
+      } else {
+        console.log(chalk.green(`\n  Native preview app launched as a fresh install for ${selectedRelease.label}. Available patches for this version can now download through the normal SDK update path.\n`));
+      }
     } catch (err: any) {
       console.error(chalk.red(`\n  Native preview failed: ${err.message}`));
       console.log(chalk.dim('  Preview does not rebuild local source. Republish the release if the deployed native artifact is missing or invalid.'));
