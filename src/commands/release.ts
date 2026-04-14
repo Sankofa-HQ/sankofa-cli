@@ -3,35 +3,45 @@ import { join } from 'path';
 import { existsSync, mkdirSync } from 'fs';
 import {
   detectAppVersion,
+  detectEntryFile,
   bundleJS,
-  buildNative,
+  buildNativePreviewArtifact,
   computeSHA256,
   formatBytes,
   getFileSize,
-  type Platform,
+  type NativePreviewArtifact,
 } from '../utils/bundler.js';
 import { uploadRelease } from '../utils/api.js';
+import { resolveEnvironmentPrompt } from '../utils/prompts.js';
+import { normalizePlatform, parseRollout } from '../utils/validation.js';
 
 export const releaseCommand = new Command('release')
-  .description('Create a new release (builds native binary + uploads JS bundle to Sankofa)')
+  .description('Create a Sankofa Deploy release by bundling JavaScript and uploading a preview-installable native artifact')
   .argument('<platform>', 'Target platform: ios or android')
-  .option('--entry-file <file>', 'JS entry file', 'index.js')
+  .option('--entry-file <file>', 'JS entry file')
   .option('--output-dir <dir>', 'Directory for built artifacts', './build')
-  .option('--output-format <format>', 'Android output format: aab (default) or apk')
+  .option('--no-native-artifact', 'Skip building/uploading the native preview artifact')
   .option('--description <desc>', 'Release description')
   .option('--mandatory', 'Mark this release as mandatory (force-update)')
   .option('--rollout <percent>', 'Initial rollout percentage (0-100)', '100')
   .option('--publish', 'Auto-publish without prompting')
-  .option('--env <environment>', 'Target environment: live or test', 'live')
+  .option('--env <environment>', 'Target environment: live or test')
   .action(async (platformArg: string, opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
 
-    const platform = platformArg.toLowerCase() as Platform;
-    if (platform !== 'ios' && platform !== 'android') {
-      console.error(chalk.red('Platform must be "ios" or "android"'));
+    let platform;
+    let environment;
+    let rollout;
+    try {
+      platform = normalizePlatform(platformArg);
+      environment = await resolveEnvironmentPrompt(opts.env);
+      rollout = parseRollout(opts.rollout);
+    } catch (err: any) {
+      console.error(chalk.red(err.message));
       process.exit(1);
     }
+    const entryFile = detectEntryFile(opts.entryFile);
 
     // 1. Detect app version
     const spinner = ora('Detecting app version...').start();
@@ -46,7 +56,7 @@ export const releaseCommand = new Command('release')
     const checkSpinner = ora('Checking for existing releases...').start();
     try {
       const { listReleases } = await import('../utils/api.js');
-      const releases = await listReleases(opts.env, platform);
+      const releases = await listReleases(environment, platform);
       const existing = releases.find(
         (r: any) => r.target_binary_version === appVersion && r.platform === platform,
       );
@@ -58,28 +68,34 @@ export const releaseCommand = new Command('release')
       }
       checkSpinner.succeed('No existing release for this version');
     } catch (err: any) {
-      checkSpinner.warn(`Could not check existing releases: ${err.message}`);
+      checkSpinner.fail(`Could not check existing releases: ${err.message}`);
+      process.exit(1);
     }
 
-    // 3. Build native binary
+    // 3. Build the native preview artifact. This does not install, launch, or
+    // start Metro; it only creates the deployed artifact used by `preview`.
     const outputDir = opts.outputDir;
     if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
 
-    console.log(chalk.dim(`\n  Building ${platform} native binary...`));
-    try {
-      const binaryPath = buildNative(platform, outputDir, opts.outputFormat);
-      console.log(chalk.green(`  ✓ Binary saved to ${binaryPath}`));
-      console.log(chalk.dim(`    Upload this to the ${platform === 'ios' ? 'App Store' : 'Play Store'} manually.\n`));
-    } catch (err: any) {
-      console.log(chalk.yellow(`  ⚠ Native build skipped or failed: ${err.message}`));
-      console.log(chalk.dim(`    You can build the native binary separately.\n`));
+    let nativeArtifact: NativePreviewArtifact | null = null;
+    if (opts.nativeArtifact !== false) {
+      console.log(chalk.dim(`\n  Building ${platform} native preview artifact...`));
+      try {
+        nativeArtifact = buildNativePreviewArtifact(platform, outputDir);
+        console.log(chalk.green(`  ✓ Preview artifact saved to ${nativeArtifact.path}\n`));
+      } catch (err: any) {
+        console.log(chalk.red(`  ✖ Native preview artifact build failed: ${err.message}`));
+        console.log(chalk.dim(`    Release cancelled because preview needs the deployed native artifact.`));
+        console.log(chalk.dim(`    Use ${chalk.cyan('--no-native-artifact')} only when you intentionally do not need sankofa preview.\n`));
+        process.exit(1);
+      }
     }
 
     // 4. Bundle JS
     const bundlePath = join(outputDir, `bundle.${platform}.jsbundle`);
     const bundleSpinner = ora('Bundling JavaScript...').start();
     try {
-      bundleJS(platform, opts.entryFile, bundlePath);
+      bundleJS(platform, entryFile, bundlePath);
       bundleSpinner.succeed('JavaScript bundled');
     } catch (err: any) {
       bundleSpinner.fail(`Bundling failed: ${err.message}`);
@@ -124,8 +140,10 @@ export const releaseCommand = new Command('release')
         platform,
         description: opts.description || `Release ${label} for ${platform}`,
         is_mandatory: opts.mandatory || false,
-        rollout_percentage: parseInt(opts.rollout, 10),
-        environment: opts.env,
+        rollout_percentage: rollout,
+        environment,
+        native_artifact_path: nativeArtifact?.path,
+        native_artifact_kind: nativeArtifact?.kind,
       });
 
       uploadSpinner.succeed('Bundle uploaded!');
@@ -136,6 +154,9 @@ export const releaseCommand = new Command('release')
       console.log(chalk.dim(`     Target:   ${release.target_binary_version}`));
       console.log(chalk.dim(`     Rollout:  ${release.rollout_percentage}%`));
       console.log(chalk.dim(`     ID:       ${release.id}`));
+      if (nativeArtifact) {
+        console.log(chalk.dim(`     Preview:  ${nativeArtifact.kind}`));
+      }
       console.log('');
     } catch (err: any) {
       uploadSpinner.fail(`Upload failed: ${err.message}`);

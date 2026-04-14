@@ -4,16 +4,22 @@ import { join, resolve } from 'path';
 
 /** Global auth config stored in ~/.sankofa/credentials.json */
 export interface GlobalConfig {
+  token?: string;
+  authType?: 'deploy_token' | 'jwt';
   apiKey?: string;
   endpoint?: string;
   projectId?: string;
+  environment?: 'live' | 'test';
 }
 
 /** Per-project config stored in .sankofa.json in the project root */
 export interface ProjectConfig {
   projectId?: string;
+  token?: string;
+  authType?: 'deploy_token' | 'jwt';
   apiKey?: string;
   endpoint?: string;
+  environment?: 'live' | 'test';
 }
 
 const GLOBAL_DIR = join(homedir(), '.sankofa');
@@ -58,28 +64,42 @@ export function saveProjectConfig(cfg: ProjectConfig): void {
 }
 
 /**
- * Resolves the API key and endpoint from (in priority order):
- * 1. SANKOFA_API_KEY / SANKOFA_ENDPOINT env vars
+ * Resolves deploy management auth from (in priority order):
+ * 1. SANKOFA_DEPLOY_TOKEN / SANKOFA_PROJECT_ID / SANKOFA_ENDPOINT env vars
  * 2. .sankofa.json in the project root
  * 3. ~/.sankofa/credentials.json (global login)
  */
-export function resolveAuth(): { apiKey: string; endpoint: string; projectId: string } {
-  const envKey = process.env.SANKOFA_API_KEY;
+export function resolveAuth(): {
+  token: string;
+  apiKey: string;
+  endpoint: string;
+  projectId: string;
+  authType: 'deploy_token' | 'jwt';
+  environment: string;
+} {
+  const envToken = process.env.SANKOFA_DEPLOY_TOKEN || process.env.SANKOFA_API_KEY;
   const envEndpoint = process.env.SANKOFA_ENDPOINT;
   const envProject = process.env.SANKOFA_PROJECT_ID;
+  const envEnvironment = process.env.SANKOFA_ENVIRONMENT;
 
   const project = findProjectConfig();
   const global = loadGlobalConfig();
 
-  const apiKey = envKey || project?.apiKey || global.apiKey;
+  const token = envToken || project?.token || project?.apiKey || global.token || global.apiKey;
   const endpoint = envEndpoint || project?.endpoint || global.endpoint || 'https://api.sankofa.dev';
   const projectId = envProject || project?.projectId || global.projectId || '';
+  const environment = envEnvironment || project?.environment || global.environment || 'live';
+  const authType =
+    (envToken?.startsWith('sk_deploy_') ? 'deploy_token' : undefined) ||
+    project?.authType ||
+    global.authType ||
+    (token?.startsWith('sk_deploy_') ? 'deploy_token' : 'jwt');
 
-  if (!apiKey) {
+  if (!token) {
     throw new Error(
-      'No API key found. Run `sankofa login` or set SANKOFA_API_KEY env var.',
+      'No Deploy Token found. Run `sankofa login --deploy-token <token> --project-id <id>` or set SANKOFA_DEPLOY_TOKEN.',
     );
   }
 
-  return { apiKey, endpoint, projectId };
+  return { token, apiKey: token, endpoint, projectId, authType, environment };
 }

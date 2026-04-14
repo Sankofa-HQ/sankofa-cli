@@ -1,5 +1,6 @@
-import { createReadStream, statSync } from 'fs';
+import { readFileSync, statSync } from 'fs';
 import { resolveAuth } from './config.js';
+import { normalizeEnvironment, normalizePlatform } from './validation.js';
 
 interface FetchOptions {
   method?: string;
@@ -8,11 +9,11 @@ interface FetchOptions {
 }
 
 async function apiFetch(path: string, opts: FetchOptions = {}): Promise<Response> {
-  const { apiKey, endpoint } = resolveAuth();
+  const { endpoint } = resolveAuth();
   const url = `${endpoint}${path}`;
 
   const headers: Record<string, string> = {
-    'x-api-key': apiKey,
+    ...getAuthHeaders(),
     ...opts.headers,
   };
 
@@ -26,30 +27,38 @@ async function apiFetch(path: string, opts: FetchOptions = {}): Promise<Response
 
 /** Build standard auth headers for dashboard API calls */
 function getAuthHeaders(): Record<string, string> {
-  const { apiKey, projectId } = resolveAuth();
+  const { token, projectId } = resolveAuth();
+  if (token.startsWith('sk_live_') || token.startsWith('sk_test_')) {
+    throw new Error('Publishing requires a Deploy Token (sk_deploy_...). SDK live/test keys are only for app runtime update checks.');
+  }
   return {
-    'Authorization': `Bearer ${apiKey}`,
-    'x-api-key': apiKey,
+    'Authorization': `Bearer ${token}`,
     ...(projectId ? { 'x-project-id': projectId } : {}),
   };
 }
 
+async function readAPIError(res: Response, fallback: string): Promise<Error> {
+  const body = await res.json().catch(() => null) as any;
+  const message = body?.error || body?.message || fallback;
+  return new Error(message);
+}
+
 /** List releases for the current project */
 export async function listReleases(env: string = 'live', platform?: string): Promise<any[]> {
-  const { apiKey, endpoint, projectId } = resolveAuth();
+  const { endpoint, projectId } = resolveAuth();
   if (!projectId) {
-    throw new Error('No project selected. Run `sankofa login` and select a project.');
+    throw new Error('No project selected. Run `sankofa login --deploy-token <token> --project-id <id>` or set SANKOFA_PROJECT_ID.');
   }
-  const params = new URLSearchParams({ projectId, environment: env });
-  if (platform) params.set('platform', platform);
+  const environment = normalizeEnvironment(env);
+  const params = new URLSearchParams({ projectId, environment });
+  if (platform) params.set('platform', normalizePlatform(platform));
 
   const res = await fetch(`${endpoint}/api/v1/deploy/releases?${params}`, {
     headers: getAuthHeaders(),
   });
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `Failed to list releases (${res.status})`);
+    throw await readAPIError(res, `Failed to list releases (${res.status})`);
   }
   return res.json();
 }
@@ -65,27 +74,37 @@ export async function uploadRelease(
     is_mandatory?: boolean;
     rollout_percentage?: number;
     environment?: string;
+    native_artifact_path?: string;
+    native_artifact_kind?: string;
   },
   onProgress?: (uploaded: number, total: number) => void,
 ): Promise<any> {
-  const { apiKey, endpoint, projectId } = resolveAuth();
+  const { endpoint, projectId } = resolveAuth();
   if (!projectId) {
-    throw new Error('No project selected. Run `sankofa login` and select a project.');
+    throw new Error('No project selected. Run `sankofa login --deploy-token <token> --project-id <id>` or set SANKOFA_PROJECT_ID.');
   }
+  const environment = normalizeEnvironment(metadata.environment);
+  const platform = normalizePlatform(metadata.platform);
 
   const stats = statSync(bundlePath);
   const totalSize = stats.size;
 
-  // Use FormData with the bundle file
-  const FormData = (await import('form-data')).default;
   const form = new FormData();
-  form.append('bundle', createReadStream(bundlePath), {
-    filename: 'bundle.jsbundle',
-    contentType: 'application/javascript',
-  });
+  const bundleBytes = readFileSync(bundlePath);
+  const bundleBlob = new Blob([new Uint8Array(bundleBytes)], { type: 'application/javascript' });
+  form.append('bundle', bundleBlob, 'bundle.jsbundle');
+  if (metadata.native_artifact_path) {
+    const nativeBytes = readFileSync(metadata.native_artifact_path);
+    const nativeBlob = new Blob([new Uint8Array(nativeBytes)], { type: 'application/octet-stream' });
+    form.append('native_artifact', nativeBlob, metadata.native_artifact_path.split('/').pop() || 'native-artifact');
+    form.append('native_artifact_kind', metadata.native_artifact_kind || '');
+  }
   form.append('metadata', JSON.stringify({
     ...metadata,
-    environment: metadata.environment || 'live',
+    native_artifact_path: undefined,
+    native_artifact_kind: undefined,
+    platform,
+    environment,
     rollout_percentage: metadata.rollout_percentage ?? 100,
   }));
 
@@ -93,14 +112,12 @@ export async function uploadRelease(
     method: 'POST',
     headers: {
       ...getAuthHeaders(),
-      ...form.getHeaders(),
     },
-    body: form as any,
+    body: form,
   });
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `Upload failed (${res.status})`);
+    throw await readAPIError(res, `Upload failed (${res.status})`);
   }
 
   return res.json();
@@ -116,6 +133,9 @@ export async function updateRelease(
   },
 ): Promise<any> {
   const { endpoint, projectId } = resolveAuth();
+  if (!projectId) {
+    throw new Error('No project selected. Run `sankofa login --deploy-token <token> --project-id <id>` or set SANKOFA_PROJECT_ID.');
+  }
   const res = await fetch(`${endpoint}/api/v1/deploy/releases/${releaseId}?projectId=${projectId}`, {
     method: 'PATCH',
     headers: {
@@ -126,8 +146,46 @@ export async function updateRelease(
   });
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `Update failed (${res.status})`);
+    throw await readAPIError(res, `Update failed (${res.status})`);
+  }
+  return res.json();
+}
+
+export async function getRelease(releaseId: string): Promise<any> {
+  const { endpoint, projectId } = resolveAuth();
+  if (!projectId) {
+    throw new Error('No project selected. Run `sankofa login --deploy-token <token> --project-id <id>` or set SANKOFA_PROJECT_ID.');
+  }
+
+  const res = await fetch(`${endpoint}/api/v1/deploy/releases/${releaseId}?projectId=${projectId}`, {
+    headers: getAuthHeaders(),
+  });
+
+  if (!res.ok) {
+    throw await readAPIError(res, `Failed to fetch release (${res.status})`);
+  }
+  return res.json();
+}
+
+export async function createDeployToken(
+  endpoint: string,
+  jwt: string,
+  projectId: string,
+  name: string,
+): Promise<{ token: string; deploy_token: any }> {
+  const params = new URLSearchParams({ projectId });
+  const res = await fetch(`${endpoint}/api/v1/deploy/tokens?${params}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${jwt}`,
+      'Content-Type': 'application/json',
+      'x-project-id': projectId,
+    },
+    body: JSON.stringify({ name, environment: 'all' }),
+  });
+
+  if (!res.ok) {
+    throw await readAPIError(res, `Failed to create Deploy Token (${res.status})`);
   }
   return res.json();
 }

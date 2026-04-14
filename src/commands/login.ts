@@ -1,10 +1,14 @@
 import { Command } from 'commander';
 import { createServer } from 'http';
+import { hostname, userInfo } from 'os';
 import { saveGlobalConfig, saveProjectConfig } from '../utils/config.js';
+import { createDeployToken } from '../utils/api.js';
 
 export const loginCommand = new Command('login')
   .description('Authenticate with your Sankofa account via browser')
-  .option('--api-key <key>', 'Authenticate directly with an API key (for CI/CD)')
+  .option('--deploy-token <token>', 'Authenticate directly with a Deploy Token (for CI/CD)')
+  .option('--project-id <id>', 'Project ID for Deploy Token auth')
+  .option('--api-key <key>', 'Deprecated. SDK API keys cannot publish releases')
   .option('--endpoint <url>', 'Sankofa API endpoint (default: https://api.sankofa.dev)')
   .option('--project', 'Save to .sankofa.json in the current project instead of global config')
   .action(async (opts) => {
@@ -12,9 +16,70 @@ export const loginCommand = new Command('login')
     const ora = (await import('ora')).default;
     let endpoint = opts.endpoint || 'https://api.sankofa.dev';
 
-    // ── CI/CD mode: direct API key (for pipelines) ──
+    // ── CI/CD mode: direct Deploy Token ──
+    if (opts.deployToken) {
+      if (!opts.deployToken.startsWith('sk_deploy_')) {
+        console.error(chalk.red('Deploy Tokens must start with sk_deploy_.'));
+        process.exit(1);
+      }
+
+      const projectId = opts.projectId || process.env.SANKOFA_PROJECT_ID;
+      if (!projectId) {
+        console.error(chalk.red('Project ID is required. Pass --project-id <id> or set SANKOFA_PROJECT_ID.'));
+        process.exit(1);
+      }
+
+      const spinner = ora('Validating Deploy Token...').start();
+      try {
+        const headers = {
+          'Authorization': `Bearer ${opts.deployToken}`,
+          'x-project-id': projectId,
+        };
+        const tryValidate = async (environment: 'live' | 'test') => {
+          const params = new URLSearchParams({ projectId, environment });
+          return fetch(`${endpoint}/api/v1/deploy/releases?${params}`, { headers });
+        };
+        let validatedEnvironment: 'live' | 'test' = 'live';
+        let res = await tryValidate('live');
+        if (!res.ok) {
+          res = await tryValidate('test');
+          if (res.ok) validatedEnvironment = 'test';
+        }
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({})) as any;
+          spinner.fail(err.error || `Deploy Token validation failed (${res.status})`);
+          process.exit(1);
+        }
+
+        const config = {
+          token: opts.deployToken,
+          authType: 'deploy_token' as const,
+          endpoint,
+          projectId,
+          environment: validatedEnvironment,
+        };
+        if (opts.project) {
+          saveProjectConfig(config);
+          spinner.succeed('Deploy Token saved to .sankofa.json');
+        } else {
+          saveGlobalConfig(config);
+          spinner.succeed('Deploy Token saved to ~/.sankofa/credentials.json');
+        }
+      } catch (err: any) {
+        spinner.fail(`Connection failed: ${err.message}`);
+        process.exit(1);
+      }
+      return;
+    }
+
+    // ── Deprecated SDK API key flow ──
     if (opts.apiKey) {
-      const spinner = ora('Validating API key...').start();
+      if (!opts.apiKey.startsWith('sk_live_') && !opts.apiKey.startsWith('sk_test_')) {
+        console.error(chalk.red('--api-key is deprecated for publishing. Use --deploy-token <sk_deploy_...> instead.'));
+        process.exit(1);
+      }
+
+      const spinner = ora('Validating SDK API key...').start();
       try {
         const res = await fetch(`${endpoint}/api/v1/handshake`, {
           headers: { 'x-api-key': opts.apiKey },
@@ -23,13 +88,10 @@ export const loginCommand = new Command('login')
           spinner.fail('Invalid API key');
           process.exit(1);
         }
-        const data = await res.json() as any;
-        spinner.succeed(`Authenticated! Project: ${data.project_id}`);
-        if (opts.project) {
-          saveProjectConfig({ apiKey: opts.apiKey, endpoint });
-        } else {
-          saveGlobalConfig({ apiKey: opts.apiKey, endpoint });
-        }
+        await res.json() as any;
+        spinner.fail('This is an app runtime SDK key. Publishing releases requires a Deploy Token (sk_deploy_...).');
+        console.log(chalk.dim('  Create a Deploy Token in Deploy Settings or run browser login with an Editor account.'));
+        process.exit(1);
       } catch (err: any) {
         spinner.fail(`Connection failed: ${err.message}`);
         process.exit(1);
@@ -183,11 +245,18 @@ export const loginCommand = new Command('login')
         selectedProject = projChoice;
       }
 
-      // Save credentials with project ID
+      const tokenSpinner = ora('Creating local Deploy Token...').start();
+      const tokenName = `local ${userInfo().username}@${hostname()}`;
+      const tokenResponse = await createDeployToken(endpoint, receivedToken, selectedProject.id, tokenName);
+      tokenSpinner.succeed('Deploy Token created');
+
+      // Save deploy credentials with project ID
       const config = {
-        apiKey: receivedToken,
+        token: tokenResponse.token,
+        authType: 'deploy_token' as const,
         endpoint,
         projectId: selectedProject.id,
+        environment: selectedProject.environment === 'test' ? 'test' as const : 'live' as const,
       };
 
       if (opts.project) {

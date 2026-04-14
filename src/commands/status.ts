@@ -1,26 +1,38 @@
 import { Command } from 'commander';
 import { listReleases } from '../utils/api.js';
+import { resolveEnvironmentPrompt } from '../utils/prompts.js';
+import { normalizePlatform } from '../utils/validation.js';
 
 export const statusCommand = new Command('status')
   .description('Show the status of all releases for this project')
   .option('--platform <platform>', 'Filter by platform (ios/android)')
-  .option('--env <environment>', 'Target environment', 'live')
+  .option('--env <environment>', 'Target environment')
   .action(async (opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
 
+    let environment;
+    let platform;
+    try {
+      environment = await resolveEnvironmentPrompt(opts.env);
+      platform = opts.platform ? normalizePlatform(opts.platform) : undefined;
+    } catch (err: any) {
+      console.error(chalk.red(err.message));
+      process.exit(1);
+    }
+
     const spinner = ora('Fetching releases...').start();
     try {
-      const releases = await listReleases(opts.env, opts.platform);
+      const releases = await listReleases(environment, platform);
       spinner.stop();
 
       if (releases.length === 0) {
-        console.log(chalk.dim('  No releases found.'));
+        console.log(chalk.dim(`  No ${environment} releases found.`));
         return;
       }
 
       console.log('');
-      console.log(chalk.bold(`  Releases (${releases.length})`));
+      console.log(chalk.bold(`  Releases (${environment}, ${releases.length})`));
       console.log(chalk.dim('  ' + '─'.repeat(80)));
 
       for (const r of releases) {

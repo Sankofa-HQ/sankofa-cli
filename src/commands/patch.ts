@@ -3,39 +3,48 @@ import { join } from 'path';
 import { existsSync, mkdirSync } from 'fs';
 import {
   bundleJS,
+  detectEntryFile,
   computeSHA256,
   formatBytes,
   getFileSize,
-  type Platform,
 } from '../utils/bundler.js';
 import { listReleases, uploadRelease } from '../utils/api.js';
+import { resolveEnvironmentPrompt } from '../utils/prompts.js';
+import { escapeRegExp, normalizePlatform, parseRollout } from '../utils/validation.js';
 
 export const patchCommand = new Command('patch')
   .description('Push an OTA patch to an existing release (JavaScript only — no native changes)')
   .argument('<platform>', 'Target platform: ios or android')
-  .option('--entry-file <file>', 'JS entry file', 'index.js')
+  .option('--entry-file <file>', 'JS entry file')
   .option('--output-dir <dir>', 'Directory for built artifacts', './build')
   .option('--description <desc>', 'Patch description')
   .option('--mandatory', 'Mark this patch as mandatory (force-update)')
   .option('--rollout <percent>', 'Initial rollout percentage (0-100)', '100')
   .option('--publish', 'Auto-publish without prompting')
-  .option('--env <environment>', 'Target environment: live or test', 'live')
+  .option('--env <environment>', 'Target environment: live or test')
   .action(async (platformArg: string, opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
     const inquirer = (await import('inquirer')).default;
 
-    const platform = platformArg.toLowerCase() as Platform;
-    if (platform !== 'ios' && platform !== 'android') {
-      console.error(chalk.red('Platform must be "ios" or "android"'));
+    let platform;
+    let environment;
+    let initialRollout;
+    try {
+      platform = normalizePlatform(platformArg);
+      environment = await resolveEnvironmentPrompt(opts.env);
+      initialRollout = parseRollout(opts.rollout);
+    } catch (err: any) {
+      console.error(chalk.red(err.message));
       process.exit(1);
     }
+    const entryFile = detectEntryFile(opts.entryFile);
 
     // 1. Fetch existing releases
     const spinner = ora('Fetching releases...').start();
     let releases: any[];
     try {
-      releases = await listReleases(opts.env, platform);
+      releases = await listReleases(environment, platform);
     } catch (err: any) {
       spinner.fail(`Failed to fetch releases: ${err.message}`);
       process.exit(1);
@@ -98,7 +107,7 @@ export const patchCommand = new Command('patch')
     const bundlePath = join(outputDir, `patch.${platform}.jsbundle`);
     const bundleSpinner = ora('Bundling JavaScript...').start();
     try {
-      bundleJS(platform, opts.entryFile, bundlePath);
+      bundleJS(platform, entryFile, bundlePath);
       bundleSpinner.succeed('JavaScript bundled');
     } catch (err: any) {
       bundleSpinner.fail(`Bundling failed: ${err.message}`);
@@ -112,11 +121,19 @@ export const patchCommand = new Command('patch')
     console.log(chalk.dim(`  Size:   ${formatBytes(size)}`));
 
     // 6. Generate patch label
-    const existingPatches = releases.filter(
-      (r: any) => r.target_binary_version === selectedRelease.target_binary_version,
-    );
-    const patchNumber = existingPatches.length + 1;
-    const label = `${selectedRelease.label}-patch.${patchNumber}`;
+    const baseLabel = selectedRelease.label.replace(/-patch\.\d+$/, '');
+    const patchPattern = new RegExp(`^${escapeRegExp(baseLabel)}-patch\\.(\\d+)$`);
+    const maxPatchNumber = releases
+      .filter((r: any) =>
+        r.target_binary_version === selectedRelease.target_binary_version &&
+        r.platform === platform &&
+        (r.environment || environment) === environment
+      )
+      .reduce((max: number, r: any) => {
+        const match = String(r.label).match(patchPattern);
+        return match ? Math.max(max, parseInt(match[1], 10)) : max;
+      }, 0);
+    const label = `${baseLabel}-patch.${maxPatchNumber + 1}`;
 
     // 7. Ask about mandatory
     let isMandatory = opts.mandatory || false;
@@ -133,7 +150,7 @@ export const patchCommand = new Command('patch')
     }
 
     // 8. Rollout percentage
-    let rollout = parseInt(opts.rollout, 10);
+    let rollout = initialRollout;
     if (!opts.publish && opts.rollout === '100') {
       const { rolloutAnswer } = await inquirer.prompt([
         {
@@ -147,7 +164,7 @@ export const patchCommand = new Command('patch')
           },
         },
       ]);
-      rollout = parseInt(rolloutAnswer, 10);
+      rollout = parseRollout(rolloutAnswer);
     }
 
     // 9. Confirm
@@ -179,7 +196,7 @@ export const patchCommand = new Command('patch')
         description: opts.description || `Patch for ${selectedRelease.label}`,
         is_mandatory: isMandatory,
         rollout_percentage: rollout,
-        environment: opts.env,
+        environment,
       });
 
       uploadSpinner.succeed('Patch uploaded!');
