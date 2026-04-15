@@ -37,15 +37,20 @@ One binary you already ship to the store. All JS/asset changes after that go thr
 
 | Command | Purpose |
 |---|---|
+| `sankofa init` | Scaffold `.sankofa.json` in the current project and print integration next steps. |
+| `sankofa doctor` | Diagnose the local toolchain (Node, Xcode, CocoaPods, Java, Android SDK, adb, altool) and Sankofa server reachability in one shot. |
 | `sankofa login` | Browser-based auth; creates a Deploy Token for the selected project and persists a session JWT for later `switch`es. |
 | `sankofa logout` | Remove stored credentials (project-scoped, global, or both). |
 | `sankofa switch` | Switch to a different project on the same server. Reuses the stored JWT — no browser round-trip. |
-| `sankofa status` | List releases + rollouts + install/rollback counts for the current project. |
-| `sankofa release` | Build the native artifact, stage a byte-identical OTA archive (bundle + assets) from it, publish a base release, **and** produce a signed store binary (`.ipa` / `.aab`) ready for `sankofa submit`. |
+| `sankofa status` | Read-only summary of all releases for the current project. |
+| `sankofa release` | Build native + stage a byte-identical OTA archive + publish the base release + produce a signed store binary (`.ipa` / `.aab`) in one command. |
 | `sankofa patch` | Ship a JS+assets-only OTA patch against an existing base release. |
 | `sankofa preview` | Download + install + launch a published release or patch on a simulator/emulator. Streams runtime logs to the terminal by default. |
+| `sankofa releases` | Manage base releases: `list`, `rollout`, `mandatory`, `kill`, `unkill`. |
+| `sankofa patches` | Manage patches: `list`, `rollout`, `mandatory`, `kill`, `unkill`. |
 | `sankofa dist` | Build ONLY the signed store binary. No Sankofa release is published. For rebuilding the binary of an existing release or for OTA-only lanes. |
 | `sankofa submit` | Upload the signed distribution binary to App Store Connect (iOS) or Play Console (Android). |
+| `sankofa upgrade` | Check npm for a newer `sankofa-cli` and install it. |
 
 Every command that hits the server short-circuits with a clean "you are not logged in" message when credentials are missing — no stray prompts before the auth check.
 
