@@ -91,8 +91,9 @@ export async function uploadRelease(
 
   const form = new FormData();
   const bundleBytes = readFileSync(bundlePath);
-  const bundleBlob = new Blob([new Uint8Array(bundleBytes)], { type: 'application/javascript' });
-  form.append('bundle', bundleBlob, 'bundle.jsbundle');
+  const bundleBlob = new Blob([new Uint8Array(bundleBytes)], { type: 'application/zip' });
+  form.append('bundle', bundleBlob, 'ota.zip');
+  form.append('bundle_format', 'zip');
   if (metadata.native_artifact_path) {
     const nativeBytes = readFileSync(metadata.native_artifact_path);
     const nativeBlob = new Blob([new Uint8Array(nativeBytes)], { type: 'application/octet-stream' });

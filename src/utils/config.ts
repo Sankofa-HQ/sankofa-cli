@@ -10,6 +10,13 @@ export interface GlobalConfig {
   endpoint?: string;
   projectId?: string;
   environment?: 'live' | 'test';
+  /**
+   * Long-lived session JWT from the browser login, persisted so `sankofa
+   * switch` can list projects and mint a new Deploy Token without forcing
+   * another browser round-trip. Cleared by `sankofa logout` (any scope that
+   * removes the global file) and on JWT expiration.
+   */
+  sessionJwt?: string;
 }
 
 /** Per-project config stored in .sankofa.json in the project root */
@@ -102,4 +109,22 @@ export function resolveAuth(): {
   }
 
   return { token, apiKey: token, endpoint, projectId, authType, environment };
+}
+
+/**
+ * Check upfront whether the CLI has any credentials at all. Use this at the
+ * START of every authenticated command so we don't prompt for environment,
+ * platform, etc. only to fail with "No Deploy Token found" at the first API
+ * call.
+ */
+export async function requireAuth(): Promise<void> {
+  try {
+    resolveAuth();
+  } catch (err: any) {
+    const chalk = (await import('chalk')).default;
+    console.error(chalk.red('  You are not logged in.'));
+    console.error('');
+    console.error(chalk.dim('  Run `sankofa login` to authenticate.'));
+    process.exit(1);
+  }
 }

@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import { listReleases } from '../utils/api.js';
+import { requireAuth } from '../utils/config.js';
 import { resolveEnvironmentPrompt } from '../utils/prompts.js';
 import { normalizePlatform } from '../utils/validation.js';
 
@@ -10,6 +11,8 @@ export const statusCommand = new Command('status')
   .action(async (opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
+
+    await requireAuth();
 
     let environment;
     let platform;

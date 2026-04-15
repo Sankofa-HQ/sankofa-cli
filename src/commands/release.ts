@@ -1,24 +1,30 @@
 import { Command } from 'commander';
 import { join } from 'path';
 import {
+  buildDistributionArtifact,
   buildNativePreviewArtifact,
   bundleJS,
   clearBuildArtifacts,
   computeSHA256,
+  createOTAArchive,
   detectAppVersion,
   detectEntryFile,
+  extractEmbeddedOTA,
   formatBytes,
   getFileSize,
+  syncNativeFromAppJson,
+  type DistributionArtifact,
   type NativePreviewArtifact,
 } from '../utils/bundler.js';
 import { uploadRelease } from '../utils/api.js';
-import { resolveEnvironmentPrompt } from '../utils/prompts.js';
+import { requireAuth } from '../utils/config.js';
+import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompts.js';
 import { resolveRNProjectRoot } from '../utils/project.js';
-import { normalizePlatform, parseRollout } from '../utils/validation.js';
+import { parseRollout } from '../utils/validation.js';
 
 export const releaseCommand = new Command('release')
   .description('Create a Sankofa Deploy release by bundling JavaScript and uploading a preview-installable native artifact')
-  .argument('<platform>', 'Target platform: ios or android')
+  .argument('[platform]', 'Target platform: ios or android (prompts if omitted)')
   .option('--entry-file <file>', 'JS entry file')
   .option('--output-dir <dir>', 'Directory for built artifacts', './build')
   .option('--no-native-artifact', 'Skip building/uploading the native preview artifact')
@@ -28,15 +34,22 @@ export const releaseCommand = new Command('release')
   .option('--publish', 'Auto-publish without prompting')
   .option('--env <environment>', 'Target environment: live or test')
   .option('--project <path>', 'Path to the React Native app directory (defaults to auto-detect)')
-  .action(async (platformArg: string, opts) => {
+  .option('--skip-distribution', 'Skip building the signed store binary (OTA-only release). Default: build distribution.')
+  .option('--ios-export-method <method>', 'iOS export method: app-store, ad-hoc, development, enterprise (default: app-store)')
+  .option('--ios-team-id <id>', 'Apple Developer Team ID for iOS code signing (auto-detected from archive when omitted)')
+  .option('--ios-export-options <path>', 'Path to a custom ExportOptions.plist (overrides --ios-export-method / --ios-team-id)')
+  .option('--android-format <fmt>', 'Android distribution format: aab (Play Store) or apk (sideload). Default: aab', 'aab')
+  .action(async (platformArg: string | undefined, opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
+
+    await requireAuth();
 
     let platform;
     let environment;
     let rollout;
     try {
-      platform = normalizePlatform(platformArg);
+      platform = await resolvePlatformPrompt(platformArg);
       environment = await resolveEnvironmentPrompt(opts.env);
       rollout = parseRollout(opts.rollout);
     } catch (err: any) {
@@ -49,6 +62,17 @@ export const releaseCommand = new Command('release')
       process.chdir(project.root);
     } catch (err: any) {
       console.error(chalk.red(err.message));
+      process.exit(1);
+    }
+
+    // Sync ios/ and android/ from app.json so native version/config reflects
+    // the latest source before we detect the version or build anything.
+    const syncSpinner = ora('Syncing native project from app.json (expo prebuild)...').start();
+    try {
+      syncNativeFromAppJson(platform);
+      syncSpinner.succeed('Native project synced');
+    } catch (err: any) {
+      syncSpinner.fail(err.message);
       process.exit(1);
     }
 
@@ -73,8 +97,13 @@ export const releaseCommand = new Command('release')
       );
       if (existing) {
         checkSpinner.fail(
-          `Version ${chalk.bold(appVersion)} already has a release (${chalk.dim(existing.label)}). Use ${chalk.cyan('sankofa patch ' + platform)} instead.`,
+          `Version ${chalk.bold(appVersion)} already has a release (${chalk.dim(existing.label)}).`,
         );
+        console.log('');
+        console.log(chalk.dim('  Options:'));
+        console.log(chalk.dim(`    • JS/asset update:          ${chalk.cyan('sankofa patch ' + platform)}`));
+        console.log(chalk.dim(`    • Rebuild signed binary:    ${chalk.cyan('sankofa dist ' + platform)}`));
+        console.log(chalk.dim(`    • Upload existing binary:   ${chalk.cyan('sankofa submit ' + platform)}`));
         process.exit(1);
       }
       checkSpinner.succeed('No existing release for this version');
@@ -109,20 +138,33 @@ export const releaseCommand = new Command('release')
       }
     }
 
-    // 4. Bundle JS
-    const bundlePath = join(outputDir, `bundle.${platform}.jsbundle`);
-    const bundleSpinner = ora('Bundling JavaScript...').start();
+    // 4. Stage the OTA payload (bundle + assets) and package it as a zip
+    //    archive. Prefer extracting from the freshly-built native artifact so
+    //    the OTA's asset IDs are byte-identical to what the `.app` embeds —
+    //    that's what keeps `useFonts` / `require('./image.png')` / any asset
+    //    lookup working after the patch loads. Falling back to a fresh Metro
+    //    bundle only if the native artifact is unavailable.
+    const stageDir = join(outputDir, 'ota-stage');
+    const archivePath = join(outputDir, `ota.${platform}.zip`);
+    const bundleSpinner = ora('Staging OTA payload from native artifact...').start();
     try {
-      bundleJS(platform, entryFile, bundlePath);
-      bundleSpinner.succeed('JavaScript bundled');
+      const reused = nativeArtifact
+        ? extractEmbeddedOTA(platform, nativeArtifact.path, stageDir)
+        : false;
+      if (!reused) {
+        bundleSpinner.text = 'Bundling JavaScript + assets (no native artifact)...';
+        bundleJS(platform, entryFile, stageDir);
+      }
+      createOTAArchive(stageDir, archivePath);
+      bundleSpinner.succeed(reused ? 'OTA archive built from native artifact' : 'OTA archive built from source');
     } catch (err: any) {
       bundleSpinner.fail(`Bundling failed: ${err.message}`);
       process.exit(1);
     }
 
-    // 5. Compute SHA256
-    const sha256 = computeSHA256(bundlePath);
-    const size = getFileSize(bundlePath);
+    // 5. Compute SHA256 of the archive (bytes the client will verify)
+    const sha256 = computeSHA256(archivePath);
+    const size = getFileSize(archivePath);
     console.log(chalk.dim(`  SHA256: ${sha256}`));
     console.log(chalk.dim(`  Size:   ${formatBytes(size)}`));
 
@@ -152,7 +194,7 @@ export const releaseCommand = new Command('release')
     // 8. Upload to Sankofa
     const uploadSpinner = ora('Uploading bundle to Sankofa...').start();
     try {
-      const release = await uploadRelease(bundlePath, {
+      const release = await uploadRelease(archivePath, {
         label,
         target_binary_version: appVersion,
         platform,
@@ -165,15 +207,86 @@ export const releaseCommand = new Command('release')
       });
 
       uploadSpinner.succeed('Bundle uploaded!');
+
+      // Always build the signed store binary alongside the OTA release —
+      // a release without a submittable binary isn't a release. Opt out only
+      // with --skip-distribution (e.g. for OTA-only CI lanes that ship the
+      // binary via a separate flow).
+      let distArtifact: DistributionArtifact | null = null;
+      if (!opts.skipDistribution) {
+        const distSpinner = ora(`Building signed ${platform} distribution binary (this takes a few minutes)...`).start();
+        try {
+          distArtifact = buildDistributionArtifact(platform, {
+            outputDir: join(outputDir, 'distribution'),
+            iosExportMethod: opts.iosExportMethod,
+            iosTeamId: opts.iosTeamId,
+            iosExportOptionsPlist: opts.iosExportOptions,
+            androidFormat: opts.androidFormat === 'apk' ? 'apk' : 'aab',
+          });
+          distSpinner.succeed('Signed distribution binary built');
+        } catch (err: any) {
+          distSpinner.fail(`Distribution build failed: ${err.message}`);
+          console.log(chalk.dim('  The OTA release was still published successfully.'));
+          console.log(chalk.dim('  Run `sankofa dist ' + platform + '` to retry the signed-binary build once signing is fixed.'));
+        }
+      }
       console.log('');
       console.log(chalk.green.bold('  🚀 Release published'));
-      console.log(chalk.dim(`     Label:    ${release.label}`));
-      console.log(chalk.dim(`     Platform: ${release.platform}`));
-      console.log(chalk.dim(`     Target:   ${release.target_binary_version}`));
-      console.log(chalk.dim(`     Rollout:  ${release.rollout_percentage}%`));
-      console.log(chalk.dim(`     ID:       ${release.id}`));
+      console.log(chalk.dim(`     Label:          ${release.label}`));
+      console.log(chalk.dim(`     Platform:       ${release.platform}`));
+      console.log(chalk.dim(`     Target version: ${release.target_binary_version}`));
+      console.log(chalk.dim(`     Rollout:        ${release.rollout_percentage}%`));
+      console.log(chalk.dim(`     Release ID:     ${release.id}`));
+      console.log('');
+      console.log(chalk.bold('  📦 OTA Archive'));
+      console.log(chalk.dim('     Path:   ') + chalk.cyan(archivePath));
+      console.log(chalk.dim('     Size:   ') + formatBytes(size));
+      console.log(chalk.dim('     SHA256: ') + chalk.yellow(sha256));
       if (nativeArtifact) {
-        console.log(chalk.dim(`     Preview:  ${nativeArtifact.kind}`));
+        const nativeSHA = computeSHA256(nativeArtifact.path);
+        const nativeSize = getFileSize(nativeArtifact.path);
+        const nativeLabel =
+          nativeArtifact.kind === 'ios-simulator-app-zip' ? 'iOS Simulator App (.app.zip)' :
+          nativeArtifact.kind === 'android-apk' ? 'Android APK' :
+          nativeArtifact.kind;
+        console.log('');
+        console.log(chalk.bold(`  📱 Native binary — ${nativeLabel}`));
+        console.log(chalk.dim('     Path:   ') + chalk.cyan(nativeArtifact.path));
+        console.log(chalk.dim('     Size:   ') + formatBytes(nativeSize));
+        console.log(chalk.dim('     SHA256: ') + chalk.yellow(nativeSHA));
+        console.log('');
+        console.log(chalk.dim('     ↑ Simulator/debug preview binary. NOT submittable to App Store'));
+        console.log(chalk.dim('       or Play Store. Used only by `sankofa preview` for QA on a'));
+        console.log(chalk.dim('       simulator/emulator. Pass --distribution to also build the'));
+        console.log(chalk.dim('       signed store binary.'));
+      }
+
+      if (distArtifact) {
+        const distSHA = computeSHA256(distArtifact.path);
+        const distSize = getFileSize(distArtifact.path);
+        const distLabel =
+          distArtifact.kind === 'ios-ipa' ? 'iOS IPA — App Store / TestFlight' :
+          distArtifact.kind === 'android-aab' ? 'Android AAB — Play Store' :
+          'Android APK — sideload';
+        console.log('');
+        console.log(chalk.bold(`  🏬 Store binary — ${distLabel}`));
+        console.log(chalk.dim('     Path:   ') + chalk.cyan(distArtifact.path));
+        console.log(chalk.dim('     Size:   ') + formatBytes(distSize));
+        console.log(chalk.dim('     SHA256: ') + chalk.yellow(distSHA));
+        console.log('');
+        if (distArtifact.kind === 'ios-ipa') {
+          console.log(chalk.dim('     Upload with:'));
+          console.log(chalk.dim(`       xcrun altool --upload-app -f ${distArtifact.path} -t ios \\`));
+          console.log(chalk.dim(`         --apiKey <KEY> --apiIssuer <ISSUER>`));
+          console.log(chalk.dim('     or via Transporter.app / Xcode Organizer.'));
+        } else if (distArtifact.kind === 'android-aab') {
+          console.log(chalk.dim('     Upload via Play Console → Production/Testing track, or:'));
+          console.log(chalk.dim(`       bundletool validate --bundle=${distArtifact.path}`));
+        }
+      } else if (opts.skipDistribution) {
+        console.log('');
+        console.log(chalk.yellow('  ⚠️  Distribution build was skipped (--skip-distribution).'));
+        console.log(chalk.dim('     Run `sankofa dist ' + platform + '` when you need the signed store binary.'));
       }
       console.log('');
     } catch (err: any) {

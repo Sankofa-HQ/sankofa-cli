@@ -1,30 +1,29 @@
 import { Command } from 'commander';
+import { execSync } from 'child_process';
 import { createHash } from 'crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { gunzipSync } from 'zlib';
+
+function shellQuoteLocal(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
 import {
   detectAppVersion,
   detectAppId,
   formatBytes,
   getFileSize,
   installAndLaunchNativePreviewArtifact,
+  syncNativeFromAppJson,
   type Platform,
 } from '../utils/bundler.js';
 import { getRelease, listReleases } from '../utils/api.js';
-import { resolveEnvironmentPrompt } from '../utils/prompts.js';
+import { requireAuth } from '../utils/config.js';
+import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompts.js';
 import { resolveRNProjectRoot } from '../utils/project.js';
 import { normalizePlatform } from '../utils/validation.js';
 
 function safeFilePart(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 96) || 'release';
-}
-
-function gunzipIfNeeded(bytes: Buffer): Buffer {
-  if (bytes.length > 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
-    return gunzipSync(bytes);
-  }
-  return bytes;
 }
 
 function isPatchRelease(release: any): boolean {
@@ -38,7 +37,7 @@ function releaseCreatedAtMs(release: any): number {
 
 export const previewCommand = new Command('preview')
   .description('Download, install, and launch a published Sankofa Deploy preview release')
-  .argument('<platform>', 'Target platform: ios or android')
+  .argument('[platform]', 'Target platform: ios or android (prompts if omitted)')
   .option('--version <version>', 'Target native app version. Prompts from deployed releases when omitted')
   .option('--label <label>', 'Deploy release label to preview')
   .option('--env <environment>', 'Target environment: live or test')
@@ -46,16 +45,19 @@ export const previewCommand = new Command('preview')
   .option('--device <device>', 'iOS simulator UDID/name or Android device serial. Defaults to booted/default device')
   .option('--output-dir <dir>', 'Directory for downloaded release artifacts', './build')
   .option('--skip-install', 'Only download and verify the selected release bundle')
+  .option('--no-logs', 'Do not stream runtime logs after launch (returns immediately)')
   .option('--project <path>', 'Path to the React Native app directory (defaults to auto-detect)')
-  .action(async (platformArg: string, opts) => {
+  .action(async (platformArg: string | undefined, opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
     const inquirer = (await import('inquirer')).default;
 
+    await requireAuth();
+
     let platform: Platform;
     let environment;
     try {
-      platform = normalizePlatform(platformArg) as Platform;
+      platform = (await resolvePlatformPrompt(platformArg)) as Platform;
       environment = await resolveEnvironmentPrompt(opts.env);
     } catch (err: any) {
       console.error(chalk.red(err.message));
@@ -67,6 +69,15 @@ export const previewCommand = new Command('preview')
       process.chdir(project.root);
     } catch (err: any) {
       console.error(chalk.red(err.message));
+      process.exit(1);
+    }
+
+    const syncSpinner = ora('Syncing native project from app.json (expo prebuild)...').start();
+    try {
+      syncNativeFromAppJson(platform);
+      syncSpinner.succeed('Native project synced');
+    } catch (err: any) {
+      syncSpinner.fail(err.message);
       process.exit(1);
     }
 
@@ -174,26 +185,39 @@ export const previewCommand = new Command('preview')
     const outputDir = opts.outputDir;
     if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
 
-    const artifactPath = join(outputDir, `${safeFilePart(selectedRelease.label)}.${platform}.jsbundle.gz`);
-    const activeBundlePath = join(outputDir, `${safeFilePart(selectedRelease.label)}.${platform}.jsbundle`);
-    const downloadSpinner = ora('Downloading release bundle...').start();
+    const archivePath = join(outputDir, `${safeFilePart(selectedRelease.label)}.${platform}.zip`);
+    const extractedStageDir = join(outputDir, `${safeFilePart(selectedRelease.label)}.${platform}.ota`);
+    const activeBundlePath = join(extractedStageDir, 'bundle.jsbundle');
+    const downloadSpinner = ora('Downloading OTA archive...').start();
     try {
       const response = await fetch(detail.download_url);
       if (!response.ok) {
         throw new Error(`download failed (${response.status})`);
       }
       const bytes = Buffer.from(await response.arrayBuffer());
-      writeFileSync(artifactPath, bytes);
+      writeFileSync(archivePath, bytes);
 
-      const uncompressed = gunzipIfNeeded(bytes);
-      const actualSHA = createHash('sha256').update(uncompressed).digest('hex');
+      const actualSHA = createHash('sha256').update(bytes).digest('hex');
       if (selectedRelease.bundle_sha256 && actualSHA !== selectedRelease.bundle_sha256) {
         throw new Error(`SHA256 mismatch: expected=${selectedRelease.bundle_sha256} actual=${actualSHA}`);
       }
-      writeFileSync(activeBundlePath, uncompressed);
-      downloadSpinner.succeed(`Downloaded and verified ${formatBytes(getFileSize(artifactPath))}`);
+
+      // Extract bundle + assets so we can seed them into the simulator's
+      // data container later. Patch preview seeds the whole directory so
+      // RN's asset resolver finds `assets/...` next to bundle.jsbundle.
+      if (existsSync(extractedStageDir)) {
+        rmSync(extractedStageDir, { recursive: true, force: true });
+      }
+      mkdirSync(extractedStageDir, { recursive: true });
+      execSync(`unzip -o -q ${shellQuoteLocal(archivePath)} -d ${shellQuoteLocal(extractedStageDir)}`, {
+        stdio: 'inherit',
+      });
+      if (!existsSync(activeBundlePath)) {
+        throw new Error(`archive did not contain bundle.jsbundle`);
+      }
+      downloadSpinner.succeed(`Downloaded and verified ${formatBytes(getFileSize(archivePath))}`);
     } catch (err: any) {
-      downloadSpinner.fail(`Failed to download release bundle: ${err.message}`);
+      downloadSpinner.fail(`Failed to download OTA archive: ${err.message}`);
       process.exit(1);
     }
 
@@ -250,10 +274,13 @@ export const previewCommand = new Command('preview')
         appId,
         artifactPath: nativeArtifactPath,
         artifactKind: nativeArtifactKind,
-        previewBundlePath: isPatchRelease(selectedRelease) ? activeBundlePath : undefined,
-        previewLabel: isPatchRelease(selectedRelease) ? selectedRelease.label : undefined,
-        clearDeployState: !isPatchRelease(selectedRelease),
+        previewStageDir: isPatchRelease(selectedRelease) ? extractedStageDir : undefined,
+        previewLabel: selectedRelease.label,
+        clearDeployState: false,
         device: opts.device,
+        // Commander sets opts.logs=false when --no-logs is passed; default to
+        // true so `sankofa preview ios` streams logs by default.
+        streamLogs: opts.logs !== false,
       });
       if (isPatchRelease(selectedRelease)) {
         console.log(chalk.green(`\n  Native preview app launched with ${selectedRelease.label} preloaded.\n`));

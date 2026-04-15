@@ -4,6 +4,25 @@ import { hostname, userInfo } from 'os';
 import { saveGlobalConfig, saveProjectConfig } from '../utils/config.js';
 import { createDeployToken } from '../utils/api.js';
 
+/**
+ * Normalize an endpoint the user typed: add a scheme when missing, strip any
+ * trailing slash, and default to `http://` for bare hostnames or LAN IPs and
+ * `https://` for anything that looks like a public hostname. Without this,
+ * `localhost:8080` silently becomes `localhost:8080/cli-auth?...` — a relative
+ * URL that `fetch` can't resolve.
+ */
+function normalizeEndpoint(input: string): string {
+  let value = input.trim();
+  if (!value) return value;
+  value = value.replace(/\/+$/, '');
+  if (/^https?:\/\//i.test(value)) return value;
+  const looksLocal =
+    value.startsWith('localhost') ||
+    value.startsWith('127.0.0.1') ||
+    /^(10|192\.168|172\.(1[6-9]|2\d|3[01]))\./.test(value);
+  return `${looksLocal ? 'http' : 'https'}://${value}`;
+}
+
 export const loginCommand = new Command('login')
   .description('Authenticate with your Sankofa account via browser')
   .option('--deploy-token <token>', 'Authenticate directly with a Deploy Token (for CI/CD)')
@@ -14,7 +33,7 @@ export const loginCommand = new Command('login')
   .action(async (opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
-    let endpoint = opts.endpoint || 'https://api.sankofa.dev';
+    let endpoint = normalizeEndpoint(opts.endpoint || 'https://api.sankofa.dev');
 
     // ── CI/CD mode: direct Deploy Token ──
     if (opts.deployToken) {
@@ -109,7 +128,7 @@ export const loginCommand = new Command('login')
       message: 'Sankofa API endpoint:',
       default: endpoint,
     }]);
-    endpoint = endpointAnswer;
+    endpoint = normalizeEndpoint(endpointAnswer);
 
     // Start a temporary local server to receive the auth callback
     const port = 9876;
@@ -250,13 +269,16 @@ export const loginCommand = new Command('login')
       const tokenResponse = await createDeployToken(endpoint, receivedToken, selectedProject.id, tokenName);
       tokenSpinner.succeed('Deploy Token created');
 
-      // Save deploy credentials with project ID
+      // Save deploy credentials with project ID and the session JWT so
+      // `sankofa switch` can pick a different project without forcing
+      // another browser round-trip.
       const config = {
         token: tokenResponse.token,
         authType: 'deploy_token' as const,
         endpoint,
         projectId: selectedProject.id,
         environment: selectedProject.environment === 'test' ? 'test' as const : 'live' as const,
+        sessionJwt: receivedToken,
       };
 
       if (opts.project) {

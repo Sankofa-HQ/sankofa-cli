@@ -4,14 +4,17 @@ import {
   bundleJS,
   clearBuildArtifacts,
   computeSHA256,
+  createOTAArchive,
   detectEntryFile,
   formatBytes,
   getFileSize,
+  syncNativeFromAppJson,
 } from '../utils/bundler.js';
 import { listReleases, uploadRelease } from '../utils/api.js';
-import { resolveEnvironmentPrompt } from '../utils/prompts.js';
+import { requireAuth } from '../utils/config.js';
+import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompts.js';
 import { resolveRNProjectRoot } from '../utils/project.js';
-import { escapeRegExp, normalizePlatform, parseRollout } from '../utils/validation.js';
+import { escapeRegExp, parseRollout } from '../utils/validation.js';
 
 function isPatchRelease(release: any): boolean {
   return /-patch\.\d+$/.test(String(release.label || ''));
@@ -19,7 +22,7 @@ function isPatchRelease(release: any): boolean {
 
 export const patchCommand = new Command('patch')
   .description('Push an OTA patch to an existing release (JavaScript only — no native changes)')
-  .argument('<platform>', 'Target platform: ios or android')
+  .argument('[platform]', 'Target platform: ios or android (prompts if omitted)')
   .option('--entry-file <file>', 'JS entry file')
   .option('--output-dir <dir>', 'Directory for built artifacts', './build')
   .option('--description <desc>', 'Patch description')
@@ -28,16 +31,18 @@ export const patchCommand = new Command('patch')
   .option('--publish', 'Auto-publish without prompting')
   .option('--env <environment>', 'Target environment: live or test')
   .option('--project <path>', 'Path to the React Native app directory (defaults to auto-detect)')
-  .action(async (platformArg: string, opts) => {
+  .action(async (platformArg: string | undefined, opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
     const inquirer = (await import('inquirer')).default;
+
+    await requireAuth();
 
     let platform;
     let environment;
     let initialRollout;
     try {
-      platform = normalizePlatform(platformArg);
+      platform = await resolvePlatformPrompt(platformArg);
       environment = await resolveEnvironmentPrompt(opts.env);
       initialRollout = parseRollout(opts.rollout);
     } catch (err: any) {
@@ -50,6 +55,17 @@ export const patchCommand = new Command('patch')
       process.chdir(project.root);
     } catch (err: any) {
       console.error(chalk.red(err.message));
+      process.exit(1);
+    }
+
+    // Sync ios/ and android/ from app.json so the entry file, asset paths,
+    // and native version reflect the current source before we bundle.
+    const syncSpinner = ora('Syncing native project from app.json (expo prebuild)...').start();
+    try {
+      syncNativeFromAppJson(platform);
+      syncSpinner.succeed('Native project synced');
+    } catch (err: any) {
+      syncSpinner.fail(err.message);
       process.exit(1);
     }
 
@@ -128,19 +144,21 @@ export const patchCommand = new Command('patch')
       process.exit(1);
     }
 
-    const bundlePath = join(outputDir, `patch.${platform}.jsbundle`);
-    const bundleSpinner = ora('Bundling JavaScript...').start();
+    const stageDir = join(outputDir, 'ota-stage');
+    const archivePath = join(outputDir, `patch.${platform}.zip`);
+    const bundleSpinner = ora('Bundling JavaScript + assets...').start();
     try {
-      bundleJS(platform, entryFile, bundlePath);
-      bundleSpinner.succeed('JavaScript bundled');
+      bundleJS(platform, entryFile, stageDir);
+      createOTAArchive(stageDir, archivePath);
+      bundleSpinner.succeed('OTA archive built');
     } catch (err: any) {
       bundleSpinner.fail(`Bundling failed: ${err.message}`);
       process.exit(1);
     }
 
-    // 5. SHA256 + size
-    const sha256 = computeSHA256(bundlePath);
-    const size = getFileSize(bundlePath);
+    // 5. SHA256 + size (of the archive bytes the client verifies)
+    const sha256 = computeSHA256(archivePath);
+    const size = getFileSize(archivePath);
     console.log(chalk.dim(`  SHA256: ${sha256}`));
     console.log(chalk.dim(`  Size:   ${formatBytes(size)}`));
 
@@ -213,7 +231,7 @@ export const patchCommand = new Command('patch')
     // 10. Upload
     const uploadSpinner = ora('Uploading patch to Sankofa...').start();
     try {
-      const release = await uploadRelease(bundlePath, {
+      const release = await uploadRelease(archivePath, {
         label,
         target_binary_version: selectedRelease.target_binary_version,
         platform,
