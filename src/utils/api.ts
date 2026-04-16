@@ -168,6 +168,94 @@ export async function getRelease(releaseId: string): Promise<any> {
   return res.json();
 }
 
+// ── Rules / Schedule / Defaults ─────────────────────────────────────
+
+function requireProjectId(): { endpoint: string; projectId: string } {
+  const { endpoint, projectId } = resolveAuth();
+  if (!projectId) {
+    throw new Error('No project selected. Run `sankofa login --deploy-token <token> --project-id <id>`');
+  }
+  return { endpoint, projectId };
+}
+
+async function deployRequest(path: string, opts: FetchOptions = {}): Promise<Response> {
+  const { endpoint, projectId } = requireProjectId();
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${endpoint}${path}${sep}projectId=${encodeURIComponent(projectId)}`;
+  const headers: Record<string, string> = {
+    ...getAuthHeaders(),
+    'Content-Type': 'application/json',
+    ...(opts.headers || {}),
+  };
+  return fetch(url, {
+    method: opts.method || 'GET',
+    headers,
+    body: opts.body,
+  });
+}
+
+export async function getReleaseRule(releaseId: string): Promise<any> {
+  const res = await deployRequest(`/api/v1/deploy/releases/${releaseId}/rules`);
+  if (!res.ok) throw await readAPIError(res, `Failed to read rule (${res.status})`);
+  const data = await res.json();
+  return data?.rule ?? null;
+}
+
+export async function putReleaseRule(releaseId: string, body: any): Promise<any> {
+  const res = await deployRequest(`/api/v1/deploy/releases/${releaseId}/rules`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await readAPIError(res, `Failed to save rule (${res.status})`);
+  return res.json();
+}
+
+export async function deleteReleaseRule(releaseId: string): Promise<void> {
+  const res = await deployRequest(`/api/v1/deploy/releases/${releaseId}/rules`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw await readAPIError(res, `Failed to clear rule (${res.status})`);
+}
+
+export async function getReleaseSchedule(releaseId: string): Promise<any> {
+  const res = await deployRequest(`/api/v1/deploy/releases/${releaseId}/schedule`);
+  if (!res.ok) throw await readAPIError(res, `Failed to read schedule (${res.status})`);
+  const data = await res.json();
+  return data?.schedule ?? null;
+}
+
+export async function putReleaseSchedule(releaseId: string, body: any): Promise<any> {
+  const res = await deployRequest(`/api/v1/deploy/releases/${releaseId}/schedule`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await readAPIError(res, `Failed to save schedule (${res.status})`);
+  return res.json();
+}
+
+export async function scheduleAction(releaseId: string, action: 'pause' | 'resume' | 'promote'): Promise<any> {
+  const res = await deployRequest(`/api/v1/deploy/releases/${releaseId}/schedule/${action}`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw await readAPIError(res, `Failed to ${action} schedule (${res.status})`);
+  return res.json();
+}
+
+export async function getProjectDefaults(env: string): Promise<any> {
+  const res = await deployRequest(`/api/v1/deploy/project-defaults?environment=${encodeURIComponent(env)}`);
+  if (!res.ok) throw await readAPIError(res, `Failed to read defaults (${res.status})`);
+  return res.json();
+}
+
+export async function putProjectDefaults(env: string, body: any): Promise<any> {
+  const res = await deployRequest(`/api/v1/deploy/project-defaults`, {
+    method: 'PUT',
+    body: JSON.stringify({ ...body, environment: env }),
+  });
+  if (!res.ok) throw await readAPIError(res, `Failed to save defaults (${res.status})`);
+  return res.json();
+}
+
 export async function createDeployToken(
   endpoint: string,
   jwt: string,

@@ -1,5 +1,16 @@
 import { Command } from 'commander';
-import { listReleases, updateRelease } from '../utils/api.js';
+import {
+  listReleases,
+  updateRelease,
+  getReleaseRule,
+  putReleaseRule,
+  deleteReleaseRule,
+  getReleaseSchedule,
+  putReleaseSchedule,
+  scheduleAction,
+  getProjectDefaults,
+  putProjectDefaults,
+} from '../utils/api.js';
 import { requireAuth } from '../utils/config.js';
 import { resolveEnvironmentPrompt } from '../utils/prompts.js';
 import { normalizePlatform, parseRollout } from '../utils/validation.js';
@@ -197,3 +208,211 @@ function buildGroup(kind: ManageKind): Command {
 
 export const releasesCommand = buildGroup('release');
 export const patchesCommand = buildGroup('patch');
+
+// ─── Rules / Targeting ────────────────────────────────────────────────
+
+function parseCSV(val: string | undefined): string[] | undefined {
+  if (!val) return undefined;
+  return val
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function parseStages(val: string): { pct: number; dwell_hours: number }[] {
+  // Accept "1:0h,10:6h,50:24h,100:72h" — pct:dwellHours pairs.
+  return val
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((piece) => {
+      const [pctStr, dwellStr] = piece.split(':');
+      const pct = parseInt(pctStr, 10);
+      const dwell = parseFloat(String(dwellStr || '0').replace(/[hH]$/, ''));
+      if (Number.isNaN(pct) || Number.isNaN(dwell)) {
+        throw new Error(`Invalid stage "${piece}" — use <pct>:<dwellHours>`);
+      }
+      return { pct, dwell_hours: dwell };
+    });
+}
+
+function buildRulesCommand(): Command {
+  const group = new Command('rules').description('Manage per-release targeting rules');
+
+  group
+    .command('get <releaseId>')
+    .description('Print the current targeting rule for a release')
+    .option('--json', 'Emit JSON')
+    .action(async (releaseId, opts) => {
+      const chalk = (await import('chalk')).default;
+      await requireAuth();
+      const rule = await getReleaseRule(releaseId);
+      if (opts.json) {
+        console.log(JSON.stringify(rule, null, 2));
+        return;
+      }
+      if (!rule) {
+        console.log(chalk.dim('  No targeting rule — every device is eligible.'));
+        return;
+      }
+      console.log(JSON.stringify(rule, null, 2));
+    });
+
+  group
+    .command('set <releaseId>')
+    .description('Upsert a targeting rule for a release')
+    .option('--min-app-version <v>', 'Minimum app version (e.g. 1.2.0)')
+    .option('--max-app-version <v>', 'Maximum app version')
+    .option('--min-os-version <v>', 'Minimum OS version')
+    .option('--max-os-version <v>', 'Maximum OS version')
+    .option('--countries <list>', 'ISO-2 allow list (comma-separated)')
+    .option('--block-countries <list>', 'ISO-2 block list (comma-separated)')
+    .option('--cohort-include <list>', 'Cohort IDs to include (comma-separated)')
+    .option('--cohort-exclude <list>', 'Cohort IDs to exclude')
+    .option('--user-ids <list>', 'distinct_ids to always include')
+    .action(async (releaseId, opts) => {
+      const chalk = (await import('chalk')).default;
+      await requireAuth();
+      const body = {
+        min_app_version: opts.minAppVersion,
+        max_app_version: opts.maxAppVersion,
+        min_os_version: opts.minOsVersion,
+        max_os_version: opts.maxOsVersion,
+        countries_allow: parseCSV(opts.countries)?.map((c) => c.toUpperCase()),
+        countries_block: parseCSV(opts.blockCountries)?.map((c) => c.toUpperCase()),
+        cohorts_include: parseCSV(opts.cohortInclude),
+        cohorts_exclude: parseCSV(opts.cohortExclude),
+        user_ids_include: parseCSV(opts.userIds),
+      };
+      const res = await putReleaseRule(releaseId, body);
+      console.log(chalk.green(`  ✓ Rule saved for ${releaseId}`));
+      console.log(JSON.stringify(res.rule, null, 2));
+    });
+
+  group
+    .command('clear <releaseId>')
+    .description('Remove all targeting (100% eligible)')
+    .action(async (releaseId) => {
+      const chalk = (await import('chalk')).default;
+      await requireAuth();
+      await deleteReleaseRule(releaseId);
+      console.log(chalk.green(`  ✓ Targeting cleared for ${releaseId}`));
+    });
+
+  return group;
+}
+
+function buildScheduleCommand(): Command {
+  const group = new Command('schedule').description('Manage staged rollout schedules');
+
+  group
+    .command('get <releaseId>')
+    .description('Print the current rollout schedule')
+    .option('--json', 'Emit JSON')
+    .action(async (releaseId, opts) => {
+      const chalk = (await import('chalk')).default;
+      await requireAuth();
+      const sched = await getReleaseSchedule(releaseId);
+      if (opts.json) {
+        console.log(JSON.stringify(sched, null, 2));
+        return;
+      }
+      if (!sched) {
+        console.log(chalk.dim('  No schedule — release uses its static rollout %.'));
+        return;
+      }
+      console.log(JSON.stringify(sched, null, 2));
+    });
+
+  group
+    .command('set <releaseId>')
+    .description('Create or replace a rollout schedule')
+    .requiredOption('--stages <spec>', 'Stage list e.g. "1:0h,10:6h,50:24h,100:72h"')
+    .option('--crash-pause <rate>', 'Crash-rate PAUSE threshold (e.g. 0.02)')
+    .option('--crash-kill <rate>', 'Crash-rate KILL threshold (e.g. 0.05)')
+    .option('--min-sample <n>', 'Minimum events before evaluating crash-rate', '100')
+    .option('--no-start', "Don't start immediately — require manual resume")
+    .action(async (releaseId, opts) => {
+      const chalk = (await import('chalk')).default;
+      await requireAuth();
+      const stages = parseStages(opts.stages);
+      const body: any = {
+        stages,
+        start_immediately: opts.start !== false,
+      };
+      if (opts.crashPause !== undefined) body.crash_rate_pause_threshold = parseFloat(opts.crashPause);
+      if (opts.crashKill !== undefined) body.crash_rate_kill_threshold = parseFloat(opts.crashKill);
+      if (opts.minSample !== undefined) body.min_sample_size = parseInt(opts.minSample, 10);
+      const res = await putReleaseSchedule(releaseId, body);
+      console.log(chalk.green(`  ✓ Schedule saved for ${releaseId}`));
+      console.log(JSON.stringify(res.schedule, null, 2));
+    });
+
+  for (const action of ['pause', 'resume', 'promote'] as const) {
+    group
+      .command(`${action} <releaseId>`)
+      .description(`${action[0].toUpperCase() + action.slice(1)} the rollout schedule`)
+      .action(async (releaseId) => {
+        const chalk = (await import('chalk')).default;
+        await requireAuth();
+        const res = await scheduleAction(releaseId, action);
+        console.log(chalk.green(`  ✓ Schedule ${action}d`));
+        console.log(JSON.stringify(res.schedule, null, 2));
+      });
+  }
+
+  return group;
+}
+
+function buildDefaultsCommand(): Command {
+  const group = new Command('defaults').description('Manage project-wide deploy defaults');
+
+  group
+    .command('get')
+    .description('Print current project defaults')
+    .option('--env <environment>', 'Environment: live or test')
+    .action(async (opts) => {
+      await requireAuth();
+      const env = await resolveEnvironmentPrompt(opts.env);
+      const defaults = await getProjectDefaults(env);
+      console.log(JSON.stringify(defaults, null, 2));
+    });
+
+  group
+    .command('set')
+    .description('Update project-wide defaults')
+    .option('--env <environment>', 'Environment: live or test')
+    .option('--pause-all', 'Freeze every rollout')
+    .option('--resume-all', 'Unfreeze rollouts')
+    .option('--crash-pause <rate>', 'Default crash-rate PAUSE threshold')
+    .option('--crash-kill <rate>', 'Default crash-rate KILL threshold')
+    .option('--min-floor <label>', 'Minimum bundle floor (never serve below this label)')
+    .option('--default-stages <spec>', 'Default rollout curve e.g. "1:0h,10:6h,100:24h"')
+    .action(async (opts) => {
+      const chalk = (await import('chalk')).default;
+      await requireAuth();
+      const env = await resolveEnvironmentPrompt(opts.env);
+      const body: any = {};
+      if (opts.pauseAll) body.paused_globally = true;
+      if (opts.resumeAll) body.paused_globally = false;
+      if (opts.crashPause !== undefined) body.default_crash_pause_threshold = parseFloat(opts.crashPause);
+      if (opts.crashKill !== undefined) body.default_crash_kill_threshold = parseFloat(opts.crashKill);
+      if (opts.minFloor !== undefined) body.min_bundle_floor = opts.minFloor;
+      if (opts.defaultStages) body.default_rollout_curve = parseStages(opts.defaultStages);
+      const res = await putProjectDefaults(env, body);
+      console.log(chalk.green('  ✓ Defaults saved'));
+      console.log(JSON.stringify(res, null, 2));
+    });
+
+  return group;
+}
+
+export const rulesCommand = buildRulesCommand();
+export const scheduleCommand = buildScheduleCommand();
+export const defaultsCommand = buildDefaultsCommand();
+
+// Silence unused-var lint: parseRollout and normalizePlatform come from
+// the legacy manage surface and are still used by buildGroup/buildUpdate
+// above.
+void parseRollout;
+void normalizePlatform;

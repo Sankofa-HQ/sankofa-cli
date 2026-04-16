@@ -12,7 +12,7 @@ import { submitCommand } from './commands/submit.js';
 import { distCommand } from './commands/dist.js';
 import { doctorCommand } from './commands/doctor.js';
 import { initCommand } from './commands/init.js';
-import { releasesCommand, patchesCommand } from './commands/manage.js';
+import { releasesCommand, patchesCommand, rulesCommand, scheduleCommand, defaultsCommand } from './commands/manage.js';
 import { upgradeCommand } from './commands/upgrade.js';
 
 const program = new Command();
@@ -33,6 +33,9 @@ program.addCommand(previewCommand);
 program.addCommand(statusCommand);
 program.addCommand(releasesCommand);
 program.addCommand(patchesCommand);
+program.addCommand(rulesCommand);
+program.addCommand(scheduleCommand);
+program.addCommand(defaultsCommand);
 program.addCommand(distCommand);
 program.addCommand(submitCommand);
 program.addCommand(upgradeCommand);
