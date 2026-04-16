@@ -14,6 +14,7 @@ import { doctorCommand } from './commands/doctor.js';
 import { initCommand } from './commands/init.js';
 import { releasesCommand, patchesCommand, rulesCommand, scheduleCommand, defaultsCommand } from './commands/manage.js';
 import { upgradeCommand } from './commands/upgrade.js';
+import { checkCommand } from './commands/check.js';
 
 const program = new Command();
 
@@ -39,5 +40,6 @@ program.addCommand(defaultsCommand);
 program.addCommand(distCommand);
 program.addCommand(submitCommand);
 program.addCommand(upgradeCommand);
+program.addCommand(checkCommand);
 
 program.parse();

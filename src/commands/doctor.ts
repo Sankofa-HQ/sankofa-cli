@@ -158,7 +158,7 @@ export const doctorCommand = new Command('doctor')
     results.push(await checkAsync('Sankofa server reachable', async () => {
       if (!endpoint) return { status: 'skip', detail: 'no endpoint configured' };
       try {
-        const res = await fetch(`${endpoint}/healthz`, { method: 'GET' });
+        const res = await fetch(`${endpoint}/api/admin/health`, { method: 'GET' });
         if (res.ok) return { status: 'ok', detail: `${endpoint} — ${res.status}` };
         return { status: 'warn', detail: `${endpoint} responded ${res.status}` };
       } catch (err: any) {

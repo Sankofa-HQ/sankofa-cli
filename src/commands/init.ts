@@ -1,8 +1,9 @@
 import { Command } from 'commander';
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync, readdirSync } from 'fs';
 import { EOL } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { loadGlobalConfig } from '../utils/config.js';
+import { execSync } from 'child_process';
 
 /**
  * Sankofa-specific paths that must never be committed:
@@ -113,17 +114,97 @@ export const initCommand = new Command('init')
       console.log(chalk.dim(`  · .gitignore already covers every Sankofa path`));
     }
 
-    console.log('');
-    console.log(chalk.bold('  Next steps'));
-    console.log('');
-
+    // ── Auto-patch native files ──
+    // Detects Expo vs bare RN and patches accordingly.
+    // Expo: adds sankofa-react-native to app.json plugins.
+    // Bare RN: patches MainApplication.kt and AppDelegate.swift directly.
+    // On failure: prints the manual steps so the user is never stuck.
     const pkg = readPackageJson(cwd);
     const deps = pkg ? { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) } : {};
     const hasSdk = !!deps['sankofa-react-native'];
 
+    const appJsonPath = join(cwd, 'app.json');
+    const hasAppJson = existsSync(appJsonPath);
+    const hasExpoKey = hasAppJson && (() => {
+      try { return !!JSON.parse(readFileSync(appJsonPath, 'utf-8'))?.expo; } catch { return false; }
+    })();
+
+    console.log('');
+    console.log(chalk.bold('  Native bundle loading'));
+
+    const failures: string[] = [];
+
+    if (hasExpoKey) {
+      // Expo project — add plugin to app.json if not already there
+      try {
+        const raw = JSON.parse(readFileSync(appJsonPath, 'utf-8'));
+        const plugins: any[] = raw.expo.plugins || [];
+        const alreadyHasPlugin = plugins.some((p: any) =>
+          (typeof p === 'string' ? p : p?.[0]) === 'sankofa-react-native'
+        );
+        if (alreadyHasPlugin) {
+          console.log(chalk.dim(`  · app.json already has sankofa-react-native plugin`));
+        } else {
+          raw.expo.plugins = [...plugins, 'sankofa-react-native'];
+          writeFileSync(appJsonPath, JSON.stringify(raw, null, 2) + '\n');
+          console.log(chalk.green(`  ✓ Added "sankofa-react-native" to app.json plugins`));
+          console.log(chalk.dim(`    Run ${chalk.cyan('npx expo prebuild --clean')} to regenerate native projects`));
+        }
+      } catch (err: any) {
+        console.log(chalk.yellow(`  ⚠ Could not patch app.json: ${err.message}`));
+        failures.push('expo');
+      }
+    } else if (existsSync(join(cwd, 'android')) || existsSync(join(cwd, 'ios'))) {
+      // Bare RN project — patch native files directly
+      const result = patchNativeFiles(cwd, chalk);
+      if (!result.android && existsSync(join(cwd, 'android'))) failures.push('android');
+      if (!result.ios && existsSync(join(cwd, 'ios'))) failures.push('ios');
+    } else {
+      console.log(chalk.yellow(`  ⚠ No android/ or ios/ directories found. Run this command from your React Native project root.`));
+    }
+
+    // Show manual fallback for any failures
+    if (failures.length > 0) {
+      console.log('');
+      console.log(chalk.yellow('  ⚠ Some native files could not be patched automatically.'));
+      console.log(chalk.yellow('    Add the following manually:'));
+      console.log('');
+      if (failures.includes('expo')) {
+        console.log(chalk.dim('    app.json — add to the plugins array:'));
+        console.log(chalk.cyan('    "plugins": ["sankofa-react-native"]'));
+        console.log('');
+      }
+      if (failures.includes('android')) {
+        console.log(chalk.dim('    Android — MainApplication.kt:'));
+        console.log(chalk.cyan(`    import dev.sankofa.rn.SankofaDeployBundleProvider
+
+    override fun getJSBundleFile(): String? {
+      return SankofaDeployBundleProvider.getJSBundleFile(applicationContext)
+        ?: super.getJSBundleFile()
+    }`));
+        console.log('');
+      }
+      if (failures.includes('ios')) {
+        console.log(chalk.dim('    iOS — AppDelegate.swift:'));
+        console.log(chalk.cyan(`    import SankofaReactNative
+
+    override func bundleURL() -> URL? {
+      if let url = SankofaDeployBundleProvider.bundleURL() {
+        return url
+      }
+      return Bundle.main.url(forResource: "main", withExtension: "jsbundle")
+    }`));
+        console.log('');
+      }
+    }
+
+    console.log('');
+    console.log(chalk.bold('  Next steps'));
+    console.log('');
+
     if (!hasSdk) {
       console.log(chalk.dim('  1. Install the runtime SDK:'));
-      console.log(chalk.cyan('     npm install sankofa-react-native'));
+      console.log(chalk.cyan(hasExpoKey ? '     npx expo install sankofa-react-native' : '     npm install sankofa-react-native'));
       console.log('');
     } else {
       console.log(chalk.dim(`  1. SDK already installed: sankofa-react-native@${deps['sankofa-react-native']}`));
@@ -134,30 +215,173 @@ export const initCommand = new Command('init')
     console.log(chalk.cyan(`     import { Sankofa, SankofaDeploy } from 'sankofa-react-native';
      Sankofa.initialize(API_KEY, { endpoint: '${endpoint}' });
      const deploy = new SankofaDeploy({ checkOnResume: true });
+     deploy.notifyAppReady(); // Prevents false auto-rollback
      deploy.checkForUpdate().then(u => u.updateAvailable && (
        u.isMandatory ? deploy.downloadAndApply(u) : deploy.downloadInBackground(u)
      ));`));
     console.log('');
 
-    console.log(chalk.dim('  3. On iOS, wire the bundle provider into AppDelegate.swift:'));
-    console.log(chalk.cyan(`     override func bundleURL() -> URL? {
-     #if DEBUG
-       return RCTBundleURLProvider.sharedSettings().jsBundleURL(forBundleRoot: "…")
-     #else
-       return sankofaDeployBundleURL() ?? Bundle.main.url(forResource: "main", withExtension: "jsbundle")
-     #endif
-     }
-     override func sourceURL(for bridge: RCTBridge) -> URL? { bundleURL() }`));
-    console.log(chalk.dim('     (Always return bundleURL() from sourceURL — NOT bridge.bundleURL — so OTA reloads pick up the new bundle.)'));
-    console.log('');
-
-    console.log(chalk.dim('  4. Run the diagnostics:'));
+    console.log(chalk.dim('  3. Run diagnostics to verify everything is wired up:'));
     console.log(chalk.cyan('     sankofa doctor'));
     console.log('');
-    console.log(chalk.dim('  5. Ship your first release:'));
+    console.log(chalk.dim('  4. Ship your first release:'));
     console.log(chalk.cyan('     sankofa release ios'));
     console.log('');
   });
+
+// ── Native Patching ───────────────────────────────────────────────────────────
+// Replicates the Expo config plugin logic so bare RN projects get auto-patched.
+
+function ensureImport(src: string, importLine: string): string {
+  if (src.includes(importLine)) return src;
+  const lines = src.split('\n');
+  const lastImport = lines.map((line, index) => ({ line, index }))
+    .filter(({ line }) => line.startsWith('import '))
+    .pop();
+  if (!lastImport) return `${importLine}\n${src}`;
+  lines.splice(lastImport.index + 1, 0, importLine);
+  return lines.join('\n');
+}
+
+function patchAndroidMainApplication(src: string): string {
+  if (src.includes('SankofaDeployBundleProvider.getJSBundleFile')) return src;
+
+  let next = ensureImport(src, 'import dev.sankofa.rn.SankofaDeployBundleProvider');
+  const existingOverride = /override fun getJSBundleFile\(\): String\?\s*\{([\s\S]*?)\n\s*\}/m;
+  if (existingOverride.test(next)) {
+    return next.replace(existingOverride, (match) => {
+      if (!match.includes('return ')) return match;
+      return match.replace('return ', 'return SankofaDeployBundleProvider.getJSBundleFile(applicationContext) ?: ');
+    });
+  }
+
+  const anchor = 'override fun getUseDeveloperSupport()';
+  const index = next.indexOf(anchor);
+  if (index === -1) return src; // Can't find anchor — skip
+
+  const method = [
+    '    override fun getJSBundleFile(): String? {',
+    '      return SankofaDeployBundleProvider.getJSBundleFile(applicationContext) ?: super.getJSBundleFile()',
+    '    }',
+    '',
+  ].join('\n');
+  return `${next.slice(0, index)}${method}${next.slice(index)}`;
+}
+
+function patchIosAppDelegate(src: string): string {
+  if (src.includes('sankofaDeployBundleURL()') && src.includes('SankofaReactNative')) return src;
+
+  let next = ensureImport(src, 'import SankofaReactNative');
+
+  if (!next.includes('private func sankofaDeployBundleURL() -> URL?')) {
+    const helper = [
+      'private func sankofaDeployBundleURL() -> URL? {',
+      '  let selector = NSSelectorFromString("bundleURL")',
+      '  for className in ["SankofaDeployBundleProvider", "SankofaReactNative.SankofaDeployBundleProvider"] {',
+      '    guard let provider = NSClassFromString(className) as? NSObject.Type,',
+      '          provider.responds(to: selector),',
+      '          let value = provider.perform(selector)?.takeUnretainedValue() as? URL else {',
+      '      continue',
+      '    }',
+      '    return value',
+      '  }',
+      '  return nil',
+      '}',
+      '',
+    ].join('\n');
+    const delegateIndex = next.indexOf('class ReactNativeDelegate');
+    if (delegateIndex === -1) {
+      // Try alternate pattern
+      const altIndex = next.indexOf('class AppDelegate');
+      if (altIndex !== -1) {
+        next = `${next.slice(0, altIndex)}${helper}${next.slice(altIndex)}`;
+      }
+    } else {
+      next = `${next.slice(0, delegateIndex)}${helper}${next.slice(delegateIndex)}`;
+    }
+  }
+
+  if (next.includes('sankofaDeployBundleURL()')) return next;
+
+  const bundleMethod = /override func bundleURL\(\) -> URL\? \{([\s\S]*?)\n\s*\}/m;
+  if (!bundleMethod.test(next)) return next; // Can't find method — skip
+
+  return next.replace(bundleMethod, (match) => {
+    const releaseReturn = 'return Bundle.main.url(forResource: "main", withExtension: "jsbundle")';
+    if (match.includes(releaseReturn)) {
+      return match.replace(
+        releaseReturn,
+        'if let sankofaURL = sankofaDeployBundleURL() { return sankofaURL }\n    ' + releaseReturn,
+      );
+    }
+    return match.replace(
+      /\n\s*return ([^\n]+)\n\s*\}/,
+      '\n    if let sankofaURL = sankofaDeployBundleURL() { return sankofaURL }\n    return $1\n  }',
+    );
+  });
+}
+
+function findFile(dir: string, name: string): string | null {
+  if (!existsSync(dir)) return null;
+  try {
+    for (const entry of readdirSync(dir, { withFileTypes: true, recursive: true })) {
+      if (entry.isFile() && entry.name === name) {
+        return join(entry.parentPath || entry.path || dir, entry.name);
+      }
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function patchNativeFiles(cwd: string, chalk: any): { android: boolean; ios: boolean } {
+  // Returns true per platform if patched OR already patched.
+  // Returns false only if the file couldn't be found or patching failed.
+  const result = { android: false, ios: false };
+
+  // Android: find MainApplication.kt
+  const androidDir = join(cwd, 'android');
+  const mainApp = findFile(androidDir, 'MainApplication.kt');
+  if (mainApp) {
+    try {
+      const original = readFileSync(mainApp, 'utf-8');
+      const patched = patchAndroidMainApplication(original);
+      if (patched !== original) {
+        writeFileSync(mainApp, patched);
+        console.log(chalk.green(`  ✓ Patched ${mainApp}`));
+      } else {
+        console.log(chalk.dim(`  · Android already patched (MainApplication.kt)`));
+      }
+      result.android = true;
+    } catch (err: any) {
+      console.log(chalk.yellow(`  ⚠ Failed to patch MainApplication.kt: ${err.message}`));
+    }
+  } else if (existsSync(androidDir)) {
+    console.log(chalk.yellow(`  ⚠ Could not find MainApplication.kt in android/`));
+  }
+
+  // iOS: find AppDelegate.swift
+  const iosDir = join(cwd, 'ios');
+  const appDelegate = findFile(iosDir, 'AppDelegate.swift');
+  if (appDelegate) {
+    try {
+      const original = readFileSync(appDelegate, 'utf-8');
+      const patched = patchIosAppDelegate(original);
+      if (patched !== original) {
+        writeFileSync(appDelegate, patched);
+        console.log(chalk.green(`  ✓ Patched ${appDelegate}`));
+      } else {
+        console.log(chalk.dim(`  · iOS already patched (AppDelegate.swift)`));
+      }
+      result.ios = true;
+    } catch (err: any) {
+      console.log(chalk.yellow(`  ⚠ Failed to patch AppDelegate.swift: ${err.message}`));
+    }
+  } else if (existsSync(iosDir)) {
+    console.log(chalk.yellow(`  ⚠ Could not find AppDelegate.swift in ios/`));
+  }
+
+  return result;
+}
 
 function readPackageJson(dir: string): any | null {
   const path = join(dir, 'package.json');
