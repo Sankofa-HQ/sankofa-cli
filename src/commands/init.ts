@@ -114,119 +114,134 @@ export const initCommand = new Command('init')
       console.log(chalk.dim(`  · .gitignore already covers every Sankofa path`));
     }
 
-    // ── Auto-patch native files ──
-    // Detects Expo vs bare RN and patches accordingly.
-    // Expo: adds sankofa-react-native to app.json plugins.
-    // Bare RN: patches MainApplication.kt and AppDelegate.swift directly.
-    // On failure: prints the manual steps so the user is never stuck.
+    // ── Detect platform ──
     const pkg = readPackageJson(cwd);
     const deps = pkg ? { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) } : {};
-    const hasSdk = !!deps['sankofa-react-native'];
+    const hasPubspec = existsSync(join(cwd, 'pubspec.yaml'));
+    const isFlutter = hasPubspec;
+    const isReactNative = !isFlutter && !!(deps['react-native'] || deps['expo']);
 
     const appJsonPath = join(cwd, 'app.json');
-    const hasAppJson = existsSync(appJsonPath);
-    const hasExpoKey = hasAppJson && (() => {
+    const hasExpoKey = existsSync(appJsonPath) && (() => {
       try { return !!JSON.parse(readFileSync(appJsonPath, 'utf-8'))?.expo; } catch { return false; }
     })();
 
     console.log('');
-    console.log(chalk.bold('  Native bundle loading'));
+    console.log(chalk.dim(`  · Platform: ${isFlutter ? 'Flutter' : isReactNative ? (hasExpoKey ? 'React Native (Expo)' : 'React Native (bare)') : 'Unknown'}`));
 
-    const failures: string[] = [];
+    // ── Platform-specific setup ──
+    if (isReactNative) {
+      console.log('');
+      console.log(chalk.bold('  Native bundle loading'));
 
-    if (hasExpoKey) {
-      // Expo project — add plugin to app.json if not already there
-      try {
-        const raw = JSON.parse(readFileSync(appJsonPath, 'utf-8'));
-        const plugins: any[] = raw.expo.plugins || [];
-        const alreadyHasPlugin = plugins.some((p: any) =>
-          (typeof p === 'string' ? p : p?.[0]) === 'sankofa-react-native'
-        );
-        if (alreadyHasPlugin) {
-          console.log(chalk.dim(`  · app.json already has sankofa-react-native plugin`));
-        } else {
-          raw.expo.plugins = [...plugins, 'sankofa-react-native'];
-          writeFileSync(appJsonPath, JSON.stringify(raw, null, 2) + '\n');
-          console.log(chalk.green(`  ✓ Added "sankofa-react-native" to app.json plugins`));
-          console.log(chalk.dim(`    Run ${chalk.cyan('npx expo prebuild --clean')} to regenerate native projects`));
+      const failures: string[] = [];
+
+      if (hasExpoKey) {
+        try {
+          const raw = JSON.parse(readFileSync(appJsonPath, 'utf-8'));
+          const plugins: any[] = raw.expo.plugins || [];
+          const alreadyHasPlugin = plugins.some((p: any) =>
+            (typeof p === 'string' ? p : p?.[0]) === 'sankofa-react-native'
+          );
+          if (alreadyHasPlugin) {
+            console.log(chalk.dim(`  · app.json already has sankofa-react-native plugin`));
+          } else {
+            raw.expo.plugins = [...plugins, 'sankofa-react-native'];
+            writeFileSync(appJsonPath, JSON.stringify(raw, null, 2) + '\n');
+            console.log(chalk.green(`  ✓ Added "sankofa-react-native" to app.json plugins`));
+            console.log(chalk.dim(`    Run ${chalk.cyan('npx expo prebuild --clean')} to regenerate native projects`));
+          }
+        } catch (err: any) {
+          console.log(chalk.yellow(`  ⚠ Could not patch app.json: ${err.message}`));
+          failures.push('expo');
         }
-      } catch (err: any) {
-        console.log(chalk.yellow(`  ⚠ Could not patch app.json: ${err.message}`));
-        failures.push('expo');
+      } else if (existsSync(join(cwd, 'android')) || existsSync(join(cwd, 'ios'))) {
+        const result = patchNativeFiles(cwd, chalk);
+        if (!result.android && existsSync(join(cwd, 'android'))) failures.push('android');
+        if (!result.ios && existsSync(join(cwd, 'ios'))) failures.push('ios');
       }
-    } else if (existsSync(join(cwd, 'android')) || existsSync(join(cwd, 'ios'))) {
-      // Bare RN project — patch native files directly
-      const result = patchNativeFiles(cwd, chalk);
-      if (!result.android && existsSync(join(cwd, 'android'))) failures.push('android');
-      if (!result.ios && existsSync(join(cwd, 'ios'))) failures.push('ios');
-    } else {
-      console.log(chalk.yellow(`  ⚠ No android/ or ios/ directories found. Run this command from your React Native project root.`));
-    }
 
-    // Show manual fallback for any failures
-    if (failures.length > 0) {
-      console.log('');
-      console.log(chalk.yellow('  ⚠ Some native files could not be patched automatically.'));
-      console.log(chalk.yellow('    Add the following manually:'));
-      console.log('');
-      if (failures.includes('expo')) {
-        console.log(chalk.dim('    app.json — add to the plugins array:'));
-        console.log(chalk.cyan('    "plugins": ["sankofa-react-native"]'));
+      if (failures.length > 0) {
         console.log('');
-      }
-      if (failures.includes('android')) {
-        console.log(chalk.dim('    Android — MainApplication.kt:'));
-        console.log(chalk.cyan(`    import dev.sankofa.rn.SankofaDeployBundleProvider
-
-    override fun getJSBundleFile(): String? {
-      return SankofaDeployBundleProvider.getJSBundleFile(applicationContext)
-        ?: super.getJSBundleFile()
-    }`));
+        console.log(chalk.yellow('  ⚠ Some native files could not be patched automatically.'));
+        console.log(chalk.yellow('    Add the following manually:'));
         console.log('');
+        if (failures.includes('expo')) {
+          console.log(chalk.dim('    app.json — add to the plugins array:'));
+          console.log(chalk.cyan('    "plugins": ["sankofa-react-native"]'));
+          console.log('');
+        }
+        if (failures.includes('android')) {
+          console.log(chalk.dim('    Android — MainApplication.kt:'));
+          console.log(chalk.cyan(`    import dev.sankofa.rn.SankofaDeployBundleProvider\n\n    override fun getJSBundleFile(): String? {\n      return SankofaDeployBundleProvider.getJSBundleFile(applicationContext)\n        ?: super.getJSBundleFile()\n    }`));
+          console.log('');
+        }
+        if (failures.includes('ios')) {
+          console.log(chalk.dim('    iOS — AppDelegate.swift:'));
+          console.log(chalk.cyan(`    import SankofaReactNative\n\n    override func bundleURL() -> URL? {\n      if let url = SankofaDeployBundleProvider.bundleURL() { return url }\n      return Bundle.main.url(forResource: "main", withExtension: "jsbundle")\n    }`));
+          console.log('');
+        }
       }
-      if (failures.includes('ios')) {
-        console.log(chalk.dim('    iOS — AppDelegate.swift:'));
-        console.log(chalk.cyan(`    import SankofaReactNative
 
-    override func bundleURL() -> URL? {
-      if let url = SankofaDeployBundleProvider.bundleURL() {
-        return url
-      }
-      return Bundle.main.url(forResource: "main", withExtension: "jsbundle")
-    }`));
-        console.log('');
-      }
-    }
-
-    console.log('');
-    console.log(chalk.bold('  Next steps'));
-    console.log('');
-
-    if (!hasSdk) {
-      console.log(chalk.dim('  1. Install the runtime SDK:'));
-      console.log(chalk.cyan(hasExpoKey ? '     npx expo install sankofa-react-native' : '     npm install sankofa-react-native'));
+      // Next steps — React Native
       console.log('');
-    } else {
-      console.log(chalk.dim(`  1. SDK already installed: sankofa-react-native@${deps['sankofa-react-native']}`));
+      console.log(chalk.bold('  Next steps'));
       console.log('');
-    }
-
-    console.log(chalk.dim('  2. Initialize the SDK in your app\'s root layout (once):'));
-    console.log(chalk.cyan(`     import { Sankofa, SankofaDeploy } from 'sankofa-react-native';
+      const hasSdk = !!deps['sankofa-react-native'];
+      if (!hasSdk) {
+        console.log(chalk.dim('  1. Install the runtime SDK:'));
+        console.log(chalk.cyan(hasExpoKey ? '     npx expo install sankofa-react-native' : '     npm install sankofa-react-native'));
+      } else {
+        console.log(chalk.dim(`  1. SDK already installed: sankofa-react-native@${deps['sankofa-react-native']}`));
+      }
+      console.log('');
+      console.log(chalk.dim('  2. Initialize in your root layout:'));
+      console.log(chalk.cyan(`     import { Sankofa, SankofaDeploy } from 'sankofa-react-native';
      Sankofa.initialize(API_KEY, { endpoint: '${endpoint}' });
      const deploy = new SankofaDeploy({ checkOnResume: true });
-     deploy.notifyAppReady(); // Prevents false auto-rollback
-     deploy.checkForUpdate().then(u => u.updateAvailable && (
-       u.isMandatory ? deploy.downloadAndApply(u) : deploy.downloadInBackground(u)
-     ));`));
-    console.log('');
+     deploy.notifyAppReady();`));
+      console.log('');
+      console.log(chalk.dim('  3. Verify everything:'));
+      console.log(chalk.cyan('     sankofa check'));
+      console.log('');
 
-    console.log(chalk.dim('  3. Run diagnostics to verify everything is wired up:'));
-    console.log(chalk.cyan('     sankofa doctor'));
-    console.log('');
-    console.log(chalk.dim('  4. Ship your first release:'));
-    console.log(chalk.cyan('     sankofa release ios'));
-    console.log('');
+    } else if (isFlutter) {
+      // Next steps — Flutter
+      const pubspecRaw = existsSync(join(cwd, 'pubspec.yaml')) ? readFileSync(join(cwd, 'pubspec.yaml'), 'utf-8') : '';
+      const hasSdk = pubspecRaw.includes('sankofa_flutter');
+
+      console.log('');
+      console.log(chalk.bold('  Next steps'));
+      console.log('');
+      if (!hasSdk) {
+        console.log(chalk.dim('  1. Install the runtime SDK:'));
+        console.log(chalk.cyan('     flutter pub add sankofa_flutter'));
+      } else {
+        console.log(chalk.dim('  1. SDK already installed: sankofa_flutter'));
+      }
+      console.log('');
+      console.log(chalk.dim('  2. Initialize in your main.dart:'));
+      console.log(chalk.cyan(`     await Sankofa.instance.init(
+       apiKey: 'YOUR_API_KEY',
+       endpoint: '${endpoint}',
+       enableSessionReplay: true,
+     );`));
+      console.log('');
+      console.log(chalk.dim('  3. Add screen tracking:'));
+      console.log(chalk.cyan(`     MaterialApp(
+       navigatorObservers: [SankofaNavigatorObserver()],
+     )`));
+      console.log('');
+      console.log(chalk.dim('  4. Verify everything:'));
+      console.log(chalk.cyan('     sankofa check'));
+      console.log('');
+
+    } else {
+      console.log('');
+      console.log(chalk.yellow('  ⚠ Could not detect platform. Make sure you run this from your project root.'));
+      console.log(chalk.dim('    Supported: React Native (Expo or bare), Flutter'));
+      console.log('');
+    }
   });
 
 // ── Native Patching ───────────────────────────────────────────────────────────
