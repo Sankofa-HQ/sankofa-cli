@@ -120,14 +120,20 @@ export const initCommand = new Command('init')
     const hasPubspec = existsSync(join(cwd, 'pubspec.yaml'));
     const isFlutter = hasPubspec;
     const isReactNative = !isFlutter && !!(deps['react-native'] || deps['expo']);
+    const hasHtmlIndex = existsSync(join(cwd, 'index.html'));
+    const isWeb = !isFlutter && !isReactNative && !!(deps['react'] || deps['next'] || deps['vue'] || deps['nuxt'] || deps['svelte'] || deps['vite'] || deps['webpack'] || deps['angular'] || hasHtmlIndex);
 
     const appJsonPath = join(cwd, 'app.json');
     const hasExpoKey = existsSync(appJsonPath) && (() => {
       try { return !!JSON.parse(readFileSync(appJsonPath, 'utf-8'))?.expo; } catch { return false; }
     })();
 
+    const platformLabel = isFlutter ? 'Flutter'
+      : isReactNative ? (hasExpoKey ? 'React Native (Expo)' : 'React Native (bare)')
+      : isWeb ? 'Web / JavaScript'
+      : 'Unknown';
     console.log('');
-    console.log(chalk.dim(`  · Platform: ${isFlutter ? 'Flutter' : isReactNative ? (hasExpoKey ? 'React Native (Expo)' : 'React Native (bare)') : 'Unknown'}`));
+    console.log(chalk.dim(`  · Platform: ${platformLabel}`));
 
     // ── Platform-specific setup ──
     if (isReactNative) {
@@ -236,10 +242,52 @@ export const initCommand = new Command('init')
       console.log(chalk.cyan('     sankofa check'));
       console.log('');
 
+    } else if (isWeb) {
+        const webSdk = deps['@sankofa/browser'] || deps['sankofa-js'] || deps['@sankofa/web'];
+        const usesNpm = !!pkg;
+        console.log('');
+        console.log(chalk.bold('  Next steps'));
+        console.log('');
+        if (webSdk) {
+          console.log(chalk.dim(`  1. SDK already installed: ${Object.keys(deps).find(k => k.includes('sankofa'))}@${webSdk}`));
+        } else if (usesNpm) {
+          console.log(chalk.dim('  1. Install the runtime SDK:'));
+          console.log(chalk.cyan('     npm install @sankofa/browser'));
+        } else {
+          console.log(chalk.dim('  1. Add the SDK to your HTML:'));
+          console.log(chalk.cyan('     <script src="https://cdn.jsdelivr.net/npm/@sankofa/browser/dist/sankofa.min.js"></script>'));
+        }
+        console.log('');
+        if (usesNpm) {
+          console.log(chalk.dim('  2. Initialize in your app entry:'));
+          console.log(chalk.cyan(`     import { Sankofa } from '@sankofa/browser';
+     await Sankofa.init({
+       apiKey: 'YOUR_API_KEY',
+       endpoint: '${endpoint}',
+     });`));
+        } else {
+          console.log(chalk.dim('  2. Initialize after the script tag:'));
+          console.log(chalk.cyan(`     <script>
+       Sankofa.init({
+         apiKey: 'YOUR_API_KEY',
+         endpoint: '${endpoint}',
+       });
+     </script>`));
+        }
+        console.log('');
+        console.log(chalk.dim('  3. Track events and identify users:'));
+        console.log(chalk.cyan(`     Sankofa.track('button_clicked', { label: 'Sign Up' });
+     Sankofa.identify('user_123');
+     Sankofa.setPerson({ name: 'Sam', email: 'sam@example.com' });`));
+        console.log('');
+        console.log(chalk.dim('  4. Verify everything:'));
+        console.log(chalk.cyan('     sankofa check'));
+        console.log('');
+
     } else {
       console.log('');
-      console.log(chalk.yellow('  ⚠ Could not detect platform. Make sure you run this from your project root.'));
-      console.log(chalk.dim('    Supported: React Native (Expo or bare), Flutter'));
+      console.log(chalk.yellow('  ⚠ Could not detect platform. No package.json or pubspec.yaml found.'));
+      console.log(chalk.dim('    Supported: React Native, Flutter, Web (React, Next.js, Vue, Svelte)'));
       console.log('');
     }
   });

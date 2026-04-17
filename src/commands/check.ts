@@ -82,7 +82,27 @@ function detectPlatform(cwd: string): Platform {
   if (deps['next'] || deps['nuxt'] || deps['vite'] || deps['webpack'] || deps['react'] || deps['vue'] || deps['svelte'] || deps['angular']) return 'web';
   if (existsSync(join(cwd, 'Package.swift')) || existsSync(join(cwd, `${cwd.split('/').pop()}.xcodeproj`))) return 'ios';
   if (existsSync(join(cwd, 'app', 'build.gradle')) || existsSync(join(cwd, 'app', 'build.gradle.kts'))) return 'android';
+  // Plain HTML — look for .html files containing sankofa or any .html at all
+  if (hasHtmlFiles(cwd)) return 'web';
   return 'unknown';
+}
+
+function hasHtmlFiles(cwd: string): boolean {
+  const candidates = ['index.html', 'index.htm'];
+  for (const f of candidates) {
+    if (existsSync(join(cwd, f))) return true;
+  }
+  // Check common directories
+  for (const dir of ['public', 'dist', 'www', 'static', '.']) {
+    const d = join(cwd, dir);
+    if (!existsSync(d)) continue;
+    try {
+      for (const entry of readdirSync(d)) {
+        if (entry.endsWith('.html')) return true;
+      }
+    } catch { /* skip */ }
+  }
+  return false;
 }
 
 function buildContext(cwd: string, chalk: any): ProjectContext {
@@ -327,28 +347,155 @@ function checkAnalyticsFlutter(ctx: ProjectContext): CheckResult[] {
 function checkAnalyticsWeb(ctx: ProjectContext): CheckResult[] {
   const results: CheckResult[] = [];
 
-  // Check for web SDK
-  const webSdk = ctx.deps['sankofa-js'] || ctx.deps['@sankofa/web'] || ctx.deps['@sankofa/browser'];
-  results.push(webSdk
-    ? { name: 'SDK installed', status: 'ok', detail: `${Object.keys(ctx.deps).find(k => k.includes('sankofa'))}@${webSdk}` }
-    : { name: 'SDK installed', status: 'fail', detail: 'no Sankofa web SDK found in dependencies', fix: 'npm install @sankofa/web' });
+  // SDK installed — check npm deps first, then CDN script tags in HTML
+  const sdkName = Object.keys(ctx.deps).find(k => k.includes('sankofa'));
+  const webSdk = ctx.deps['@sankofa/browser'] || ctx.deps['sankofa-js'] || ctx.deps['@sankofa/web'];
+  const isNpmProject = !!ctx.pkg;
 
-  // Check for script tag or import
-  const srcDirs = ['src', 'app', 'pages', 'public', 'lib'];
-  let found = false;
+  // Scan HTML files for CDN script tags
+  const htmlDirs = ['.', 'public', 'dist', 'www', 'static', 'src'];
+  let cdnHtmlFile = '';
+  for (const d of htmlDirs) {
+    const f = findFileContaining(join(ctx.cwd, d), '.html', 'sankofa');
+    if (f) { cdnHtmlFile = f; break; }
+  }
+
+  if (webSdk) {
+    results.push({ name: 'SDK installed', status: 'ok', detail: `${sdkName}@${webSdk}` });
+  } else if (cdnHtmlFile) {
+    const htmlSrc = readFileSync(cdnHtmlFile, 'utf-8');
+    const hasCdn = htmlSrc.includes('cdn.jsdelivr.net') || htmlSrc.includes('unpkg.com') || htmlSrc.includes('sankofa.min.js') || htmlSrc.includes('sankofa.js');
+    results.push(hasCdn
+      ? { name: 'SDK loaded', status: 'ok', detail: `via CDN script tag in ${cdnHtmlFile.replace(ctx.cwd + '/', '')}` }
+      : { name: 'SDK loaded', status: 'ok', detail: `sankofa reference found in ${cdnHtmlFile.replace(ctx.cwd + '/', '')}` });
+  } else {
+    results.push({ name: 'SDK installed', status: 'fail', detail: 'no Sankofa SDK found in dependencies or HTML files', fix: isNpmProject ? 'npm install @sankofa/browser' : 'Add <script src="https://cdn.jsdelivr.net/npm/@sankofa/browser/dist/sankofa.min.js"></script> to your HTML' });
+  }
+
+  // Find initialization — JS/TS files first, then inline in HTML
+  const srcDirs = ['src', 'app', 'pages', 'lib', 'components', 'js', 'scripts', 'assets'];
+  const exts = ['.tsx', '.ts', '.jsx', '.js'];
+  let initFile = '';
+  let src = '';
   for (const d of srcDirs) {
-    const f = findFileContaining(join(ctx.cwd, d), '.ts', 'sankofa')
-      || findFileContaining(join(ctx.cwd, d), '.js', 'sankofa')
-      || findFileContaining(join(ctx.cwd, d), '.tsx', 'sankofa')
-      || findFileContaining(join(ctx.cwd, d), '.html', 'sankofa');
-    if (f) {
-      results.push({ name: 'SDK initialization', status: 'ok', detail: f.replace(ctx.cwd + '/', '') });
-      found = true;
-      break;
+    for (const ext of exts) {
+      const f = findFileContaining(join(ctx.cwd, d), ext, 'Sankofa.init');
+      if (f) { initFile = f; src = readFileSync(f, 'utf-8'); break; }
+    }
+    if (initFile) break;
+  }
+
+  // Fallback: look for any sankofa import in JS/TS
+  if (!initFile) {
+    for (const d of srcDirs) {
+      for (const ext of exts) {
+        const f = findFileContaining(join(ctx.cwd, d), ext, '@sankofa/browser')
+          || findFileContaining(join(ctx.cwd, d), ext, 'sankofa-js');
+        if (f) { initFile = f; src = readFileSync(f, 'utf-8'); break; }
+      }
+      if (initFile) break;
     }
   }
-  if (!found) {
-    results.push({ name: 'SDK initialization', status: 'warn', detail: 'no Sankofa import/script found in source', fix: 'Initialize the Sankofa SDK in your app entry point' });
+
+  // Fallback: check inline scripts in HTML files
+  if (!initFile && cdnHtmlFile) {
+    const htmlSrc = readFileSync(cdnHtmlFile, 'utf-8');
+    if (htmlSrc.includes('Sankofa.init')) {
+      initFile = cdnHtmlFile;
+      src = htmlSrc;
+    }
+  }
+  // Also check root-level JS files (no subdirectory)
+  if (!initFile) {
+    for (const ext of ['.js', '.ts']) {
+      try {
+        for (const entry of readdirSync(ctx.cwd)) {
+          if (entry.endsWith(ext) && existsSync(join(ctx.cwd, entry))) {
+            const content = readFileSync(join(ctx.cwd, entry), 'utf-8');
+            if (content.includes('Sankofa.init') || content.includes('sankofa')) {
+              initFile = entry; src = content; break;
+            }
+          }
+        }
+      } catch { /* skip */ }
+      if (initFile) break;
+    }
+  }
+
+  results.push(initFile
+    ? { name: 'Sankofa.init()', status: 'ok', detail: initFile.replace(ctx.cwd + '/', '') }
+    : { name: 'Sankofa.init()', status: 'fail', detail: 'Sankofa.init() not found in source', fix: "import { Sankofa } from '@sankofa/browser'; Sankofa.init({ apiKey, endpoint });" });
+
+  // API key
+  if (src) {
+    const keyMatch = src.match(/['"]sk_(?:test|live)_[a-f0-9]+['"]/);
+    const envMatch = src.match(/(?:VITE_|NEXT_PUBLIC_|REACT_APP_)SANKOFA_API_KEY/);
+    if (keyMatch) {
+      const key = keyMatch[0].replace(/['"]/g, '');
+      if (key.startsWith('sk_test_')) {
+        results.push({ name: 'API key', status: 'warn', detail: `using test key (${key.slice(0, 16)}...)`, fix: 'Switch to a live key before shipping to production' });
+      } else {
+        results.push({ name: 'API key', status: 'ok', detail: 'live key configured' });
+      }
+    } else if (envMatch) {
+      results.push({ name: 'API key', status: 'ok', detail: `loaded from env var (${envMatch[0]})` });
+    } else if (src.includes('apiKey')) {
+      results.push({ name: 'API key', status: 'ok', detail: 'apiKey configured' });
+    }
+  }
+
+  // Helper: search all source locations (JS/TS dirs + HTML + root files)
+  const searchAll = (needle: string): boolean => {
+    // JS/TS subdirectories
+    for (const d of srcDirs) {
+      for (const ext of exts) {
+        if (findFileContaining(join(ctx.cwd, d), ext, needle)) return true;
+      }
+    }
+    // HTML files
+    for (const d of htmlDirs) {
+      if (findFileContaining(join(ctx.cwd, d), '.html', needle)) return true;
+    }
+    // Root-level JS files
+    try {
+      for (const entry of readdirSync(ctx.cwd)) {
+        if ((entry.endsWith('.js') || entry.endsWith('.ts')) && existsSync(join(ctx.cwd, entry))) {
+          if (readFileSync(join(ctx.cwd, entry), 'utf-8').includes(needle)) return true;
+        }
+      }
+    } catch { /* skip */ }
+    return false;
+  };
+
+  // Event tracking
+  const usesTrack = searchAll('Sankofa.track');
+  results.push(usesTrack
+    ? { name: 'Event tracking', status: 'ok', detail: 'Sankofa.track() found' }
+    : { name: 'Event tracking', status: 'warn', detail: 'no Sankofa.track() calls found', fix: "Sankofa.track('event_name', { property: value })" });
+
+  // User identification
+  const usesIdentify = searchAll('Sankofa.identify');
+  results.push(usesIdentify
+    ? { name: 'User identification', status: 'ok', detail: 'Sankofa.identify() found' }
+    : { name: 'User identification', status: 'warn', detail: 'no Sankofa.identify() calls found', fix: "Add Sankofa.identify('user_id') after login to link events to users" });
+
+  // Screen / page tracking
+  const usesScreen = searchAll('Sankofa.screen');
+  if (src && src.includes('autocapture')) {
+    results.push({ name: 'Page tracking', status: 'ok', detail: 'autocapture configured (auto pageviews)' });
+  } else if (usesScreen) {
+    results.push({ name: 'Page tracking', status: 'ok', detail: 'Sankofa.screen() found' });
+  } else {
+    results.push({ name: 'Page tracking', status: 'warn', detail: 'no page/screen tracking found', fix: "Add autocapture: true to Sankofa.init() or call Sankofa.screen('PageName') manually" });
+  }
+
+  // Session replay
+  if (src) {
+    if (src.includes('sessionReplayPlugin') || src.includes('replay')) {
+      results.push({ name: 'Session Replay', status: 'ok', detail: 'session replay plugin configured' });
+    } else {
+      results.push({ name: 'Session Replay', status: 'warn', detail: 'session replay plugin not found', fix: "import { sessionReplayPlugin } from '@sankofa/browser'; add to plugins array in Sankofa.init()" });
+    }
   }
 
   return results;
@@ -491,15 +638,20 @@ async function checkApiAccess(ctx: ProjectContext, module: string): Promise<Chec
         if (match) { apiKey = match[0].replace(/['"]/g, ''); break; }
       }
     }
-    // Flutter: scan lib/ for API keys
+    // Scan broader directories for API keys (Flutter lib/, web js/, HTML files)
     if (!apiKey) {
-      const libDir = join(ctx.cwd, 'lib');
-      if (existsSync(libDir)) {
-        const dartFile = findFileContaining(libDir, '.dart', 'sk_test_') || findFileContaining(libDir, '.dart', 'sk_live_');
-        if (dartFile) {
-          const src = readFileSync(dartFile, 'utf-8');
-          const match = src.match(/['"]sk_(?:test|live)_[a-f0-9]+['"]/);
-          if (match) apiKey = match[0].replace(/['"]/g, '');
+      const scanDirs = ['lib', 'js', 'scripts', 'src', 'assets', '.'];
+      const scanExts = ['.dart', '.js', '.ts', '.html'];
+      for (const d of scanDirs) {
+        if (apiKey) break;
+        const dir = d === '.' ? ctx.cwd : join(ctx.cwd, d);
+        for (const ext of scanExts) {
+          const f = findFileContaining(dir, ext, 'sk_test_') || findFileContaining(dir, ext, 'sk_live_');
+          if (f) {
+            const content = readFileSync(f, 'utf-8');
+            const match = content.match(/['"]sk_(?:test|live)_[a-f0-9]+['"]/);
+            if (match) { apiKey = match[0].replace(/['"]/g, ''); break; }
+          }
         }
       }
     }
