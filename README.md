@@ -121,33 +121,51 @@ Requirements:
 
 ## Concepts
 
-- **Base release** — an OTA archive tied to a specific `target_binary_version` (e.g. `1.2.0`). Ships with the embedded native binary's first build for that version. Label is `v<version>`.
-- **Patch release** — a JS + assets archive that updates a base. Label is `<base-label>-patch.<n>` (e.g. `v1.2.0-patch.3`). Inherits the base's native binary metadata.
-- **OTA archive (`ota.zip`)** — `bundle.jsbundle` + `assets/`. Unzipped on-device into `Library/Application Support/SankofaDeploy/<label>_<hash>/`. RN's `AssetSourceResolver` resolves `assets/...` relative to the bundle URL's directory, so every font/image the JS references is found.
-- **Native preview artifact** — iOS `.app.zip` (simulator) or Android `.apk`. Used only by `sankofa preview` to reproduce what real users see. NOT submittable to a store.
-- **Distribution binary** — iOS `.ipa` (App Store / TestFlight) or Android `.aab` / `.apk` (Play Store). Built only with `--distribution`. This is what `sankofa submit` uploads.
-- **Rollout** — percentage of unique devices that receive a given release, bucketed deterministically by a sha256 of `(distinctId, releaseId)`.
-- **Mandatory update** — forces the app to download-and-apply immediately instead of staging for next launch.
+- **Base release** — a release tied to a specific native binary version (e.g. `1.2.0`). Created with `sankofa release`.
+- **Patch release** — a JavaScript-only update against an existing base release. Created with `sankofa patch`. No native rebuild required.
+- **Rollout** — percentage of devices that receive a given release. Deterministic per device — increasing the percentage only adds new devices, never removes existing ones.
+- **Mandatory update** — forces the app to download and apply immediately instead of waiting for next launch.
+- **Kill switch** — instantly disables a release for all devices. Takes effect on next app launch.
 
 ---
 
 ## Quickstart
 
+### Any platform (Analytics)
+
 ```bash
-# 1. Auth (browser flow).
+# 1. Set up the project.
+sankofa init
+
+# 2. Log in.
 sankofa login
 
-# 2. Ship the first release. Every `release` builds the OTA archive AND the
-#    signed store binary — you always have something submittable. Append
-#    --skip-distribution only on OTA-only CI lanes.
+# 3. Verify everything is wired up.
+sankofa check
+
+# Done. Events flow to your Sankofa dashboard.
+```
+
+### React Native (Analytics + Deploy)
+
+```bash
+# 1. Set up — auto-patches native files + adds Expo plugin.
+sankofa init
+
+# 2. Log in.
+sankofa login
+
+# 3. Verify the full setup.
+sankofa check
+
+# 4. Ship the first release (OTA + signed store binary).
 sankofa release ios
 sankofa submit ios --apple-api-key-id ABC --apple-api-issuer UUID
 
-# 3. After the store build is out, ship a JS/assets-only patch:
+# 5. After the store build is out, ship a JS/assets-only patch:
 sankofa patch ios
 
-# 4. Need to rebuild JUST the signed binary for the current version
-#    (e.g. signing certs refreshed, release already exists):
+# 6. Need to rebuild JUST the signed binary?
 sankofa dist ios
 sankofa submit ios
 ```
@@ -188,6 +206,83 @@ Resolution order (highest wins):
 ---
 
 ## Commands
+
+### `init`
+
+Set up Sankofa in any project. Auto-detects the platform and does the right thing.
+
+```bash
+sankofa init                             # auto-detect platform, create config
+sankofa init --endpoint https://api.sankofa.dev --project-id proj_...
+sankofa init --force                     # overwrite existing .sankofa.json
+```
+
+**What it does per platform:**
+
+- **React Native (Expo)** — creates `.sankofa.json`, updates `.gitignore`, adds `sankofa-react-native` to `app.json` plugins.
+- **React Native (bare)** — same + patches `MainApplication.kt` and `AppDelegate.swift` with the OTA bundle provider. If patching fails, prints the exact code to add manually.
+- **Flutter** — creates `.sankofa.json`, updates `.gitignore`, prints Dart initialization code.
+- **Web** — creates `.sankofa.json`, updates `.gitignore`, prints CDN `<script>` or `npm install` instructions.
+- **iOS / Android** — creates `.sankofa.json`, updates `.gitignore`, prints platform-specific SDK setup.
+
+Idempotent — safe to run multiple times. Existing `.sankofa.json` is preserved unless `--force` is passed.
+
+### `check`
+
+Verify your entire Sankofa integration is correct. Run it before shipping, after updating the SDK, or when something breaks.
+
+```bash
+sankofa check                  # run all module checks for the detected platform
+sankofa check analytics        # analytics-specific checks only
+sankofa check deploy           # deploy-specific checks only (React Native)
+```
+
+Every failed check shows a `→ fix` command. Example output:
+
+```
+  Sankofa — Full Configuration Check
+  Platform: React Native
+  ──────────────────────────────────
+
+  CREDENTIALS & SERVER
+  ✓ Project config     project proj_abc123, env live
+  ✓ CLI credentials    project proj_abc123
+  ✓ Server reachable   https://api.sankofa.dev — responding
+
+  ANALYTICS
+  ✓ SDK installed          sankofa-react-native@0.1.0
+  ✓ Sankofa.initialize()   app/_layout.tsx
+  ✓ Session Replay         recordSessions configured
+  ✓ Screen tracking        useSankofaScreen() found
+  ✓ Event tracking         Sankofa.track() found
+  ✓ Analytics API access   API key valid and accessible
+
+  ✓ Analytics is fully configured and ready!
+
+  DEPLOY
+  ✓ SDK installed             sankofa-react-native@0.1.0
+  ✓ Expo config plugin        sankofa-react-native in app.json plugins
+  ✓ Android bundle provider   wired in MainApplication.kt
+  ✓ iOS bundle provider       wired in AppDelegate.swift
+  ✓ notifyAppReady()          health confirmation present
+  ✓ checkForUpdate()          update check present
+  ✓ Deploy API access         authenticated and accessible
+
+  ✓ Deploy is fully configured and ready!
+```
+
+**Analytics checks** (all platforms): SDK installed, initialization found in source, API key validation (test vs live vs placeholder), session replay, screen/page tracking, event tracking, user identification, API key server verification.
+
+**Deploy checks** (React Native only): Expo config plugin or native bundle provider patching, `notifyAppReady()`, `checkForUpdate()`, `.gitignore` coverage, authenticated API access.
+
+### `doctor`
+
+Low-level toolchain diagnostics. Checks Node, Xcode, CocoaPods, Java, Android SDK, and server reachability.
+
+```bash
+sankofa doctor
+sankofa doctor --project /path/to/app
+```
 
 ### `login`
 
@@ -235,12 +330,7 @@ Prints each release's label, platform, target version, rollout %, install count,
 
 Build + publish a **base release**.
 
-Every `release` produces, in this order, **three things you can see and verify**:
-1. A **preview native artifact** (`.app.zip` / `.apk`) consumed by `sankofa preview`.
-2. An **OTA archive** (`ota.<platform>.zip`) uploaded to the Sankofa server.
-3. A **signed store binary** (`.ipa` / `.aab`) ready for App Store Connect or Play Console — unless you pass `--skip-distribution`.
-
-There's no `--distribution` flag; distribution is always on. If you genuinely only want OTA (e.g. a CI lane that ships the binary via a separate process), pass `--skip-distribution`.
+Every `release` builds the native app, publishes the OTA update, and produces a signed store binary (`.ipa` / `.aab`) — all in one command. Pass `--skip-distribution` if you only need OTA.
 
 ```bash
 sankofa release ios                                 # OTA + signed .ipa
@@ -328,9 +418,7 @@ sankofa preview ios --no-logs        # do not stream runtime logs
 - `--no-logs` — don't attach to the app's stdout after launch. Default: logs stream live via `xcrun simctl launch --console-pty` (iOS) or `adb logcat --pid=…` (Android). Ctrl+C detaches without killing the app.
 - `--project <path>` — RN app root override.
 
-For **patches**, the CLI extracts the OTA archive locally, copies `bundle.jsbundle` + `assets/` into the simulator's data container at `Library/Application Support/SankofaDeployPreview/<label>/`, and seeds the SDK's `sankofa_deploy_bundle_path` so the app loads exactly that bundle on startup.
-
-For **base releases**, only the label is seeded (the embedded bundle provides the JS). This prevents the SDK from re-downloading the very release you just previewed.
+The CLI downloads the release, installs it on the simulator/emulator, and configures the SDK to load the correct bundle on startup.
 
 ### `dist`
 
@@ -403,54 +491,33 @@ Uses `googleapis` to: create an edit → upload `.aab`/`.apk` → set the chosen
 
 ---
 
-## The release pipeline in detail
+## The release pipeline
 
-Every `sankofa release <platform>` runs the following, in order:
+Every `sankofa release <platform>` handles the full pipeline automatically:
 
-1. **Auth check** — short-circuits before any prompt if credentials are missing.
-2. **Resolve project root** — walks up from `cwd`, or uses `--project`. Prompts among candidates in a monorepo.
-3. **Sync native from `app.json`** — `npx expo prebuild --platform <platform> --no-install --non-interactive`. Keeps `CFBundleShortVersionString` / `versionName` in lock-step with `app.json`'s version.
-4. **Detect version** — reads Info.plist or build.gradle first (that's what the SDK reads at runtime). If `app.json` disagrees, throws immediately with the `expo prebuild` instruction — never publishes a cross-version release.
-5. **Duplicate-version check** — if there's already a base release for this version + platform, the CLI suggests `sankofa patch` instead and exits.
-6. **Clear build caches** — `./build` gets wiped. Native caches (`ios/build`, `android/.gradle`) are deliberately kept for incremental rebuilds.
-7. **Pod install** (iOS) — always runs. A no-op when `Podfile.lock` matches `Pods/Manifest.lock`, so podspec changes from a linked SDK never slip through silently.
-8. **Native build**:
-    - iOS: `xcodebuild -configuration Release -sdk iphonesimulator -derivedDataPath …`. Full stderr is captured to `build/xcodebuild.log`; on failure, the relevant error lines are surfaced inline.
-    - Android: `./gradlew assembleRelease`.
-9. **Stage OTA from the native artifact** — extracts `bundle.jsbundle` + `assets/` directly out of the `.app` / `.apk`. This is what guarantees byte-identical asset IDs between the embedded bundle and the uploaded archive: Metro isn't deterministic across runs, so we never call Metro twice for the same release.
-10. **`zip -r ota.<platform>.zip .`** inside the stage dir. Flat layout, absolute archive path.
-11. **SHA256** of the archive bytes.
-12. **Upload** — POSTs `bundle=ota.zip` + `bundle_format=zip` + the native preview artifact + metadata to `POST /api/v1/deploy/releases`.
-13. **Distribution build** — `xcodebuild archive` → `xcodebuild -exportArchive` with an `ExportOptions.plist` (iOS), or `./gradlew bundleRelease` (Android). Runs on every `release` unless `--skip-distribution` is passed. A failure here is non-fatal — the OTA release is already published; the CLI prints `sankofa dist <platform>` to retry the signed-binary step once signing is fixed.
-14. **Summary** — OTA + preview + distribution artifact paths, sizes, and SHA256s are printed in bold with highlighted hashes.
+1. **Auth check** — verifies credentials before any prompt.
+2. **Version detection** — reads the native binary version and validates it matches `app.json`.
+3. **Native build** — builds the app, extracts the JavaScript bundle and assets.
+4. **Upload** — publishes the release to the Sankofa server with integrity verification.
+5. **Distribution build** — produces a signed `.ipa` / `.aab` for store submission (unless `--skip-distribution`).
 
-`sankofa patch` is the same pipeline minus steps 8–10 (no native build), plus Metro with `--assets-dest` to emit `bundle.jsbundle` + `assets/` manually, which then get zipped.
+`sankofa patch` skips the native build — it bundles only JavaScript and assets for a lightweight OTA update.
 
 ---
 
 ## Asset handling (fonts, images, videos…)
 
-Sankofa Deploy ships assets inside the OTA archive — this is what makes `useFonts`, `require('./image.png')`, and any other asset reference survive a patch.
-
-- CLI emits `assets/` alongside `bundle.jsbundle` via Metro's `--assets-dest` flag, or copies the directory out of the native artifact (for base releases).
-- SDK unzips the archive into `Library/Application Support/SankofaDeploy/<label>_<hash>/` (iOS) or `filesDir/SankofaDeploy/<label>_<hash>/` (Android).
-- AppDelegate / ReactHost reads `sankofa_deploy_bundle_path` and hands RN a `file://…/bundle.jsbundle` URL.
-- RN's `AssetSourceResolver` resolves every `assets/…` path relative to the bundle URL's directory — so the fonts/images next to `bundle.jsbundle` are found. No custom native resolver needed.
-
-Asset drift cause-of-death (byte-different Metro output) is avoided for base releases by copying from the freshly-built `.app` and avoided for patches by shipping the assets alongside the bundle. A patch bundle can't reference an asset that wasn't also in its archive.
+Sankofa Deploy ships assets alongside the JavaScript bundle — fonts, images, and any other resources referenced by your code survive OTA patches automatically. No additional configuration needed.
 
 ---
 
 ## Rollout, rollback, and crash reporting
 
-- **Rollout %** is deterministic per device (`sha256(distinctId + releaseId) mod 100 < percent`). Increasing a rollout only adds new devices; the sampled set is stable.
-- **Mandatory** updates call `downloadAndApply` immediately after `checkForUpdate`. Optional updates call `downloadInBackground` (applied on next restart).
-- **Auto-rollback**: if the native binary boots twice within 30 seconds without calling `deploy.notifyAppReady()`, the SDK reverts to the previous bundle, fires a `rollback` event, and sets `rolled_back_label` so the same bad label won't be re-downloaded. A 10-second auto-confirm timer is the safety net.
-- **Global JS error handler**: the SDK installs `ErrorUtils.setGlobalHandler` so uncaught fatal errors in an OTA bundle immediately roll back, fire `crash_on_update`, and reload. Embedded-bundle crashes don't fire a rollback (there's nothing to roll back to) but still report the crash.
-- **Debounce**: repeated fatal errors in the same session only fire one `rollback` event. No inflated counters from Retry-button spam.
-- **Dashboard** surfaces `total_installs`, `total_rollbacks`, `total_crashes`, `unique_devices` per release.
-
-Exposed as `SankofaDeploy.reportError(err, { fatal })` for apps to forward ErrorBoundary catches (Expo Router's boundary is wrapped in the bundled example).
+- **Rollout** — phased rollouts let you ship to a small percentage of users first, then increase gradually. The rollout is deterministic — increasing the percentage only adds devices, never removes ones that already received the update.
+- **Auto-rollback** — if the app crashes repeatedly after an OTA update, the SDK automatically reverts to the previous working bundle.
+- **Kill switch** — instantly disable a release for all users from the dashboard or CLI.
+- **Crash monitoring** — the dashboard tracks crash rates per release. Staged rollout schedules can auto-pause or auto-halt when crash rates exceed configured thresholds.
+- **Error reporting** — use `deploy.reportError(err, { fatal: true })` to report errors from your ErrorBoundary for accurate crash-rate tracking.
 
 ---
 
@@ -524,16 +591,16 @@ The last ~15 error lines print inline. The full log is at `build/xcodebuild.log`
 A new pod dependency landed. Run `cd ios && bundle exec pod install` once. `sankofa release` does this for you on every run but if you bypassed it with `--no-native-artifact`, do it manually.
 
 **"Downloaded v1.2.0-patch.X. Applies on next restart." repeating every launch**  
-The bridge didn't reload. Fixed in SDK ≥ current version — the SDK now posts `RCTTriggerReloadCommandNotification` (not the deprecated `RCTBridgeWillReloadNotification`). Also, `downloadInBackground` no-ops when the same label is already pending, so even a bad reload can't loop.
+Update to the latest SDK version. If it persists, the app's reload mechanism may not be configured correctly — run `sankofa check deploy` for diagnostics.
 
 **"Font registration was unsuccessful" after OTA**  
-An asset reference drifted. Base releases avoid this by extracting bundle + assets from the signed native artifact. Patches ship assets via `--assets-dest`. If you still hit it, the OTA archive is missing the asset — inspect with `unzip -l build/ota.<platform>.zip`.
+An asset is missing from the update bundle. Run `sankofa check deploy` and verify your assets are included in the release.
 
 **Preview says `Up to date` but a patch exists on the dashboard**  
-Watch the reason in parens: `no_matching_release` (wrong version), `not_in_rollout` (device's distinctId hash is above the rollout %), `missing_update_context` (empty version sent), `check_network_error:…` (simulator can't reach the endpoint). If it's a network error, check `SANKOFA_ENDPOINT` vs what the app hits — simulator can reach LAN IPs via `NSAllowsLocalNetworking`.
+Check the reason shown in parentheses — common causes are version mismatch, rollout percentage, or network connectivity. Run `sankofa doctor` to diagnose.
 
-**Preview says `Update check failed: check_network_error:…`**  
-The app couldn't reach the Sankofa server. `curl <your endpoint>/healthz` from your host to confirm the server is listening on the right address; if yes, the simulator's network is the suspect.
+**App can't reach the server**  
+Run `sankofa doctor` to verify server reachability. For local development, ensure the simulator/emulator can reach your endpoint (use LAN IP, not `localhost`).
 
 ---
 
