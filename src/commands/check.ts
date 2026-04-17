@@ -489,14 +489,179 @@ function checkAnalyticsWeb(ctx: ProjectContext): CheckResult[] {
     results.push({ name: 'Page tracking', status: 'warn', detail: 'no page/screen tracking found', fix: "Add autocapture: true to Sankofa.init() or call Sankofa.screen('PageName') manually" });
   }
 
-  // Session replay
-  if (src) {
-    if (src.includes('sessionReplayPlugin') || src.includes('replay')) {
-      results.push({ name: 'Session Replay', status: 'ok', detail: 'session replay plugin configured' });
-    } else {
-      results.push({ name: 'Session Replay', status: 'warn', detail: 'session replay plugin not found', fix: "import { sessionReplayPlugin } from '@sankofa/browser'; add to plugins array in Sankofa.init()" });
-    }
+  // Session replay — check source + HTML files for replay plugin/script
+  const hasReplayInSource = src && (src.includes('sessionReplayPlugin') || src.includes('SankofaReplay') || src.includes('rrwebReplayPlugin'));
+  const hasReplayCdn = cdnHtmlFile && readFileSync(cdnHtmlFile, 'utf-8').includes('sankofa-replay');
+  const hasReplayDep = !!ctx.deps['@sankofa/replay-rrweb'];
+  if (hasReplayInSource || hasReplayCdn || hasReplayDep) {
+    results.push({ name: 'Session Replay', status: 'ok', detail: hasReplayCdn ? 'replay CDN script + plugin configured' : 'session replay plugin configured' });
+  } else {
+    results.push({ name: 'Session Replay', status: 'warn', detail: 'session replay not configured', fix: isNpmProject
+      ? "npm install @sankofa/replay-rrweb — then add rrwebReplayPlugin() to plugins in Sankofa.init()"
+      : 'Add <script src="https://cdn.jsdelivr.net/npm/@sankofa/replay-rrweb/dist/sankofa-replay.min.js"></script> and SankofaReplay.rrwebReplayPlugin() to plugins' });
   }
+
+  return results;
+}
+
+// ── iOS (Swift) Analytics Checks ──────────────────────────────────────────────
+
+function checkAnalyticsIOS(ctx: ProjectContext): CheckResult[] {
+  const results: CheckResult[] = [];
+
+  // SDK installed — check Package.swift or Podfile
+  const pkgSwift = join(ctx.cwd, 'Package.swift');
+  const podfile = join(ctx.cwd, 'Podfile');
+  const hasSPM = existsSync(pkgSwift) && readFileSync(pkgSwift, 'utf-8').includes('SankofaIOS');
+  const hasPod = existsSync(podfile) && readFileSync(podfile, 'utf-8').includes('SankofaIOS');
+  if (hasSPM) {
+    results.push({ name: 'SDK installed', status: 'ok', detail: 'SankofaIOS via Swift Package Manager' });
+  } else if (hasPod) {
+    results.push({ name: 'SDK installed', status: 'ok', detail: 'SankofaIOS via CocoaPods' });
+  } else {
+    results.push({ name: 'SDK installed', status: 'fail', detail: 'SankofaIOS not found in Package.swift or Podfile', fix: 'Add .package(url: "https://github.com/Sankofa-HQ/sankofa_sdk_ios.git", from: "1.0.0") to Package.swift' });
+  }
+
+  // Initialization — search Sources/ for Sankofa.shared.initialize
+  const srcDir = join(ctx.cwd, 'Sources');
+  const altSrc = join(ctx.cwd, ctx.cwd.split('/').pop() || '');
+  const searchDirs = [srcDir, altSrc, ctx.cwd];
+  let initFile = '';
+  let src = '';
+  for (const d of searchDirs) {
+    const f = findFileContaining(d, '.swift', 'Sankofa.shared.initialize') || findFileContaining(d, '.swift', 'Sankofa.shared');
+    if (f) { initFile = f; src = readFileSync(f, 'utf-8'); break; }
+  }
+
+  results.push(initFile
+    ? { name: 'Sankofa.shared.initialize()', status: 'ok', detail: initFile.replace(ctx.cwd + '/', '') }
+    : { name: 'Sankofa.shared.initialize()', status: 'fail', detail: 'not found in Swift source files', fix: 'Add Sankofa.shared.initialize(apiKey: "...", config: SankofaConfig(...)) to your AppDelegate or @main App' });
+
+  // API key
+  if (src) {
+    if (src.includes('sk_test_')) {
+      results.push({ name: 'API key', status: 'warn', detail: 'using test key', fix: 'Switch to a live key before shipping to production' });
+    } else if (src.includes('sk_live_')) {
+      results.push({ name: 'API key', status: 'ok', detail: 'live key configured' });
+    } else if (src.includes('apiKey')) {
+      results.push({ name: 'API key', status: 'ok', detail: 'API key configured' });
+    }
+
+    results.push(src.includes('recordSessions')
+      ? { name: 'Session Replay', status: 'ok', detail: 'recordSessions configured' }
+      : { name: 'Session Replay', status: 'warn', detail: 'recordSessions not set — defaults to true' });
+  }
+
+  // Screen tracking — .screen() method or .sankofaScreen() SwiftUI modifier
+  let usesScreen = false;
+  let screenMethod = '';
+  for (const d of searchDirs) {
+    if (findFileContaining(d, '.swift', '.sankofaScreen(')) { usesScreen = true; screenMethod = '.sankofaScreen() modifier'; break; }
+    if (findFileContaining(d, '.swift', '.screen(')) { usesScreen = true; screenMethod = 'Sankofa.shared.screen()'; break; }
+  }
+  results.push(usesScreen
+    ? { name: 'Screen tracking', status: 'ok', detail: `${screenMethod} found` }
+    : { name: 'Screen tracking', status: 'warn', detail: 'no screen tracking found', fix: 'Add .sankofaScreen("Name") modifier to your SwiftUI views or call Sankofa.shared.screen("Name")' });
+
+  // Event tracking
+  let usesTrack = false;
+  for (const d of searchDirs) {
+    if (findFileContaining(d, '.swift', '.track(')) { usesTrack = true; break; }
+  }
+  results.push(usesTrack
+    ? { name: 'Event tracking', status: 'ok', detail: 'Sankofa.shared.track() found' }
+    : { name: 'Event tracking', status: 'warn', detail: 'no track() calls found', fix: 'Add Sankofa.shared.track("event_name") to track custom events' });
+
+  // Identify
+  let usesIdentify = false;
+  for (const d of searchDirs) {
+    if (findFileContaining(d, '.swift', '.identify(')) { usesIdentify = true; break; }
+  }
+  results.push(usesIdentify
+    ? { name: 'User identification', status: 'ok', detail: 'Sankofa.shared.identify() found' }
+    : { name: 'User identification', status: 'warn', detail: 'no identify() calls found', fix: 'Add Sankofa.shared.identify(userId: "...") after login' });
+
+  return results;
+}
+
+// ── Android (Kotlin) Analytics Checks ─────────────────────────────────────────
+
+function checkAnalyticsAndroid(ctx: ProjectContext): CheckResult[] {
+  const results: CheckResult[] = [];
+
+  // SDK installed — check build.gradle
+  const appGradle = join(ctx.cwd, 'app', 'build.gradle.kts');
+  const appGradleGroovy = join(ctx.cwd, 'app', 'build.gradle');
+  const gradleFile = existsSync(appGradle) ? appGradle : existsSync(appGradleGroovy) ? appGradleGroovy : null;
+  if (gradleFile) {
+    const content = readFileSync(gradleFile, 'utf-8');
+    if (content.includes('dev.sankofa.sdk') || content.includes('sankofa')) {
+      results.push({ name: 'SDK installed', status: 'ok', detail: 'dev.sankofa.sdk in build.gradle' });
+    } else {
+      results.push({ name: 'SDK installed', status: 'fail', detail: 'Sankofa SDK not found in app/build.gradle', fix: 'Add implementation("dev.sankofa.sdk:sankofa-android:1.0.0") to your dependencies' });
+    }
+  } else {
+    results.push({ name: 'SDK installed', status: 'fail', detail: 'app/build.gradle not found', fix: 'Run this from your Android project root' });
+  }
+
+  // Initialization — search for Sankofa.init in Kotlin/Java source
+  const srcDirs = [
+    join(ctx.cwd, 'app', 'src', 'main', 'java'),
+    join(ctx.cwd, 'app', 'src', 'main', 'kotlin'),
+    join(ctx.cwd, 'app', 'src'),
+  ];
+  let initFile = '';
+  let src = '';
+  for (const d of srcDirs) {
+    const f = findFileContaining(d, '.kt', 'Sankofa.init') || findFileContaining(d, '.java', 'Sankofa.init');
+    if (f) { initFile = f; src = readFileSync(f, 'utf-8'); break; }
+  }
+
+  results.push(initFile
+    ? { name: 'Sankofa.init()', status: 'ok', detail: initFile.replace(ctx.cwd + '/', '') }
+    : { name: 'Sankofa.init()', status: 'fail', detail: 'Sankofa.init() not found in Kotlin/Java source', fix: 'Add Sankofa.init(context, apiKey, config) to your Application.onCreate()' });
+
+  // API key
+  if (src) {
+    if (src.includes('sk_test_')) {
+      results.push({ name: 'API key', status: 'warn', detail: 'using test key', fix: 'Switch to a live key before shipping to production' });
+    } else if (src.includes('sk_live_')) {
+      results.push({ name: 'API key', status: 'ok', detail: 'live key configured' });
+    } else if (src.includes('apiKey')) {
+      results.push({ name: 'API key', status: 'ok', detail: 'API key configured' });
+    }
+
+    results.push(src.includes('recordSessions')
+      ? { name: 'Session Replay', status: 'ok', detail: 'recordSessions configured' }
+      : { name: 'Session Replay', status: 'warn', detail: 'recordSessions not set — defaults to true' });
+  }
+
+  // Screen tracking — check for .screen() or @SankofaScreen annotation
+  let usesScreen = false;
+  for (const d of srcDirs) {
+    if (findFileContaining(d, '.kt', '.screen(') || findFileContaining(d, '.kt', '@SankofaScreen')) { usesScreen = true; break; }
+  }
+  results.push(usesScreen
+    ? { name: 'Screen tracking', status: 'ok', detail: 'screen tracking found' }
+    : { name: 'Screen tracking', status: 'warn', detail: 'no screen() or @SankofaScreen found', fix: 'Add Sankofa.screen("ScreenName") or @SankofaScreen("Name") annotation to your activities' });
+
+  // Event tracking
+  let usesTrack = false;
+  for (const d of srcDirs) {
+    if (findFileContaining(d, '.kt', 'Sankofa.track') || findFileContaining(d, '.java', 'Sankofa.track')) { usesTrack = true; break; }
+  }
+  results.push(usesTrack
+    ? { name: 'Event tracking', status: 'ok', detail: 'Sankofa.track() found' }
+    : { name: 'Event tracking', status: 'warn', detail: 'no Sankofa.track() calls found', fix: 'Add Sankofa.track("event_name") to track custom events' });
+
+  // Identify
+  let usesIdentify = false;
+  for (const d of srcDirs) {
+    if (findFileContaining(d, '.kt', 'Sankofa.identify') || findFileContaining(d, '.java', 'Sankofa.identify')) { usesIdentify = true; break; }
+  }
+  results.push(usesIdentify
+    ? { name: 'User identification', status: 'ok', detail: 'Sankofa.identify() found' }
+    : { name: 'User identification', status: 'warn', detail: 'no identify() calls found', fix: 'Add Sankofa.identify("userId") after login' });
 
   return results;
 }
@@ -638,10 +803,10 @@ async function checkApiAccess(ctx: ProjectContext, module: string): Promise<Chec
         if (match) { apiKey = match[0].replace(/['"]/g, ''); break; }
       }
     }
-    // Scan broader directories for API keys (Flutter lib/, web js/, HTML files)
+    // Scan broader directories for API keys (Flutter lib/, web js/, Swift Sources/, Kotlin app/src/, HTML files)
     if (!apiKey) {
-      const scanDirs = ['lib', 'js', 'scripts', 'src', 'assets', '.'];
-      const scanExts = ['.dart', '.js', '.ts', '.html'];
+      const scanDirs = ['lib', 'js', 'scripts', 'src', 'assets', 'Sources', 'app/src', '.'];
+      const scanExts = ['.dart', '.js', '.ts', '.html', '.swift', '.kt'];
       for (const d of scanDirs) {
         if (apiKey) break;
         const dir = d === '.' ? ctx.cwd : join(ctx.cwd, d);
@@ -750,10 +915,16 @@ checkCommand
       case 'web':
         moduleChecks = checkAnalyticsWeb(ctx);
         break;
+      case 'ios':
+        moduleChecks = checkAnalyticsIOS(ctx);
+        break;
+      case 'android':
+        moduleChecks = checkAnalyticsAndroid(ctx);
+        break;
       default:
         console.log(chalk.yellow(`  Could not detect a supported platform in this directory.`));
-        console.log(chalk.dim(`  Supported: React Native, Flutter, Web/JS`));
-        console.log(chalk.dim(`  Make sure you run this from your project root (where package.json or pubspec.yaml lives).`));
+        console.log(chalk.dim(`  Supported: React Native, Flutter, Web/JS, iOS (Swift), Android (Kotlin)`));
+        console.log(chalk.dim(`  Make sure you run this from your project root.`));
         console.log('');
         return;
     }
@@ -803,6 +974,8 @@ checkCommand
       case 'react-native': analyticsChecks = checkAnalyticsReactNative(ctx); break;
       case 'flutter': analyticsChecks = checkAnalyticsFlutter(ctx); break;
       case 'web': analyticsChecks = checkAnalyticsWeb(ctx); break;
+      case 'ios': analyticsChecks = checkAnalyticsIOS(ctx); break;
+      case 'android': analyticsChecks = checkAnalyticsAndroid(ctx); break;
     }
 
     // Deploy (RN only)

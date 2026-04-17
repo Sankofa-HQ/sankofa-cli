@@ -1,19 +1,27 @@
-# Sankofa Deploy CLI
+# Sankofa CLI
 
-Ship JavaScript changes to your React Native / Expo apps without cutting a new native build. Sankofa Deploy is a CodePush / Expo-Updates-style over-the-air (OTA) pipeline with a self-hostable server, a native-binary preview flow, a signed-binary build path, and direct submission to App Store Connect and Play Console.
+The command-line tool for [Sankofa](https://sankofa.dev) — analytics, OTA updates, and crash reporting for mobile and web apps. One CLI to set up, verify, and ship across every platform Sankofa supports.
 
-One binary you already ship to the store. All JS/asset changes after that go through Sankofa — your users pick them up on the next app launch.
+**Deploy** — Ship JavaScript changes to your React Native / Expo apps without cutting a new native build. CodePush-style OTA with phased rollouts, auto-rollback, and a kill switch.
+
+**Analytics** — Event tracking, session replays, heatmaps, and funnels. Works on React Native, Flutter, Web (npm and CDN), iOS (Swift), and Android (Kotlin).
+
+**Check** — Verify your SDK integration is correct across any platform before you ship.
 
 ---
 
 ## Table of contents
 
 1. [What the CLI does](#what-the-cli-does)
-2. [Install](#install)
-3. [Concepts](#concepts)
-4. [Quickstart](#quickstart)
-5. [Authentication & config](#authentication--config)
-6. [Commands](#commands)
+2. [Supported platforms](#supported-platforms)
+3. [Install](#install)
+4. [Concepts](#concepts)
+5. [Quickstart](#quickstart)
+6. [Authentication & config](#authentication--config)
+7. [Commands](#commands)
+    - [`init`](#init)
+    - [`check`](#check)
+    - [`doctor`](#doctor)
     - [`login`](#login)
     - [`logout`](#logout)
     - [`switch`](#switch)
@@ -23,36 +31,67 @@ One binary you already ship to the store. All JS/asset changes after that go thr
     - [`preview`](#preview)
     - [`dist`](#dist)
     - [`submit`](#submit)
-7. [The release pipeline in detail](#the-release-pipeline-in-detail)
-8. [Asset handling (fonts, images, videos…)](#asset-handling-fonts-images-videos)
-9. [Rollout, rollback, and crash reporting](#rollout-rollback-and-crash-reporting)
-10. [Signing (iOS + Android)](#signing-ios--android)
-11. [CI/CD](#cicd)
-12. [Troubleshooting](#troubleshooting)
-13. [Environment variables](#environment-variables)
+8. [The release pipeline in detail](#the-release-pipeline-in-detail)
+9. [Asset handling (fonts, images, videos…)](#asset-handling-fonts-images-videos)
+10. [Rollout, rollback, and crash reporting](#rollout-rollback-and-crash-reporting)
+11. [Signing (iOS + Android)](#signing-ios--android)
+12. [CI/CD](#cicd)
+13. [Troubleshooting](#troubleshooting)
+14. [Environment variables](#environment-variables)
 
 ---
 
 ## What the CLI does
 
+### Setup & Diagnostics
+
+| Command | Purpose | Platforms |
+|---|---|---|
+| `sankofa init` | Auto-detect platform, create `.sankofa.json`, patch native files (Expo plugin / bare RN / Flutter / iOS / Android / Web), update `.gitignore`. | All |
+| `sankofa check` | Verify the full SDK integration — credentials, native wiring, initialization, tracking, server connectivity. Shows exactly what to fix. | All |
+| `sankofa check analytics` | Analytics-specific checks: SDK install, `init()`, API key, session replay, screen/event tracking, user identification. | All |
+| `sankofa check deploy` | Deploy-specific checks: bundle provider, Expo plugin, `notifyAppReady()`, `checkForUpdate()`. | React Native |
+| `sankofa doctor` | Diagnose the local toolchain (Node, Xcode, CocoaPods, Java, Android SDK, adb, altool) and server reachability. | React Native |
+
+### Authentication
+
 | Command | Purpose |
 |---|---|
-| `sankofa init` | Scaffold `.sankofa.json` in the current project and print integration next steps. |
-| `sankofa doctor` | Diagnose the local toolchain (Node, Xcode, CocoaPods, Java, Android SDK, adb, altool) and Sankofa server reachability in one shot. |
 | `sankofa login` | Browser-based auth; creates a Deploy Token for the selected project and persists a session JWT for later `switch`es. |
 | `sankofa logout` | Remove stored credentials (project-scoped, global, or both). |
 | `sankofa switch` | Switch to a different project on the same server. Reuses the stored JWT — no browser round-trip. |
-| `sankofa status` | Read-only summary of all releases for the current project. |
-| `sankofa release` | Build native + stage a byte-identical OTA archive + publish the base release + produce a signed store binary (`.ipa` / `.aab`) in one command. |
+
+### Deploy (React Native)
+
+| Command | Purpose |
+|---|---|
+| `sankofa release` | Build native + stage OTA archive + publish base release + produce signed store binary (`.ipa` / `.aab`). |
 | `sankofa patch` | Ship a JS+assets-only OTA patch against an existing base release. |
-| `sankofa preview` | Download + install + launch a published release or patch on a simulator/emulator. Streams runtime logs to the terminal by default. |
+| `sankofa preview` | Download + install + launch a release on a simulator/emulator. Streams runtime logs. |
+| `sankofa status` | Read-only summary of all releases for the current project. |
 | `sankofa releases` | Manage base releases: `list`, `rollout`, `mandatory`, `kill`, `unkill`. |
 | `sankofa patches` | Manage patches: `list`, `rollout`, `mandatory`, `kill`, `unkill`. |
-| `sankofa dist` | Build ONLY the signed store binary. No Sankofa release is published. For rebuilding the binary of an existing release or for OTA-only lanes. |
-| `sankofa submit` | Upload the signed distribution binary to App Store Connect (iOS) or Play Console (Android). |
+| `sankofa dist` | Build ONLY the signed store binary. No Sankofa release is published. |
+| `sankofa submit` | Upload the signed binary to App Store Connect (iOS) or Play Console (Android). |
 | `sankofa upgrade` | Check npm for a newer `sankofa-cli` and install it. |
 
 Every command that hits the server short-circuits with a clean "you are not logged in" message when credentials are missing — no stray prompts before the auth check.
+
+---
+
+## Supported platforms
+
+`sankofa init` and `sankofa check` auto-detect the platform from the project root:
+
+| Platform | Detection | SDK Package | `init` does | `check analytics` validates |
+|---|---|---|---|---|
+| **React Native (Expo)** | `expo` in package.json | `sankofa-react-native` | Adds config plugin to app.json | SDK, init, API key, replay, `useSankofaScreen()`, events |
+| **React Native (bare)** | `react-native` in package.json | `sankofa-react-native` | Patches `MainApplication.kt` + `AppDelegate.swift` | Same as Expo |
+| **Flutter** | `pubspec.yaml` exists | `sankofa_flutter` | Creates config, shows Dart setup | SDK, `Sankofa.instance.init()`, replay, `SankofaNavigatorObserver`, events, identify |
+| **Web (npm)** | `react`/`next`/`vue`/`vite` in package.json | `@sankofa/browser` | Creates config, shows import setup | SDK, `Sankofa.init()`, API key, replay plugin, events, identify, page tracking |
+| **Web (CDN)** | `index.html` exists, no package.json | `@sankofa/browser` (CDN) | Creates config, shows `<script>` setup | CDN script tag, `Sankofa.init()`, `SankofaReplay`, events, identify, screen |
+| **iOS (Swift)** | `Package.swift` exists | `SankofaIOS` (SPM/CocoaPods) | Creates config, shows SPM setup | SPM/Pod dep, `Sankofa.shared.initialize()`, `.sankofaScreen()`, events, identify |
+| **Android (Kotlin)** | `app/build.gradle` exists | `dev.sankofa.sdk:sankofa-android` | Creates config, shows Gradle setup | Gradle dep, `Sankofa.init()`, `@SankofaScreen`, events, identify |
 
 ---
 

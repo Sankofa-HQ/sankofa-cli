@@ -128,9 +128,13 @@ export const initCommand = new Command('init')
       try { return !!JSON.parse(readFileSync(appJsonPath, 'utf-8'))?.expo; } catch { return false; }
     })();
 
+    const isIOS = !isFlutter && !isReactNative && !isWeb && existsSync(join(cwd, 'Package.swift'));
+    const isAndroid = !isFlutter && !isReactNative && !isWeb && !isIOS && (existsSync(join(cwd, 'app', 'build.gradle.kts')) || existsSync(join(cwd, 'app', 'build.gradle')));
     const platformLabel = isFlutter ? 'Flutter'
       : isReactNative ? (hasExpoKey ? 'React Native (Expo)' : 'React Native (bare)')
       : isWeb ? 'Web / JavaScript'
+      : isIOS ? 'iOS (Swift)'
+      : isAndroid ? 'Android (Kotlin)'
       : 'Unknown';
     console.log('');
     console.log(chalk.dim(`  · Platform: ${platformLabel}`));
@@ -284,10 +288,74 @@ export const initCommand = new Command('init')
         console.log(chalk.cyan('     sankofa check'));
         console.log('');
 
+    } else if (existsSync(join(cwd, 'Package.swift'))) {
+      // iOS (Swift) project
+      const pkgSwift = readFileSync(join(cwd, 'Package.swift'), 'utf-8');
+      const hasSdk = pkgSwift.includes('SankofaIOS') || pkgSwift.includes('sankofa_sdk_ios');
+      console.log('');
+      console.log(chalk.bold('  Next steps'));
+      console.log('');
+      if (hasSdk) {
+        console.log(chalk.dim('  1. SDK already in Package.swift: SankofaIOS'));
+      } else {
+        console.log(chalk.dim('  1. Add the SDK to your Package.swift dependencies:'));
+        console.log(chalk.cyan('     .package(url: "https://github.com/Sankofa-HQ/sankofa_sdk_ios.git", from: "1.0.0")'));
+      }
+      console.log('');
+      console.log(chalk.dim('  2. Initialize in your App or AppDelegate:'));
+      console.log(chalk.cyan(`     import SankofaIOS
+     Sankofa.shared.initialize(
+       apiKey: "YOUR_API_KEY",
+       config: SankofaConfig(endpoint: "${endpoint}")
+     )`));
+      console.log('');
+      console.log(chalk.dim('  3. Track events:'));
+      console.log(chalk.cyan(`     Sankofa.shared.track("button_tapped", properties: ["label": "Sign Up"])
+     Sankofa.shared.screen("Home")
+     Sankofa.shared.identify(userId: "user_123")`));
+      console.log('');
+      console.log(chalk.dim('  4. Verify everything:'));
+      console.log(chalk.cyan('     sankofa check'));
+      console.log('');
+
+    } else if (existsSync(join(cwd, 'app', 'build.gradle.kts')) || existsSync(join(cwd, 'app', 'build.gradle'))) {
+      // Android (Kotlin) project
+      const gradleFile = existsSync(join(cwd, 'app', 'build.gradle.kts')) ? join(cwd, 'app', 'build.gradle.kts') : join(cwd, 'app', 'build.gradle');
+      const gradleContent = readFileSync(gradleFile, 'utf-8');
+      const hasSdk = gradleContent.includes('dev.sankofa.sdk') || gradleContent.includes('sankofa');
+      console.log('');
+      console.log(chalk.bold('  Next steps'));
+      console.log('');
+      if (hasSdk) {
+        console.log(chalk.dim('  1. SDK already in build.gradle: dev.sankofa.sdk'));
+      } else {
+        console.log(chalk.dim('  1. Add the SDK to app/build.gradle.kts:'));
+        console.log(chalk.cyan('     implementation("dev.sankofa.sdk:sankofa-android:1.0.0")'));
+      }
+      console.log('');
+      console.log(chalk.dim('  2. Initialize in your Application.onCreate():'));
+      console.log(chalk.cyan(`     import dev.sankofa.sdk.Sankofa
+     import dev.sankofa.sdk.SankofaConfig
+     Sankofa.init(
+       context = applicationContext,
+       apiKey = "YOUR_API_KEY",
+       config = SankofaConfig(endpoint = "${endpoint}")
+     )`));
+      console.log('');
+      console.log(chalk.dim('  3. Track events:'));
+      console.log(chalk.cyan(`     Sankofa.track("button_clicked", mapOf("label" to "Sign Up"))
+     Sankofa.screen("Home")
+     Sankofa.identify("user_123")`));
+      console.log('');
+      console.log(chalk.dim('  4. Verify everything:'));
+      console.log(chalk.cyan('     sankofa check'));
+      console.log('');
+
     } else {
       console.log('');
-      console.log(chalk.yellow('  ⚠ Could not detect platform. No package.json or pubspec.yaml found.'));
-      console.log(chalk.dim('    Supported: React Native, Flutter, Web (React, Next.js, Vue, Svelte)'));
+      console.log(chalk.yellow('  ⚠ Could not detect platform.'));
+      console.log(chalk.dim('    Supported: React Native, Flutter, Web/JS, iOS (Swift), Android (Kotlin)'));
+      console.log(chalk.dim('    Run this from your project root.'));
       console.log('');
     }
   });
