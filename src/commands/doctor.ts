@@ -92,7 +92,18 @@ export const doctorCommand = new Command('doctor')
         const out = execSync('java -version 2>&1', { encoding: 'utf-8' });
         const m = out.match(/version "([^"]+)"/);
         if (!m) return { status: 'warn', detail: out.split('\n')[0] };
-        return { status: 'ok', detail: m[1] };
+        const version = m[1];
+        const major = parseInt(version.split('.')[0], 10);
+        // Android Gradle Plugin officially supports Java 17 (LTS) and
+        // Java 21. Java 24+ fails CMake configure tasks with native-access
+        // restrictions — silent 20-minute build failures. Flag early.
+        if (major < 17) {
+          return { status: 'fail', detail: `${version} — Android requires Java 17+. Install with: brew install --cask temurin@17` };
+        }
+        if (major > 21) {
+          return { status: 'fail', detail: `${version} — Android Gradle Plugin doesn't support Java ${major}. Install Java 17: brew install --cask temurin@17, then: export JAVA_HOME=$(/usr/libexec/java_home -v 17)` };
+        }
+        return { status: 'ok', detail: version };
       } catch {
         return { status: 'warn', detail: 'not found — needed for Android builds' };
       }
