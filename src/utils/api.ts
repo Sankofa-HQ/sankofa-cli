@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from 'fs';
+import { statSync, openAsBlob } from 'fs';
 import { resolveAuth } from './config.js';
 import { normalizeEnvironment, normalizePlatform } from './validation.js';
 
@@ -90,13 +90,17 @@ export async function uploadRelease(
   const totalSize = stats.size;
 
   const form = new FormData();
-  const bundleBytes = readFileSync(bundlePath);
-  const bundleBlob = new Blob([new Uint8Array(bundleBytes)], { type: 'application/zip' });
+  // Use openAsBlob() — streams the file from disk instead of loading the
+  // whole thing into memory as a Buffer → Uint8Array copy. Node 24's
+  // fetch is flaky with Blobs built from >20MB in-memory Uint8Arrays
+  // (connection resets mid-upload). openAsBlob lazy-streams the file.
+  const bundleBlob = await openAsBlob(bundlePath, { type: 'application/zip' });
   form.append('bundle', bundleBlob, 'ota.zip');
   form.append('bundle_format', 'zip');
   if (metadata.native_artifact_path) {
-    const nativeBytes = readFileSync(metadata.native_artifact_path);
-    const nativeBlob = new Blob([new Uint8Array(nativeBytes)], { type: 'application/octet-stream' });
+    const nativeBlob = await openAsBlob(metadata.native_artifact_path, {
+      type: 'application/octet-stream',
+    });
     form.append('native_artifact', nativeBlob, metadata.native_artifact_path.split('/').pop() || 'native-artifact');
     form.append('native_artifact_kind', metadata.native_artifact_kind || '');
   }
@@ -109,19 +113,73 @@ export async function uploadRelease(
     rollout_percentage: metadata.rollout_percentage ?? 100,
   }));
 
-  const res = await fetch(`${endpoint}/api/v1/deploy/releases?projectId=${projectId}`, {
-    method: 'POST',
-    headers: {
-      ...getAuthHeaders(),
-    },
-    body: form,
-  });
+  const uploadUrl = `${endpoint}/api/v1/deploy/releases?projectId=${projectId}`;
+  let res;
+  try {
+    // Release uploads can take several minutes when the server does the
+    // full pipeline (B2/S3 upload, SHA256 verification, ClickHouse
+    // metadata). Node's fetch defaults to a 5-minute headers timeout,
+    // which trips on slow networks + cold storage. Bump to 20 min.
+    //
+    // `dispatcher` is the undici Agent used under the hood — it's
+    // accepted by Node's fetch even though it's not in the standard
+    // Fetch API types. Import is dynamic because undici is a Node
+    // built-in (not available in non-Node runtimes) but bundlers may
+    // complain about a static import.
+    // @ts-ignore — undici ships with Node >= 18 but isn't in @types/node as
+    // an importable module path. Dynamic import resolves at runtime.
+    const undici = await import('undici' as any) as any;
+    const longUploadAgent = new undici.Agent({
+      headersTimeout: 20 * 60 * 1000,
+      bodyTimeout: 20 * 60 * 1000,
+      connectTimeout: 30 * 1000,
+    });
+    res = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        ...getAuthHeaders(),
+      },
+      body: form,
+      dispatcher: longUploadAgent,
+    } as any);
+  } catch (err: any) {
+    // Node's fetch throws TypeError("fetch failed") for network-layer
+    // problems and hides the real cause in err.cause. Unwrap it so the
+    // user sees "connection refused" / "ENOTFOUND" / cert issues etc.
+    const cause = err?.cause;
+    const code = cause?.code || cause?.errno;
+    const hint = networkErrorHint(code, uploadUrl);
+    const detail = cause?.message || err?.message || 'unknown network error';
+    throw new Error(`Upload failed: ${detail}${code ? ` (${code})` : ''}\n  → ${hint}`);
+  }
 
   if (!res.ok) {
     throw await readAPIError(res, `Upload failed (${res.status})`);
   }
 
   return res.json();
+}
+
+function networkErrorHint(code: string | undefined, url: string): string {
+  const endpoint = new URL(url).origin;
+  switch (code) {
+    case 'ECONNREFUSED':
+      return `Nothing is listening at ${endpoint}. Start your Sankofa server or check the endpoint in .sankofa.json.`;
+    case 'ENOTFOUND':
+      return `Cannot resolve the hostname in ${endpoint}. Check your endpoint URL.`;
+    case 'ETIMEDOUT':
+    case 'UND_ERR_CONNECT_TIMEOUT':
+      return `Connection to ${endpoint} timed out. Is the server reachable from this network?`;
+    case 'CERT_HAS_EXPIRED':
+    case 'UNABLE_TO_VERIFY_LEAF_SIGNATURE':
+    case 'SELF_SIGNED_CERT_IN_CHAIN':
+      return `TLS certificate problem at ${endpoint}. For self-hosted dev servers, use http:// instead of https://, or install a valid cert.`;
+    case 'ECONNRESET':
+    case 'UND_ERR_SOCKET':
+      return `Connection to ${endpoint} was reset mid-upload. The server may have a body-size limit; check nginx/caddy/server config.`;
+    default:
+      return `Check that ${endpoint} is reachable: curl -I ${endpoint}/api/admin/health`;
+  }
 }
 
 /** Update a release (rollout, mandatory, kill switch) */

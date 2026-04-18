@@ -2,6 +2,7 @@ import { execSync } from 'child_process';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
 import { basename, dirname, join, resolve } from 'path';
 import { createHash } from 'crypto';
+import { resolveBuildEnv, logBuildEnv, type TargetPlatform } from './buildEnv.js';
 
 export type Platform = 'ios' | 'android';
 
@@ -524,6 +525,20 @@ export function buildNativePreviewArtifact(
 ): NativePreviewArtifact {
   mkdirSync(outputDir, { recursive: true });
 
+  // Auto-detect build tooling (Android SDK, Java 17/21, adb on Android;
+  // Xcode, CocoaPods on iOS). Works across macOS, Linux, Windows without
+  // touching the user's shell rc files — env vars are injected into the
+  // subprocess only. Missing tools produce a clean error with install
+  // instructions rather than a 20-minute mystery gradle failure.
+  const buildEnv = resolveBuildEnv(platform as TargetPlatform, { strict: true });
+  // Log what we found (one line per detected path) so users can see why
+  // a build "just worked" without them having set ANDROID_HOME.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const chalk = require('chalk');
+    logBuildEnv(buildEnv, chalk.default || chalk);
+  } catch { /* chalk may not be available in some contexts */ }
+
   if (platform === 'ios') {
     const workspace = findXcodeWorkspace();
     const project = workspace ? null : findXcodeProject();
@@ -544,7 +559,7 @@ export function buildNativePreviewArtifact(
     const podfileExists = existsSync(join(iosDir, 'Podfile'));
     if (podfileExists) {
       const podCmd = existsSync(join(iosDir, 'Gemfile')) ? 'bundle exec pod install' : 'pod install';
-      execSync(podCmd, { cwd: iosDir, stdio: 'inherit' });
+      execSync(podCmd, { cwd: iosDir, stdio: 'inherit', env: buildEnv.env });
     }
 
     const derivedDataPath = join(outputDir, 'sankofa-ios-preview-derived-data');
@@ -560,7 +575,7 @@ export function buildNativePreviewArtifact(
     try {
       execSync(
         `set -o pipefail; xcodebuild ${projectArg} -scheme ${shellQuote(scheme)} -configuration Release -sdk iphonesimulator -derivedDataPath ${shellQuote(derivedDataPath)} CODE_SIGNING_ALLOWED=NO build 2>&1 | tee ${shellQuote(xcodebuildLog)}`,
-        { stdio: 'inherit', shell: '/bin/bash' } as any,
+        { stdio: 'inherit', shell: '/bin/bash', env: buildEnv.env } as any,
       );
     } catch (err: any) {
       let tail = '';
@@ -588,16 +603,21 @@ export function buildNativePreviewArtifact(
     const zipPath = join(outputDir, `${safeArtifactName(scheme)}-ios-simulator.app.zip`);
     execSync(`ditto -c -k --sequesterRsrc --keepParent ${shellQuote(appPath)} ${shellQuote(zipPath)}`, {
       stdio: 'inherit',
+      env: buildEnv.env,
     });
     return { path: zipPath, kind: 'ios-simulator-app-zip' };
   }
 
   const gradlew = join(process.cwd(), 'android', 'gradlew');
-  const gradleExecutable = existsSync(gradlew) ? './gradlew' : 'gradle';
+  // Windows uses gradlew.bat; POSIX uses ./gradlew
+  const gradleExecutable = existsSync(gradlew)
+    ? (process.platform === 'win32' ? 'gradlew.bat' : './gradlew')
+    : 'gradle';
   const androidDir = join(process.cwd(), 'android');
   execSync(`${gradleExecutable} assembleRelease`, {
     cwd: androidDir,
     stdio: 'inherit',
+    env: buildEnv.env,
   });
 
   const apkPath = join(process.cwd(), 'android', 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk');
@@ -653,6 +673,13 @@ export function buildDistributionArtifact(
 }
 
 function buildDistributionIPA(opts: DistributionOptions): DistributionArtifact {
+  const buildEnv = resolveBuildEnv('ios', { strict: true });
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const chalk = require('chalk');
+    logBuildEnv(buildEnv, chalk.default || chalk);
+  } catch { /* ignore */ }
+
   const workspace = findXcodeWorkspace();
   const project = workspace ? null : findXcodeProject();
   const scheme = findXcodeScheme();
@@ -681,7 +708,7 @@ function buildDistributionIPA(opts: DistributionOptions): DistributionArtifact {
   try {
     execSync(
       `set -o pipefail; xcodebuild ${projectArg} -scheme ${shellQuote(scheme)} -configuration Release -destination 'generic/platform=iOS' -archivePath ${shellQuote(archivePath)} archive 2>&1 | tee ${shellQuote(archiveLog)}`,
-      { stdio: 'inherit', shell: '/bin/bash' } as any,
+      { stdio: 'inherit', shell: '/bin/bash', env: buildEnv.env } as any,
     );
   } catch (err: any) {
     throw new Error(
@@ -712,7 +739,7 @@ function buildDistributionIPA(opts: DistributionOptions): DistributionArtifact {
   try {
     execSync(
       `set -o pipefail; xcodebuild -exportArchive -archivePath ${shellQuote(archivePath)} -exportPath ${shellQuote(exportDir)} -exportOptionsPlist ${shellQuote(exportOptionsPlist)} 2>&1 | tee ${shellQuote(exportLog)}`,
-      { stdio: 'inherit', shell: '/bin/bash' } as any,
+      { stdio: 'inherit', shell: '/bin/bash', env: buildEnv.env } as any,
     );
   } catch (err: any) {
     throw new Error(
@@ -729,16 +756,25 @@ function buildDistributionIPA(opts: DistributionOptions): DistributionArtifact {
 }
 
 function buildDistributionAndroid(opts: DistributionOptions): DistributionArtifact {
+  const buildEnv = resolveBuildEnv('android', { strict: true });
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const chalk = require('chalk');
+    logBuildEnv(buildEnv, chalk.default || chalk);
+  } catch { /* ignore */ }
+
   const androidDir = join(process.cwd(), 'android');
   if (!existsSync(androidDir)) {
     throw new Error(`No android/ directory at ${process.cwd()}. Run \`expo prebuild\` first.`);
   }
   const gradlew = join(androidDir, 'gradlew');
-  const gradleExecutable = existsSync(gradlew) ? './gradlew' : 'gradle';
+  const gradleExecutable = existsSync(gradlew)
+    ? (process.platform === 'win32' ? 'gradlew.bat' : './gradlew')
+    : 'gradle';
   const format = opts.androidFormat || 'aab';
   const task = format === 'aab' ? 'bundleRelease' : 'assembleRelease';
 
-  execSync(`${gradleExecutable} ${task}`, { cwd: androidDir, stdio: 'inherit' });
+  execSync(`${gradleExecutable} ${task}`, { cwd: androidDir, stdio: 'inherit', env: buildEnv.env });
 
   const outputsDir = join(androidDir, 'app', 'build', 'outputs');
   const artifactPath =
@@ -820,11 +856,20 @@ export function installAndLaunchNativePreview(
     return;
   }
 
+  // Auto-detect Android SDK so adb gets prepended to PATH even if the
+  // user hasn't exported ANDROID_HOME in their shell.
+  const androidEnv = resolveBuildEnv('android', { strict: true });
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const chalk = require('chalk');
+    logBuildEnv(androidEnv, chalk.default || chalk);
+  } catch { /* ignore */ }
+
   const deviceArg = opts.device ? `-s ${shellQuote(opts.device)} ` : '';
   if (binary) {
-    execSync(`adb ${deviceArg}install -r ${shellQuote(binary)}`, { stdio: 'inherit' });
+    execSync(`adb ${deviceArg}install -r ${shellQuote(binary)}`, { stdio: 'inherit', env: androidEnv.env });
   }
-  execSync(`adb ${deviceArg}shell monkey -p ${shellQuote(appId)} -c android.intent.category.LAUNCHER 1`, { stdio: 'inherit' });
+  execSync(`adb ${deviceArg}shell monkey -p ${shellQuote(appId)} -c android.intent.category.LAUNCHER 1`, { stdio: 'inherit', env: androidEnv.env });
 }
 
 export function installAndLaunchNativePreviewArtifact(
@@ -934,16 +979,18 @@ export function installAndLaunchNativePreviewArtifact(
 
   if (opts.streamLogs) {
     const deviceArg = opts.device ? `-s ${shellQuote(opts.device)} ` : '';
+    // Reuse the same Android env (adb injected onto PATH) as the install step.
+    const androidEnv = resolveBuildEnv('android');
     // Clear the buffer so we only show logs for this session, then tail
     // everything with priority Info or higher from the app's process. Ctrl+C
     // exits logcat without killing the app.
     try {
-      execSync(`adb ${deviceArg}logcat -c`, { stdio: 'ignore' });
+      execSync(`adb ${deviceArg}logcat -c`, { stdio: 'ignore', env: androidEnv.env });
     } catch {}
     console.log(`\n  Streaming logs for ${opts.appId}. Ctrl+C to detach.\n`);
     execSync(
       `adb ${deviceArg}logcat --pid=$(adb ${deviceArg}shell pidof -s ${shellQuote(opts.appId)}) *:I`,
-      { stdio: 'inherit', shell: '/bin/bash' } as any,
+      { stdio: 'inherit', shell: '/bin/bash', env: androidEnv.env } as any,
     );
   }
 }
@@ -1032,21 +1079,32 @@ export function buildNative(
   outputDir: string,
   outputFormat?: string, // 'apk' for Android (default: 'aab')
 ): string {
+  const buildEnv = resolveBuildEnv(platform as TargetPlatform, { strict: true });
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const chalk = require('chalk');
+    logBuildEnv(buildEnv, chalk.default || chalk);
+  } catch { /* ignore */ }
+
   const isExpo = existsSync(join(process.cwd(), 'node_modules', 'expo'));
 
   if (platform === 'ios') {
     if (isExpo) {
-      execSync(`npx expo run:ios --configuration Release`, { stdio: 'inherit' });
+      execSync(`npx expo run:ios --configuration Release`, { stdio: 'inherit', env: buildEnv.env });
     } else {
       execSync(
         `cd ios && xcodebuild -workspace *.xcworkspace -scheme * -configuration Release -archivePath ${outputDir}/app.xcarchive archive`,
-        { stdio: 'inherit' },
+        { stdio: 'inherit', env: buildEnv.env },
       );
     }
     return join(outputDir, 'app.ipa');
   } else {
     const task = outputFormat === 'apk' ? 'assembleRelease' : 'bundleRelease';
-    execSync(`cd android && ./gradlew ${task}`, { stdio: 'inherit' });
+    const androidDir = join(process.cwd(), 'android');
+    const gradleExecutable = existsSync(join(androidDir, 'gradlew'))
+      ? (process.platform === 'win32' ? 'gradlew.bat' : './gradlew')
+      : 'gradle';
+    execSync(`${gradleExecutable} ${task}`, { cwd: androidDir, stdio: 'inherit', env: buildEnv.env });
 
     const ext = outputFormat === 'apk' ? 'apk' : 'aab';
     const defaultPath = join(

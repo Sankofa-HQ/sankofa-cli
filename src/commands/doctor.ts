@@ -3,6 +3,7 @@ import { execSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { loadGlobalConfig } from '../utils/config.js';
+import { resolveBuildEnv } from '../utils/buildEnv.js';
 
 type CheckResult = {
   name: string;
@@ -87,41 +88,55 @@ export const doctorCommand = new Command('doctor')
       results.push({ name: 'Xcode / iOS toolchain', status: 'skip', detail: 'not macOS' });
     }
 
-    results.push(check('Java', () => {
-      try {
-        const out = execSync('java -version 2>&1', { encoding: 'utf-8' });
-        const m = out.match(/version "([^"]+)"/);
-        if (!m) return { status: 'warn', detail: out.split('\n')[0] };
-        const version = m[1];
-        const major = parseInt(version.split('.')[0], 10);
-        // Android Gradle Plugin officially supports Java 17 (LTS) and
-        // Java 21. Java 24+ fails CMake configure tasks with native-access
-        // restrictions — silent 20-minute build failures. Flag early.
-        if (major < 17) {
-          return { status: 'fail', detail: `${version} — Android requires Java 17+. Install with: brew install --cask temurin@17` };
-        }
-        if (major > 21) {
-          return { status: 'fail', detail: `${version} — Android Gradle Plugin doesn't support Java ${major}. Install Java 17: brew install --cask temurin@17, then: export JAVA_HOME=$(/usr/libexec/java_home -v 17)` };
-        }
-        return { status: 'ok', detail: version };
-      } catch {
-        return { status: 'warn', detail: 'not found — needed for Android builds' };
-      }
-    }));
+    // Use the shared auto-detector so doctor reports the same paths
+    // that `sankofa release` will actually use. When the detector
+    // finds tools in standard locations (Android Studio's default SDK
+    // path, Homebrew Java 17), doctor reports them as OK even if the
+    // user hasn't exported ANDROID_HOME / JAVA_HOME.
+    const androidEnv = resolveBuildEnv('android');
 
-    results.push(check('Android SDK (ANDROID_HOME)', () => {
-      const home = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT;
-      if (!home) return { status: 'warn', detail: 'ANDROID_HOME/ANDROID_SDK_ROOT unset — needed for Android builds' };
-      if (!existsSync(home)) return { status: 'fail', detail: `${home} does not exist` };
-      return { status: 'ok', detail: home };
-    }));
+    const javaHome = androidEnv.env.JAVA_HOME;
+    if (javaHome && existsSync(javaHome)) {
+      try {
+        const out = execSync(`"${join(javaHome, 'bin', 'java')}" -version 2>&1`, { encoding: 'utf-8' });
+        const m = out.match(/version "([^"]+)"/);
+        const version = m ? m[1] : '?';
+        results.push({ name: 'Java (17 or 21)', status: 'ok', detail: `${version} at ${javaHome}` });
+      } catch {
+        results.push({ name: 'Java (17 or 21)', status: 'warn', detail: javaHome });
+      }
+    } else {
+      const miss = androidEnv.missing.find((m) => m.tool.includes('Java'));
+      results.push({
+        name: 'Java (17 or 21)',
+        status: 'fail',
+        detail: miss?.hint || 'No compatible Java (17 or 21) found on PATH',
+      });
+    }
+
+    const sdk = androidEnv.env.ANDROID_HOME;
+    if (sdk && existsSync(sdk)) {
+      const wasAutoDetected = !process.env.ANDROID_HOME && !process.env.ANDROID_SDK_ROOT;
+      const suffix = wasAutoDetected ? ' (auto-detected)' : '';
+      results.push({ name: 'Android SDK', status: 'ok', detail: `${sdk}${suffix}` });
+    } else {
+      const miss = androidEnv.missing.find((m) => m.tool.includes('Android SDK'));
+      results.push({
+        name: 'Android SDK',
+        status: 'fail',
+        detail: miss?.hint || 'not found in standard locations',
+      });
+    }
 
     results.push(check('adb', () => {
+      // With the shared detector, PATH now includes platform-tools from
+      // the auto-detected SDK — so adb is available to subprocesses even
+      // if the user's shell doesn't know about it.
       try {
-        const v = execSync('adb --version', { encoding: 'utf-8' }).split('\n')[0];
+        const v = execSync('adb --version', { encoding: 'utf-8', env: androidEnv.env }).split('\n')[0];
         return { status: 'ok', detail: v };
       } catch {
-        return { status: 'warn', detail: 'not on PATH — needed for `sankofa preview android` + log streaming' };
+        return { status: 'warn', detail: 'not available — install Android platform-tools' };
       }
     }));
 
