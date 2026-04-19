@@ -15,6 +15,8 @@ import { initCommand } from './commands/init.js';
 import { releasesCommand, patchesCommand, rulesCommand, scheduleCommand, defaultsCommand } from './commands/manage.js';
 import { upgradeCommand } from './commands/upgrade.js';
 import { checkCommand } from './commands/check.js';
+import { flagsCommand } from './commands/flags.js';
+import { configCommand } from './commands/config.js';
 
 const program = new Command();
 
@@ -41,5 +43,8 @@ program.addCommand(distCommand);
 program.addCommand(submitCommand);
 program.addCommand(upgradeCommand);
 program.addCommand(checkCommand);
+// M6 — Sankofa Switch + Config
+program.addCommand(flagsCommand);
+program.addCommand(configCommand);
 
 program.parse();
