@@ -33,15 +33,51 @@ export function resolveJWT(): JWTAuth {
 
   if (!jwt) {
     throw new Error(
-      'No dashboard session found. Run `sankofa login` (the browser flow) ' +
-      'to store a session JWT, or set SANKOFA_JWT for CI use.',
+      'No dashboard session found. Run `sankofa login` to store a session, ' +
+      'or set SANKOFA_JWT for CI use.',
     );
   }
   if (!projectId) {
     throw new Error('No project selected. Run `sankofa switch` to pick a project.');
   }
 
+  // Proactive local expiry check so we surface a clean "session expired"
+  // message instead of the server's generic "Invalid token" — the jwt
+  // library intentionally collapses expired + signature-bad into the
+  // same error. Local decode is safe: we verify nothing cryptographically
+  // here (the server still validates on every request), we just read
+  // the exp claim to front-load a better UX.
+  const exp = safeDecodeExp(jwt);
+  if (exp !== null && exp * 1000 < Date.now()) {
+    throw new Error(
+      'Your session has expired. Run `sankofa login` to refresh.',
+    );
+  }
+
   return { jwt, endpoint, projectId, environment };
+}
+
+/**
+ * Extract the `exp` claim from a JWT without verifying the signature.
+ * Returns null when the token doesn't parse as a JWT at all — in that
+ * case we treat expiry as "unknown" and let the server decide.
+ *
+ * We deliberately don't verify the signature here: that's the server's
+ * job, and signature verification would require shipping the signing
+ * secret to the CLI (worse security posture).
+ */
+function safeDecodeExp(jwt: string): number | null {
+  const parts = jwt.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const raw = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = raw.padEnd(Math.ceil(raw.length / 4) * 4, '=');
+    const json = Buffer.from(padded, 'base64').toString('utf8');
+    const payload = JSON.parse(json);
+    return typeof payload.exp === 'number' ? payload.exp : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -71,6 +107,14 @@ export async function jwtFetch<T = unknown>(
     body = null;
   }
   if (!res.ok) {
+    // The server returns "Invalid token" for expired + bad-sig + bad-
+    // shape JWTs alike. All three have the same user-facing fix, so we
+    // collapse them into a single actionable message.
+    if (res.status === 401) {
+      throw new Error(
+        'Your session is no longer valid. Run `sankofa login` to refresh.',
+      );
+    }
     const message = (body && (body.error || body.message)) || `HTTP ${res.status}`;
     throw new Error(message);
   }
