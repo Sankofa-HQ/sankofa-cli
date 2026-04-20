@@ -17,6 +17,7 @@ import { upgradeCommand } from './commands/upgrade.js';
 import { checkCommand } from './commands/check.js';
 import { flagsCommand } from './commands/flags.js';
 import { configCommand } from './commands/config.js';
+import { demoCommand } from './commands/demo.js';
 
 const program = new Command();
 
@@ -46,5 +47,6 @@ program.addCommand(checkCommand);
 // M6 — Sankofa Switch + Config
 program.addCommand(flagsCommand);
 program.addCommand(configCommand);
+program.addCommand(demoCommand);
 
 program.parse();
