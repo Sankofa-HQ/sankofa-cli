@@ -1,4 +1,5 @@
 import { Command } from 'commander';
+import fs from 'node:fs';
 import { join } from 'path';
 import {
   buildDistributionArtifact,
@@ -16,8 +17,20 @@ import {
   type DistributionArtifact,
   type NativePreviewArtifact,
 } from '../utils/bundler.js';
+import os from 'node:os';
+import path from 'node:path';
 import { uploadRelease } from '../utils/api.js';
 import { requireAuth } from '../utils/config.js';
+import {
+  uploadCatchSymbol,
+  uploadSymbolsDirectory,
+  type UploadedArtifact,
+} from '../utils/catchSymbols.js';
+import {
+  buildDSymManifest,
+  buildNDKManifest,
+  writeManifest,
+} from '../utils/nativeManifest.js';
 import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompts.js';
 import { resolveRNProjectRoot } from '../utils/project.js';
 import { parseRollout } from '../utils/validation.js';
@@ -39,6 +52,14 @@ export const releaseCommand = new Command('release')
   .option('--ios-team-id <id>', 'Apple Developer Team ID for iOS code signing (auto-detected from archive when omitted)')
   .option('--ios-export-options <path>', 'Path to a custom ExportOptions.plist (overrides --ios-export-method / --ios-team-id)')
   .option('--android-format <fmt>', 'Android distribution format: aab (Play Store) or apk (sideload). Default: aab', 'aab')
+  // ── Sankofa Catch symbol uploads (M10). Each flag takes a path
+  //    (file or directory). Non-existent paths are skipped with a
+  //    warning so the release flow isn't blocked by a missing artifact.
+  .option('--upload-sourcemaps <path>', 'Upload JS source map(s) for this release (file or directory)')
+  .option('--upload-dsym <path>', 'Upload iOS dSYM(s) for this release (file or directory of .zip bundles)')
+  .option('--upload-mapping <path>', 'Upload Android ProGuard/R8 mapping.txt for this release')
+  .option('--upload-ndk <path>', 'Upload Android NDK symbols for this release (directory of .so files)')
+  .option('--upload-dart-symbols <path>', 'Upload Flutter/Dart symbol bundle for this release')
   .action(async (platformArg: string | undefined, opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
@@ -288,6 +309,153 @@ export const releaseCommand = new Command('release')
         console.log(chalk.yellow('  ⚠️  Distribution build was skipped (--skip-distribution).'));
         console.log(chalk.dim('     Run `sankofa dist ' + platform + '` when you need the signed store binary.'));
       }
+
+      // ── Sankofa Catch — symbol artifact uploads (M10) ──
+      // Tied to this release's label so the symbolicator worker can
+      // pick the right artifact when resolving events for it. Any
+      // upload flag that maps to a missing path is skipped with a
+      // warning rather than failing the whole release.
+      const anyUpload = opts.uploadSourcemaps || opts.uploadDsym ||
+        opts.uploadMapping || opts.uploadNdk || opts.uploadDartSymbols;
+      if (anyUpload) {
+        console.log('');
+        console.log(chalk.bold('  🦋 Catch symbol uploads'));
+        const symSpinner = ora('Uploading symbols…').start();
+        try {
+          const uploaded: UploadedArtifact[] = [];
+          const warnings: string[] = [];
+          const releaseLabel = release.label;
+
+          // Native symbol manifests — the server's iOS dSYM + NDK
+          // resolver expects a pre-computed JSON manifest, not a raw
+          // Mach-O / ELF. `sankofa catch make-*-manifest` produces
+          // one; here we run the same conversion inline so customers
+          // can drop a raw .dSYM bundle / .so into --upload-dsym /
+          // --upload-ndk and get readable stacks with zero extra
+          // steps. The manifest is written to a tmp file and that
+          // path is what gets uploaded.
+          const convertDSymIfNeeded = (p: string): string => {
+            // Already a manifest? Leave it alone.
+            if (p.endsWith('.manifest.json')) return p;
+            // Bundle or raw Mach-O — convert.
+            const manifest = buildDSymManifest({ dsymPath: p });
+            const out = path.join(
+              os.tmpdir(),
+              `sankofa-dsym-${manifest.debug_id}.manifest.json`,
+            );
+            writeManifest(manifest, out);
+            return out;
+          };
+          const convertNDKIfNeeded = (p: string): string => {
+            if (p.endsWith('.manifest.json')) return p;
+            const manifest = buildNDKManifest({ soPath: p });
+            const out = path.join(
+              os.tmpdir(),
+              `sankofa-ndk-${manifest.debug_id}.manifest.json`,
+            );
+            writeManifest(manifest, out);
+            return out;
+          };
+
+          const uploadOne = async (kindLabel: string, filePath: string, kind: Parameters<typeof uploadCatchSymbol>[0]['kind']) => {
+            try {
+              // If the path is a directory, fan out via the dir helper;
+              // the single-file path also works for files directly.
+              const isDir = fs.existsSync(filePath) && fs.statSync(filePath).isDirectory();
+
+              // Native kinds auto-convert raw binaries → manifest
+              // before upload. For dSYM we also accept the .dSYM
+              // bundle (a directory), which resolveDSymBinary
+              // handles. For NDK the caller should pass a single
+              // .so OR a directory (the dir walker will iterate).
+              if (!isDir && kind === 'ios_dsym') {
+                filePath = convertDSymIfNeeded(filePath);
+              } else if (isDir && kind === 'ios_dsym') {
+                // A .dSYM bundle is technically a directory — detect
+                // that shape and convert rather than treat it as a
+                // "directory of dSYMs".
+                const looksLikeBundle = fs.existsSync(
+                  path.join(filePath, 'Contents', 'Resources', 'DWARF'),
+                );
+                if (looksLikeBundle) {
+                  filePath = convertDSymIfNeeded(filePath);
+                  const single = await uploadCatchSymbol({
+                    filePath,
+                    kind,
+                    environment,
+                    release: releaseLabel,
+                  });
+                  if (single) uploaded.push(single);
+                  return;
+                }
+              }
+              if (!isDir && kind === 'android_ndk') {
+                // Raw .so? Convert; anything else (already a manifest)
+                // goes through untouched.
+                if (filePath.endsWith('.so') || filePath.endsWith('.so.debug')) {
+                  filePath = convertNDKIfNeeded(filePath);
+                }
+              }
+              if (isDir) {
+                // Heuristic per kind — narrow the file pattern to cut
+                // through the junk directories bundlers drop beside
+                // source maps (asset manifests, stats files, etc.).
+                const pattern =
+                  kind === 'js_sourcemap' ? /\.map$/ :
+                  kind === 'ios_dsym' ? /\.dSYM(\.zip)?$/i :
+                  kind === 'android_mapping' ? /mapping\.txt$/i :
+                  kind === 'android_ndk' ? /\.(so|so\.debug)$/ :
+                  kind === 'flutter_symbols' ? /\.symbols(\.zip)?$/i :
+                  /.*/;
+                const { uploaded: found, skipped } = await uploadSymbolsDirectory({
+                  dir: filePath,
+                  kind: kind!,
+                  environment,
+                  release: releaseLabel,
+                  filePattern: pattern,
+                });
+                uploaded.push(...found);
+                if (found.length === 0) {
+                  warnings.push(
+                    `${kindLabel}: no files matched in ${filePath} (skipped: ${skipped.length})`,
+                  );
+                }
+              } else {
+                const art = await uploadCatchSymbol({
+                  filePath,
+                  kind,
+                  environment,
+                  release: releaseLabel,
+                  allowMissing: true,
+                });
+                if (art) uploaded.push(art);
+                else warnings.push(`${kindLabel}: ${filePath} not found — skipped`);
+              }
+            } catch (e: any) {
+              warnings.push(`${kindLabel}: ${e.message}`);
+            }
+          };
+
+          if (opts.uploadSourcemaps) await uploadOne('sourcemaps', opts.uploadSourcemaps, 'js_sourcemap');
+          if (opts.uploadDsym) await uploadOne('dSYM', opts.uploadDsym, 'ios_dsym');
+          if (opts.uploadMapping) await uploadOne('mapping', opts.uploadMapping, 'android_mapping');
+          if (opts.uploadNdk) await uploadOne('NDK', opts.uploadNdk, 'android_ndk');
+          if (opts.uploadDartSymbols) await uploadOne('Dart symbols', opts.uploadDartSymbols, 'flutter_symbols');
+
+          symSpinner.succeed(`Uploaded ${uploaded.length} symbol artifact${uploaded.length === 1 ? '' : 's'}`);
+          for (const art of uploaded) {
+            console.log(chalk.dim(`     • ${art.kind.padEnd(16)} ${art.original_name}  (${art.id.slice(0, 12)})`));
+          }
+          for (const w of warnings) {
+            console.log(chalk.yellow(`     ⚠ ${w}`));
+          }
+        } catch (e: any) {
+          symSpinner.fail(`Symbol upload failed: ${e.message}`);
+          // Don't fail the release — symbols are a nice-to-have
+          // side-effect; the binary/OTA is what's already landed.
+        }
+      }
+
       console.log('');
     } catch (err: any) {
       uploadSpinner.fail(`Upload failed: ${err.message}`);
