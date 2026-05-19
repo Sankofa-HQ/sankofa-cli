@@ -6,6 +6,7 @@ import { logoutCommand } from './commands/logout.js';
 import { switchCommand } from './commands/switch.js';
 import { releaseCommand } from './commands/release.js';
 import { patchCommand } from './commands/patch.js';
+import { flutterPushCommand } from './commands/flutter-push.js';
 import { previewCommand } from './commands/preview.js';
 import { statusCommand } from './commands/status.js';
 import { submitCommand } from './commands/submit.js';
@@ -34,6 +35,10 @@ program.addCommand(logoutCommand);
 program.addCommand(switchCommand);
 program.addCommand(releaseCommand);
 program.addCommand(patchCommand);
+// Phase 8 — Flutter Code OTA push (runtime=flutter-code, payload=libapp.so).
+// Lives alongside `release` because it's a sibling operation on the same
+// /api/v1/deploy/releases endpoint, just with a different runtime.
+program.addCommand(flutterPushCommand);
 program.addCommand(previewCommand);
 program.addCommand(statusCommand);
 program.addCommand(releasesCommand);
