@@ -6,7 +6,7 @@
     "sankofa": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node --max-old-space-size=8192 ./node_modules/typescript/bin/tsc",
     "dev": "tsx src/index.ts",
     "prepublishOnly": "npm run build"
   },

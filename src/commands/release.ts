@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import fs from 'node:fs';
 import { join } from 'path';
+import { statSync } from 'fs';
 import {
   buildDistributionArtifact,
   buildNativePreviewArtifact,
@@ -19,7 +20,7 @@ import {
 } from '../utils/bundler.js';
 import os from 'node:os';
 import path from 'node:path';
-import { uploadRelease } from '../utils/api.js';
+import { listReleases, uploadRelease } from '../utils/api.js';
 import { requireAuth } from '../utils/config.js';
 import {
   uploadCatchSymbol,
@@ -32,8 +33,10 @@ import {
   writeManifest,
 } from '../utils/nativeManifest.js';
 import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompts.js';
-import { resolveRNProjectRoot } from '../utils/project.js';
+import { resolveProjectRoot, type ProjectInfo } from '../utils/stack.js';
 import { parseRollout } from '../utils/validation.js';
+import { buildFlutterAOT, resolveFlutterPlatform } from '../utils/flutterBundler.js';
+import { captureFlutterBaseline, type BaselineManifest } from '../utils/baseline.js';
 
 export const releaseCommand = new Command('release')
   .description('Create a Sankofa Deploy release by bundling JavaScript and uploading a preview-installable native artifact')
@@ -51,7 +54,7 @@ export const releaseCommand = new Command('release')
   .option('--ios-export-method <method>', 'iOS export method: app-store, ad-hoc, development, enterprise (default: app-store)')
   .option('--ios-team-id <id>', 'Apple Developer Team ID for iOS code signing (auto-detected from archive when omitted)')
   .option('--ios-export-options <path>', 'Path to a custom ExportOptions.plist (overrides --ios-export-method / --ios-team-id)')
-  .option('--android-format <fmt>', 'Android distribution format: aab (Play Store) or apk (sideload). Default: aab', 'aab')
+  .option('--android-format <fmt>', '[RN, deprecated alias for --apk/--appbundle] Android format: aab or apk. Default: aab', 'aab')
   // ── Sankofa Catch symbol uploads (M10). Each flag takes a path
   //    (file or directory). Non-existent paths are skipped with a
   //    warning so the release flow isn't blocked by a missing artifact.
@@ -60,11 +63,50 @@ export const releaseCommand = new Command('release')
   .option('--upload-mapping <path>', 'Upload Android ProGuard/R8 mapping.txt for this release')
   .option('--upload-ndk <path>', 'Upload Android NDK symbols for this release (directory of .so files)')
   .option('--upload-dart-symbols <path>', 'Upload Flutter/Dart symbol bundle for this release')
+  .option('--dry-run', 'Build + capture Diff Guard baseline locally, but do NOT contact the server or upload')
+  .option('--apk', 'Android: produce an APK (sideload-installable). Default is --appbundle. (RN + Flutter)')
+  .option('--appbundle', 'Android: produce an AAB (Play Store). This is the default. (RN + Flutter)')
   .action(async (platformArg: string | undefined, opts) => {
     const chalk = (await import('chalk')).default;
-    const ora = (await import('ora')).default;
 
     await requireAuth();
+
+    // Resolve project + dispatch by stack. Flutter releases follow a much
+    // shorter path (no native artifact build step, no symbol uploads —
+    // those don't apply to Dart AOT today). RN releases keep the existing
+    // pipeline unchanged.
+    let project: ProjectInfo;
+    try {
+      project = await resolveProjectRoot({
+        explicit: opts.project,
+        allowedStacks: ['react-native', 'flutter'],
+      });
+    } catch (err: any) {
+      console.error(chalk.red(`  ✖ ${err.message}`));
+      process.exit(1);
+    }
+
+    if (project.root !== process.cwd()) {
+      console.log(chalk.dim(`  → Working in ${project.root}`));
+      process.chdir(project.root);
+    }
+
+    if (project.stack === 'flutter') {
+      return flutterRelease(project, platformArg, opts);
+    }
+
+    // ── React Native (existing flow, unchanged below) ──
+    const ora = (await import('ora')).default;
+
+    // Honor the new --apk / --appbundle flags here too. They take
+    // precedence over the legacy --android-format if both are passed,
+    // because the new flags express user intent more clearly.
+    if (opts.apk && opts.appbundle) {
+      console.error(chalk.red('  ✖ --apk and --appbundle are mutually exclusive.'));
+      process.exit(1);
+    }
+    if (opts.apk) opts.androidFormat = 'apk';
+    else if (opts.appbundle) opts.androidFormat = 'aab';
 
     let platform;
     let environment;
@@ -73,14 +115,6 @@ export const releaseCommand = new Command('release')
       platform = await resolvePlatformPrompt(platformArg);
       environment = await resolveEnvironmentPrompt(opts.env);
       rollout = parseRollout(opts.rollout);
-    } catch (err: any) {
-      console.error(chalk.red(err.message));
-      process.exit(1);
-    }
-
-    try {
-      const project = await resolveRNProjectRoot(opts.project);
-      process.chdir(project.root);
     } catch (err: any) {
       console.error(chalk.red(err.message));
       process.exit(1);
@@ -462,3 +496,232 @@ export const releaseCommand = new Command('release')
       process.exit(1);
     }
   });
+
+// ── Flutter release ───────────────────────────────────────────────────────────
+
+export async function flutterRelease(
+  project: ProjectInfo,
+  platformArg: string | undefined,
+  opts: any,
+) {
+  const chalk = (await import('chalk')).default;
+  const ora = (await import('ora')).default;
+  const inquirer = (await import('inquirer')).default;
+
+  // Platform — explicit positional required for parity with RN. iOS is
+  // Phase 6 and refused up-front so users don't waste a build cycle.
+  const platform = await resolveFlutterPlatform(platformArg);
+
+  let environment;
+  let rollout;
+  try {
+    environment = await resolveEnvironmentPrompt(opts.env);
+    rollout = parseRollout(opts.rollout);
+  } catch (err: any) {
+    console.error(chalk.red(err.message));
+    process.exit(1);
+  }
+
+  if (opts.apk && opts.appbundle) {
+    console.error(chalk.red('  ✖ --apk and --appbundle are mutually exclusive.'));
+    process.exit(1);
+  }
+
+  // 1. Build the AAB (Play Store deployable) + APK (for libapp.so extraction)
+  //    + extract libapp.so + AndroidManifest + flutter_assets.
+  const format: 'aab' | 'apk' = opts.apk ? 'apk' : 'aab';
+  const buildSpinner = ora(
+    `Building Flutter ${format.toUpperCase()} + APK (release, arm64-v8a)...`,
+  ).start();
+  let built;
+  try {
+    built = buildFlutterAOT(project.root, {
+      outputDir: opts.outputDir || './build',
+      keepApk: true,
+      verbose: false,
+      format,
+    });
+    buildSpinner.succeed(
+      `Built ${format.toUpperCase()}${format === 'aab' ? ' + APK' : ''} + extracted libapp.so (${formatBytes(statSync(built.libappPath).size)})`,
+    );
+  } catch (err: any) {
+    buildSpinner.fail(`Flutter build failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  const engineVersion = built.engine.sankofaEngineVersion;
+  const appVersion = built.appVersion;
+  const label = `v${appVersion}`;
+
+  // 2. Refuse if a flutter-code release already exists for this version +
+  //    engine combination. Direct user to `sankofa patch` instead. Skipped
+  //    on --dry-run (we never want to touch the server in that mode).
+  if (!opts.dryRun) {
+    const checkSpinner = ora('Checking for existing baseline release...').start();
+    try {
+      const releases = await listReleases(environment, platform);
+      const conflict = releases.find((r: any) =>
+        (r.runtime === 'flutter-code' || r.runtime === 'flutter_code') &&
+        r.target_binary_version === appVersion &&
+        r.engine_version === engineVersion,
+      );
+      if (conflict) {
+        checkSpinner.fail(
+          `A baseline release already exists for ${chalk.bold(appVersion)} + ${chalk.bold(engineVersion)}: ${chalk.dim(conflict.label)}.`,
+        );
+        console.log('');
+        console.log(chalk.dim('  Use one of:'));
+        console.log(chalk.dim(`    • Hot-patch:               ${chalk.cyan('sankofa patch')}`));
+        console.log(chalk.dim(`    • Bump pubspec version and rerun  ${chalk.cyan('sankofa release')}`));
+        process.exit(1);
+      }
+      checkSpinner.succeed('No existing baseline — safe to create');
+    } catch (err: any) {
+      checkSpinner.fail(`Could not check existing releases: ${err.message}`);
+      process.exit(1);
+    }
+  } else {
+    console.log(chalk.dim('  · Skipping server check (--dry-run)'));
+  }
+
+  // 3. Capture the Diff Guard baseline snapshot. Done BEFORE the upload
+  //    so we never have a published release without a corresponding
+  //    on-disk baseline.
+  const baselineSpinner = ora('Capturing Diff Guard baseline...').start();
+  const libappSha = computeSHA256(built.libappPath);
+  const baselineManifest: BaselineManifest = {
+    version: 1,
+    stack: 'flutter',
+    releaseLabel: label,
+    targetBinaryVersion: appVersion,
+    engineVersion,
+    payloadSha256: libappSha,
+    capturedAt: new Date().toISOString(),
+  };
+  try {
+    captureFlutterBaseline({
+      projectRoot: project.root,
+      androidManifestPath: built.apkContentsDir
+        ? join(built.apkContentsDir, 'AndroidManifest.xml')
+        : '',
+      flutterAssetsDir: built.apkContentsDir
+        ? join(built.apkContentsDir, 'assets', 'flutter_assets')
+        : '',
+      manifest: baselineManifest,
+    });
+    baselineSpinner.succeed('Baseline captured at .sankofa/baseline/');
+  } catch (err: any) {
+    baselineSpinner.fail(`Baseline capture failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  const libappSize = getFileSize(built.libappPath);
+  console.log(chalk.dim(`  Label:            ${label}`));
+  console.log(chalk.dim(`  Engine version:   ${engineVersion}`));
+  console.log(chalk.dim(`  Target binary:    ${appVersion}`));
+  console.log(chalk.dim(`  libapp.so SHA256: ${libappSha}`));
+  console.log(chalk.dim(`  libapp.so size:   ${formatBytes(libappSize)}`));
+
+  // 4. --dry-run: stop here, baseline is captured, nothing to upload.
+  if (opts.dryRun) {
+    console.log('');
+    console.log(chalk.green.bold('  ✓ Dry-run complete'));
+    if (built.aabPath) {
+      console.log('');
+      console.log(chalk.bold('  🏬 Store binary — Android AAB (Play Store)'));
+      console.log(chalk.dim('     Path:   ') + chalk.cyan(built.aabPath));
+      console.log(chalk.dim('     Size:   ') + formatBytes(statSync(built.aabPath).size));
+      console.log(chalk.dim('     Contains: Sankofa updater (libsankofa_updater_ffi.so) + OTA wiring'));
+      console.log(chalk.dim('     Upload via Play Console → Production/Testing track'));
+    } else if (built.apkPath) {
+      console.log('');
+      console.log(chalk.bold('  📦 Store binary — Android APK (sideload)'));
+      console.log(chalk.dim('     Path:   ') + chalk.cyan(built.apkPath));
+      console.log(chalk.dim('     Size:   ') + formatBytes(statSync(built.apkPath).size));
+    }
+    console.log('');
+    console.log(chalk.dim('     Baseline saved to .sankofa/baseline/'));
+    console.log(chalk.dim('     Future `sankofa patch` runs will Diff-Guard against this snapshot.'));
+    console.log(chalk.dim('     Re-run without --dry-run to publish the release to Sankofa.'));
+    console.log('');
+    return;
+  }
+
+  // 5. Confirm publish.
+  let shouldPublish = opts.publish;
+  if (!shouldPublish) {
+    const { confirm } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'confirm',
+        message: `Publish ${chalk.bold(label)} as the Flutter Code baseline for ${chalk.bold(appVersion)}?`,
+        default: true,
+      },
+    ]);
+    shouldPublish = confirm;
+  }
+
+  if (!shouldPublish) {
+    console.log(chalk.dim('Release cancelled. Baseline snapshot kept on disk for next attempt.'));
+    return;
+  }
+
+  // 5. Upload as runtime=flutter-code, no base release — this IS the base.
+  const uploadSpinner = ora('Uploading libapp.so to Sankofa...').start();
+  try {
+    const release = await uploadRelease(built.libappPath, {
+      label,
+      target_binary_version: appVersion,
+      platform,
+      description: opts.description || `Flutter Code baseline ${label}`,
+      is_mandatory: opts.mandatory || false,
+      rollout_percentage: rollout,
+      environment,
+      runtime: 'flutter-code',
+      engine_version: engineVersion,
+    });
+    uploadSpinner.succeed('libapp.so uploaded');
+
+    console.log('');
+    console.log(chalk.green.bold('  🚀 Flutter Code baseline released'));
+    console.log(chalk.dim(`     Label:           ${release.label}`));
+    console.log(chalk.dim(`     Runtime:         ${release.runtime}`));
+    console.log(chalk.dim(`     Engine:          ${release.engine_version}`));
+    console.log(chalk.dim(`     Target binary:   ${release.target_binary_version}`));
+    console.log(chalk.dim(`     Rollout:         ${release.rollout_percentage}%`));
+    console.log(chalk.dim(`     Release ID:      ${release.id}`));
+
+    // The deployable store artifact: AAB for Play Store, APK as fallback.
+    // This is the ONE artifact the customer should submit. Built fresh
+    // by `sankofa release` so we can guarantee it has the Sankofa engine
+    // fork's libflutter.so + the OTA wiring. Raw `flutter build` would
+    // also include them (via the sankofa_deploy plugin's jniLibs), but
+    // without `sankofa release` there's no server-side baseline = no
+    // OTA can reach the published app. So this command is the source of
+    // truth for production releases.
+    if (built.aabPath) {
+      console.log('');
+      console.log(chalk.bold('  🏬 Store binary — Android AAB (Play Store)'));
+      console.log(chalk.dim('     Path:   ') + chalk.cyan(built.aabPath));
+      console.log(chalk.dim('     Size:   ') + formatBytes(statSync(built.aabPath).size));
+      console.log(chalk.dim('     Contains: Sankofa updater (libsankofa_updater_ffi.so) + OTA wiring'));
+      console.log('');
+      console.log(chalk.dim('     ↑ This is your deployable. Upload to Play Console → Production/Testing track.'));
+      console.log(chalk.dim('       Do not submit anything from raw `flutter build` — only this AAB is registered for OTA.'));
+    } else if (built.apkPath) {
+      console.log('');
+      console.log(chalk.bold('  📦 Store binary — Android APK (sideload)'));
+      console.log(chalk.dim('     Path:   ') + chalk.cyan(built.apkPath));
+      console.log(chalk.dim('     Size:   ') + formatBytes(statSync(built.apkPath).size));
+      console.log(chalk.dim('     For Play Store, rerun with default `--format aab`.'));
+    }
+
+    console.log('');
+    console.log(chalk.dim('  Future hot-patches: ') + chalk.cyan('sankofa patch'));
+    console.log(chalk.dim('  Diff Guard will refuse patches that change AndroidManifest, flutter_assets, or add new native bindings.'));
+    console.log('');
+  } catch (err: any) {
+    uploadSpinner.fail(`Upload failed: ${err.message}`);
+    process.exit(1);
+  }
+}

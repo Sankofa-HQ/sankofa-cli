@@ -4,6 +4,21 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { loadGlobalConfig } from '../utils/config.js';
 import { resolveBuildEnv } from '../utils/buildEnv.js';
+import {
+  classifyProject,
+  resolveProjectRoot,
+  STACK_LABELS,
+  type ProjectInfo,
+  type Stack,
+} from '../utils/stack.js';
+import {
+  PRODUCTS,
+  availableProductsForStack,
+  detectInstalledProducts,
+  selectedProducts,
+  ALL_PRODUCT_IDS,
+  type ProductId,
+} from '../utils/products.js';
 
 type CheckResult = {
   name: string;
@@ -12,14 +27,19 @@ type CheckResult = {
 };
 
 export const doctorCommand = new Command('doctor')
-  .description('Diagnose the local toolchain + Sankofa server reachability in one shot')
-  .option('--project <path>', 'React Native app directory (defaults to cwd)')
+  .description('Diagnose the local toolchain + Sankofa integration across all installed products')
+  .option('--project <path>', 'Project root (defaults to cwd)')
+  .option('--deploy', 'Limit checks to Sankofa Deploy')
+  .option('--flag', 'Limit checks to Sankofa Switch (feature flags)')
+  .option('--config', 'Limit checks to Sankofa Config (remote configuration)')
+  .option('--catch', 'Limit checks to Sankofa Catch (errors + analytics)')
+  .option('--all', 'Run checks for every available product (default when no product flags)')
   .action(async (opts) => {
     const chalk = (await import('chalk')).default;
 
     const results: CheckResult[] = [];
-    const cwd = opts.project ? opts.project : process.cwd();
 
+    // 1. Universal toolchain checks (always run).
     results.push(check('Node.js', () => {
       const v = process.versions.node;
       const major = parseInt(v.split('.')[0], 10);
@@ -27,148 +47,72 @@ export const doctorCommand = new Command('doctor')
       return { status: 'ok', detail: v };
     }));
 
-    if (process.platform === 'darwin') {
-      results.push(check('Xcode (xcodebuild)', () => {
-        try {
-          const v = execSync('xcodebuild -version', { encoding: 'utf-8' }).split('\n')[0];
-          return { status: 'ok', detail: v };
-        } catch {
-          return { status: 'fail', detail: 'not found — install Xcode from the App Store' };
-        }
-      }));
-
-      results.push(check('Xcode Command Line Tools', () => {
-        try {
-          const path = execSync('xcode-select -p', { encoding: 'utf-8' }).trim();
-          return { status: 'ok', detail: path };
-        } catch {
-          return { status: 'fail', detail: 'run `xcode-select --install`' };
-        }
-      }));
-
-      results.push(check('xcrun simctl', () => {
-        try {
-          const booted = execSync('xcrun simctl list devices booted', { encoding: 'utf-8' });
-          const count = (booted.match(/\(Booted\)/g) || []).length;
-          return count > 0
-            ? { status: 'ok', detail: `${count} booted simulator(s)` }
-            : { status: 'warn', detail: 'no booted simulator — open Simulator before running `sankofa preview`' };
-        } catch {
-          return { status: 'fail', detail: 'simctl not available' };
-        }
-      }));
-
-      results.push(check('CocoaPods', () => {
-        try {
-          const v = execSync('pod --version', { encoding: 'utf-8' }).trim();
-          return { status: 'ok', detail: v };
-        } catch {
-          return { status: 'fail', detail: 'install with `sudo gem install cocoapods` or via Homebrew' };
-        }
-      }));
-
-      results.push(check('Bundler (optional)', () => {
-        try {
-          const v = execSync('bundle --version', { encoding: 'utf-8' }).trim();
-          return { status: 'ok', detail: v };
-        } catch {
-          return { status: 'warn', detail: 'not installed — only needed if your project has a Gemfile' };
-        }
-      }));
-
-      results.push(check('xcrun altool (for submit ios)', () => {
-        try {
-          execSync('xcrun altool --help', { stdio: 'ignore' });
-          return { status: 'ok', detail: 'present' };
-        } catch {
-          return { status: 'warn', detail: 'not on PATH — `sankofa submit ios` will fail' };
-        }
-      }));
-    } else {
-      results.push({ name: 'Xcode / iOS toolchain', status: 'skip', detail: 'not macOS' });
+    // 2. Resolve the project — explicit path, cwd, or scan + pick (mirrors init).
+    //    Doctor can also run with no project in sight (e.g. checking auth);
+    //    in that case the universal checks still run.
+    let project: ProjectInfo | null = null;
+    try {
+      project = await resolveProjectRoot({ explicit: opts.project });
+    } catch {
+      project = null;
     }
 
-    // Use the shared auto-detector so doctor reports the same paths
-    // that `sankofa release` will actually use. When the detector
-    // finds tools in standard locations (Android Studio's default SDK
-    // path, Homebrew Java 17), doctor reports them as OK even if the
-    // user hasn't exported ANDROID_HOME / JAVA_HOME.
-    const androidEnv = resolveBuildEnv('android');
-
-    const javaHome = androidEnv.env.JAVA_HOME;
-    if (javaHome && existsSync(javaHome)) {
-      try {
-        const out = execSync(`"${join(javaHome, 'bin', 'java')}" -version 2>&1`, { encoding: 'utf-8' });
-        const m = out.match(/version "([^"]+)"/);
-        const version = m ? m[1] : '?';
-        results.push({ name: 'Java (17 or 21)', status: 'ok', detail: `${version} at ${javaHome}` });
-      } catch {
-        results.push({ name: 'Java (17 or 21)', status: 'warn', detail: javaHome });
+    if (project) {
+      if (project.root !== process.cwd()) {
+        console.log(chalk.dim(`  → Working in ${project.root}`));
+        process.chdir(project.root);
       }
-    } else {
-      const miss = androidEnv.missing.find((m) => m.tool.includes('Java'));
       results.push({
-        name: 'Java (17 or 21)',
-        status: 'fail',
-        detail: miss?.hint || 'No compatible Java (17 or 21) found on PATH',
+        name: 'Project type',
+        status: 'ok',
+        detail: `${STACK_LABELS[project.stack]} — ${project.name}`,
+      });
+    } else {
+      results.push({
+        name: 'Project type',
+        status: 'warn',
+        detail: `No recognized project at ${process.cwd()} (skipping stack + product checks)`,
       });
     }
 
-    const sdk = androidEnv.env.ANDROID_HOME;
-    if (sdk && existsSync(sdk)) {
-      const wasAutoDetected = !process.env.ANDROID_HOME && !process.env.ANDROID_SDK_ROOT;
-      const suffix = wasAutoDetected ? ' (auto-detected)' : '';
-      results.push({ name: 'Android SDK', status: 'ok', detail: `${sdk}${suffix}` });
-    } else {
-      const miss = androidEnv.missing.find((m) => m.tool.includes('Android SDK'));
-      results.push({
-        name: 'Android SDK',
-        status: 'fail',
-        detail: miss?.hint || 'not found in standard locations',
-      });
+    const cwd = project ? project.root : process.cwd();
+
+    // 3. Stack-specific toolchain checks.
+    if (project) {
+      results.push(...stackToolchainChecks(project.stack, cwd));
     }
 
-    results.push(check('adb', () => {
-      // With the shared detector, PATH now includes platform-tools from
-      // the auto-detected SDK — so adb is available to subprocesses even
-      // if the user's shell doesn't know about it.
-      try {
-        const v = execSync('adb --version', { encoding: 'utf-8', env: androidEnv.env }).split('\n')[0];
-        return { status: 'ok', detail: v };
-      } catch {
-        return { status: 'warn', detail: 'not available — install Android platform-tools' };
+    // 4. Per-product integration checks. Source of truth for "what did the
+    //    user install" is the `products` array persisted in .sankofa.json by
+    //    init. Without that, we can't tell Switch from Deploy on shared
+    //    SDKs (e.g. sankofa_deploy is one package covering all products).
+    //    Backwards-compat: pre-Phase-10 .sankofa.json files don't have the
+    //    products field; we infer Deploy via file detection but conservatively
+    //    leave Switch/Config/Catch out unless --all is passed.
+    const installedProductIds = project ? resolveInstalledProducts(project) : [];
+    if (project) {
+      const productsToCheck = resolveProductsToCheck(opts, project.stack, installedProductIds);
+      const installedReports = detectInstalledProducts(project, installedProductIds);
+      const installedMap = new Map(installedReports.map((r) => [r.product, r]));
+
+      for (const productId of productsToCheck) {
+        const report = installedMap.get(productId);
+        if (!report) {
+          continue;
+        }
+        // For products the user explicitly installed via `init`, use the
+        // per-product detector. For products not in the .sankofa.json
+        // products list, show them only if --all is passed (handled by
+        // resolveProductsToCheck).
+        results.push({
+          name: `${PRODUCTS[productId].name}`,
+          status: report.installed ? 'ok' : 'warn',
+          detail: report.detail,
+        });
       }
-    }));
+    }
 
-    const pkg = readPackageJson(cwd);
-    results.push(check('React Native project', () => {
-      if (!pkg) return { status: 'warn', detail: `no package.json at ${cwd}` };
-      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.expo) return { status: 'ok', detail: `Expo ${deps.expo}` };
-      if (deps['react-native']) return { status: 'ok', detail: `React Native ${deps['react-native']} (bare)` };
-      return { status: 'fail', detail: 'neither expo nor react-native in dependencies' };
-    }));
-
-    results.push(check('sankofa-react-native SDK', () => {
-      if (!pkg) return { status: 'skip', detail: 'no package.json' };
-      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      return deps['sankofa-react-native']
-        ? { status: 'ok', detail: deps['sankofa-react-native'] }
-        : { status: 'warn', detail: 'SDK not installed — runtime checkForUpdate will be a no-op' };
-    }));
-
-    results.push(check('ios/ prebuild', () => {
-      const iosDir = join(cwd, 'ios');
-      if (!existsSync(iosDir)) return { status: 'warn', detail: 'ios/ missing — run `npx expo prebuild --platform ios`' };
-      return { status: 'ok', detail: iosDir };
-    }));
-
-    results.push(check('android/ prebuild', () => {
-      const androidDir = join(cwd, 'android');
-      if (!existsSync(androidDir)) return { status: 'warn', detail: 'android/ missing — run `npx expo prebuild --platform android`' };
-      return { status: 'ok', detail: androidDir };
-    }));
-
+    // 5. Sankofa credentials + server reachability (universal).
     const global = loadGlobalConfig();
     results.push(check('Sankofa credentials', () => {
       if (!global.token && !process.env.SANKOFA_DEPLOY_TOKEN) {
@@ -192,6 +136,7 @@ export const doctorCommand = new Command('doctor')
       }
     }));
 
+    // 6. Print results.
     const pad = Math.max(...results.map((r) => r.name.length));
     console.log('');
     for (const r of results) {
@@ -208,6 +153,27 @@ export const doctorCommand = new Command('doctor')
       console.log(`  ${icon} ${r.name.padEnd(pad)}   ${tone(r.detail)}`);
     }
 
+    // 7. Available-but-not-installed products hint. Driven by the
+    //    user's `.sankofa.json` products list (what they explicitly
+    //    installed), not by file-based detection. A product is "available
+    //    but not installed" when it's supported on this stack AND not in
+    //    the persisted products list.
+    if (project) {
+      const available = availableProductsForStack(project.stack);
+      const installedSet = new Set<string>(installedProductIds);
+      const missing = available.filter((p) => !installedSet.has(p.id));
+      if (missing.length > 0) {
+        console.log('');
+        console.log(chalk.bold(`  Available for ${STACK_LABELS[project.stack]} (not yet installed)`));
+        for (const p of missing) {
+          console.log(
+            chalk.dim(`    · ${p.name.padEnd(18)} `) +
+              chalk.cyan(`sankofa init ${p.flag}`),
+          );
+        }
+      }
+    }
+
     const failed = results.filter((r) => r.status === 'fail').length;
     const warned = results.filter((r) => r.status === 'warn').length;
     console.log('');
@@ -221,6 +187,297 @@ export const doctorCommand = new Command('doctor')
     }
     console.log('');
   });
+
+function resolveProductsToCheck(
+  opts: any,
+  stack: Stack,
+  installedFromConfig: ProductId[],
+): ProductId[] {
+  // Explicit product flag — verbatim respect.
+  const requested = selectedProducts(opts);
+  if (requested.length > 0) {
+    return requested;
+  }
+  // --all: show every product available for this stack, installed or not.
+  if (opts.all) {
+    return availableProductsForStack(stack).map((p) => p.id);
+  }
+  // Default: only show products the user explicitly initialized. If
+  // .sankofa.json has no products list (legacy / pre-Phase-10 init),
+  // fall back to "show all available" so doctor remains useful.
+  if (installedFromConfig.length > 0) {
+    return installedFromConfig;
+  }
+  return availableProductsForStack(stack).map((p) => p.id);
+}
+
+function readInstalledProductIds(projectRoot: string): ProductId[] {
+  const configPath = join(projectRoot, '.sankofa.json');
+  if (!existsSync(configPath)) return [];
+  try {
+    const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const products: unknown[] = Array.isArray(raw.products) ? raw.products : [];
+    return products.filter((p): p is ProductId =>
+      typeof p === 'string' && (ALL_PRODUCT_IDS as string[]).includes(p),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function resolveInstalledProducts(project: ProjectInfo): ProductId[] {
+  // 1. Trust .sankofa.json's products list if present (the post-Phase-10
+  //    ground truth).
+  const fromConfig = readInstalledProductIds(project.root);
+  if (fromConfig.length > 0) return fromConfig;
+
+  // 2. Pre-Phase-10 fallback: infer Deploy from file detection (we can
+  //    reliably detect Deploy via native patching markers). Other products
+  //    can't be inferred from files because they share the SDK package, so
+  //    leave them out — accurate over generous.
+  const reports = detectInstalledProducts(project, []);
+  const deploy = reports.find((r) => r.product === 'deploy');
+  if (deploy?.installed) return ['deploy'];
+  return [];
+}
+
+function stackToolchainChecks(stack: Stack, cwd: string): CheckResult[] {
+  switch (stack) {
+    case 'react-native':
+      return rnToolchainChecks(cwd);
+    case 'flutter':
+      return flutterToolchainChecks(cwd);
+    case 'web':
+      return webToolchainChecks(cwd);
+    case 'native-ios':
+      return nativeIosToolchainChecks(cwd);
+    case 'native-android':
+      return nativeAndroidToolchainChecks(cwd);
+    default:
+      return [];
+  }
+}
+
+// ── React Native ──────────────────────────────────────────────────────────────
+
+function rnToolchainChecks(cwd: string): CheckResult[] {
+  const results: CheckResult[] = [];
+  results.push(...iosToolchainChecks({ requirePods: true }));
+  results.push(...androidToolchainChecks(cwd));
+
+  const pkg = readPackageJson(cwd);
+  results.push(check('React Native project', () => {
+    if (!pkg) return { status: 'warn', detail: `no package.json at ${cwd}` };
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    if (deps.expo) return { status: 'ok', detail: `Expo ${deps.expo}` };
+    if (deps['react-native']) return { status: 'ok', detail: `React Native ${deps['react-native']} (bare)` };
+    return { status: 'fail', detail: 'neither expo nor react-native in dependencies' };
+  }));
+
+  results.push(check('ios/ prebuild', () => {
+    const iosDir = join(cwd, 'ios');
+    if (!existsSync(iosDir)) return { status: 'warn', detail: 'ios/ missing — run `npx expo prebuild --platform ios`' };
+    return { status: 'ok', detail: iosDir };
+  }));
+
+  results.push(check('android/ prebuild', () => {
+    const androidDir = join(cwd, 'android');
+    if (!existsSync(androidDir)) return { status: 'warn', detail: 'android/ missing — run `npx expo prebuild --platform android`' };
+    return { status: 'ok', detail: androidDir };
+  }));
+
+  return results;
+}
+
+// ── Flutter ───────────────────────────────────────────────────────────────────
+
+function flutterToolchainChecks(cwd: string): CheckResult[] {
+  const results: CheckResult[] = [];
+
+  results.push(check('Flutter SDK', () => {
+    try {
+      const v = execSync('flutter --version', { encoding: 'utf-8' }).split('\n')[0];
+      return { status: 'ok', detail: v };
+    } catch {
+      return { status: 'fail', detail: 'flutter not on PATH — install from flutter.dev' };
+    }
+  }));
+
+  results.push(check('Dart SDK', () => {
+    try {
+      const v = execSync('dart --version', { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] })
+        .trim()
+        .split('\n')[0];
+      return { status: 'ok', detail: v };
+    } catch {
+      return { status: 'warn', detail: 'dart not on PATH — usually bundled with Flutter' };
+    }
+  }));
+
+  results.push(...iosToolchainChecks({ requirePods: false }));
+  results.push(...androidToolchainChecks(cwd));
+
+  results.push(check('pubspec.yaml', () => {
+    const path = join(cwd, 'pubspec.yaml');
+    if (!existsSync(path)) return { status: 'fail', detail: 'missing' };
+    return { status: 'ok', detail: path };
+  }));
+
+  return results;
+}
+
+// ── Web ───────────────────────────────────────────────────────────────────────
+
+function webToolchainChecks(cwd: string): CheckResult[] {
+  const results: CheckResult[] = [];
+  const pkg = readPackageJson(cwd);
+  if (pkg) {
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    const framework =
+      deps['next'] ? `Next.js ${deps['next']}` :
+      deps['vite'] ? `Vite ${deps['vite']}` :
+      deps['react-scripts'] ? `Create React App ${deps['react-scripts']}` :
+      deps['vue'] ? `Vue ${deps['vue']}` :
+      deps['nuxt'] ? `Nuxt ${deps['nuxt']}` :
+      deps['svelte'] ? `Svelte ${deps['svelte']}` :
+      deps['@angular/core'] ? `Angular ${deps['@angular/core']}` :
+      deps['react'] ? `React ${deps['react']}` :
+      'static / unknown';
+    results.push({ name: 'Web framework', status: 'ok', detail: framework });
+  } else if (existsSync(join(cwd, 'index.html'))) {
+    results.push({ name: 'Web project', status: 'ok', detail: 'static (index.html)' });
+  }
+  return results;
+}
+
+// ── Native iOS ────────────────────────────────────────────────────────────────
+
+function nativeIosToolchainChecks(cwd: string): CheckResult[] {
+  const results: CheckResult[] = [];
+  results.push(...iosToolchainChecks({ requirePods: false }));
+  results.push(check('Package.swift', () => {
+    const path = join(cwd, 'Package.swift');
+    if (!existsSync(path)) return { status: 'fail', detail: 'missing' };
+    return { status: 'ok', detail: path };
+  }));
+  return results;
+}
+
+// ── Native Android ────────────────────────────────────────────────────────────
+
+function nativeAndroidToolchainChecks(cwd: string): CheckResult[] {
+  const results: CheckResult[] = [];
+  results.push(...androidToolchainChecks(cwd));
+  results.push(check('Gradle wrapper', () => {
+    const wrapper = join(cwd, 'gradlew');
+    if (!existsSync(wrapper)) return { status: 'warn', detail: 'gradlew missing — run `gradle wrapper`' };
+    return { status: 'ok', detail: wrapper };
+  }));
+  return results;
+}
+
+// ── Shared toolchain checks ───────────────────────────────────────────────────
+
+function iosToolchainChecks(opts: { requirePods: boolean }): CheckResult[] {
+  if (process.platform !== 'darwin') {
+    return [{ name: 'Xcode / iOS toolchain', status: 'skip', detail: 'not macOS' }];
+  }
+  const results: CheckResult[] = [];
+
+  results.push(check('Xcode (xcodebuild)', () => {
+    try {
+      const v = execSync('xcodebuild -version', { encoding: 'utf-8' }).split('\n')[0];
+      return { status: 'ok', detail: v };
+    } catch {
+      return { status: 'fail', detail: 'not found — install Xcode from the App Store' };
+    }
+  }));
+
+  results.push(check('Xcode Command Line Tools', () => {
+    try {
+      const path = execSync('xcode-select -p', { encoding: 'utf-8' }).trim();
+      return { status: 'ok', detail: path };
+    } catch {
+      return { status: 'fail', detail: 'run `xcode-select --install`' };
+    }
+  }));
+
+  results.push(check('xcrun simctl', () => {
+    try {
+      const booted = execSync('xcrun simctl list devices booted', { encoding: 'utf-8' });
+      const count = (booted.match(/\(Booted\)/g) || []).length;
+      return count > 0
+        ? { status: 'ok', detail: `${count} booted simulator(s)` }
+        : { status: 'warn', detail: 'no booted simulator — open Simulator before running `sankofa preview`' };
+    } catch {
+      return { status: 'fail', detail: 'simctl not available' };
+    }
+  }));
+
+  if (opts.requirePods) {
+    results.push(check('CocoaPods', () => {
+      try {
+        const v = execSync('pod --version', { encoding: 'utf-8' }).trim();
+        return { status: 'ok', detail: v };
+      } catch {
+        return { status: 'fail', detail: 'install with `sudo gem install cocoapods` or via Homebrew' };
+      }
+    }));
+  }
+
+  return results;
+}
+
+function androidToolchainChecks(cwd: string): CheckResult[] {
+  const results: CheckResult[] = [];
+  const androidEnv = resolveBuildEnv('android');
+
+  const javaHome = androidEnv.env.JAVA_HOME;
+  if (javaHome && existsSync(javaHome)) {
+    try {
+      const out = execSync(`"${join(javaHome, 'bin', 'java')}" -version 2>&1`, { encoding: 'utf-8' });
+      const m = out.match(/version "([^"]+)"/);
+      const version = m ? m[1] : '?';
+      results.push({ name: 'Java (17 or 21)', status: 'ok', detail: `${version} at ${javaHome}` });
+    } catch {
+      results.push({ name: 'Java (17 or 21)', status: 'warn', detail: javaHome });
+    }
+  } else {
+    const miss = androidEnv.missing.find((m) => m.tool.includes('Java'));
+    results.push({
+      name: 'Java (17 or 21)',
+      status: 'fail',
+      detail: miss?.hint || 'No compatible Java (17 or 21) found on PATH',
+    });
+  }
+
+  const sdk = androidEnv.env.ANDROID_HOME;
+  if (sdk && existsSync(sdk)) {
+    const wasAutoDetected = !process.env.ANDROID_HOME && !process.env.ANDROID_SDK_ROOT;
+    const suffix = wasAutoDetected ? ' (auto-detected)' : '';
+    results.push({ name: 'Android SDK', status: 'ok', detail: `${sdk}${suffix}` });
+  } else {
+    const miss = androidEnv.missing.find((m) => m.tool.includes('Android SDK'));
+    results.push({
+      name: 'Android SDK',
+      status: 'fail',
+      detail: miss?.hint || 'not found in standard locations',
+    });
+  }
+
+  results.push(check('adb', () => {
+    try {
+      const v = execSync('adb --version', { encoding: 'utf-8', env: androidEnv.env }).split('\n')[0];
+      return { status: 'ok', detail: v };
+    } catch {
+      return { status: 'warn', detail: 'not available — install Android platform-tools' };
+    }
+  }));
+
+  return results;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function check(name: string, fn: () => { status: CheckResult['status']; detail: string }): CheckResult {
   try {
