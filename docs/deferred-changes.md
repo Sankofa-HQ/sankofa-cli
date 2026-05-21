@@ -32,7 +32,52 @@ sankofa_flutter:
 
 **Trigger:** API stable + ready for external customer install.
 
-**Note on the deleted Phase 7 package:** `flutter-deploy/sankofa-flutter-deploy/flutter-sdk/` is now redundant; the Dart + Kotlin + jniLibs have all been migrated to the unified SDK. It can be deleted once we're sure no other branch / WIP work references it (audit: `grep -r "sankofa_deploy" .` should return only legacy-detection compatibility code).
+**Note on the deleted Phase 7 package:** `flutter-deploy/sankofa-flutter-deploy/flutter-sdk/` was DELETED on 2026-05-21 after a full migration + audit confirmed zero live code references. Git history preserves the work. The CLI's `init.ts` and `products.ts` still accept the legacy `sankofa_deploy` pubspec entry as backward-compat detection (for any branch still mid-migration), but no path / package on disk references it.
+
+---
+
+## When the server's reverse-handshake schema lands "module integration status"
+
+**Current state:** the Flutter `SankofaDeploy` runs a self-audit on init
+([`checkIntegration()`](../../../sdks/sankofa_sdk_flutter/lib/src/deploy/sankofa_deploy.dart))
+that inspects the host's AndroidManifest, MainActivity class hierarchy,
+INTERNET permission, `com.sankofa.apiKey`/`endpoint` meta-data, and JNI
+initialization. The result is cached in
+`Sankofa.instance.lastDeployIntegrationStatus` and printed as a debug
+warning when the integration is partial/broken. **It is not yet
+forwarded to the server.**
+
+The Flutter `Sankofa.init` currently does NOT send a reverse handshake
+(unlike RN, which sends `?installed=core,deploy,catch&platform=android`
+to `/api/v1/handshake`). The Flutter side fetches its own deploy state
+through the platform plugin's HTTP call inside the Updater.
+
+**Target state:**
+
+1. Flutter `Sankofa.init` issues a reverse handshake on startup that
+   includes both the installed module list AND each module's
+   integration status, e.g.:
+   ```
+   GET /api/v1/handshake?installed=core,deploy
+       &integration=deploy:partial:no_sankofa_application,no_internet_permission
+   ```
+2. Server records the integration status per device/release/distinct_id.
+3. Dashboard surfaces "SDK Integration Incomplete" badge for any
+   project whose latest reverse handshake reports a non-`full` module.
+
+**Trigger:** when we have time + the dashboard surface to display it.
+Without the dashboard side this is invisible to the developer except
+via debug-mode logs.
+
+**Files to update when this lands:**
+
+| File | Change |
+|---|---|
+| `sdks/sankofa_sdk_flutter/lib/src/sankofa_client.dart` | Add reverse handshake call in `init()` after Deploy audit; encode the audit result via `integration=` query param |
+| `sdks/sankofa_sdk_react_native/src/index.ts` | Already sends `installed=` — extend with the same `integration=` param after RN's `SankofaDeploy.checkIntegration()` lands |
+| `sdks/sankofa_sdk_react_native/src/deploy/SankofaDeploy.ts` | Mirror Flutter's `checkIntegration()` — inspect MainApplication bundle-loader patch, app.json plugins, iOS AppDelegate (when iOS lands), `sankofa-react-native` SDK dep |
+| `server/engine/ee/deploy/handshake.go` | Parse the new `integration` query param into the `DeviceContext`; persist to a new column on the device-attribution table |
+| `dashboard/ee/components/deploy/` | New widget: "SDK Integration Incomplete" with per-module breakdown |
 
 ---
 
