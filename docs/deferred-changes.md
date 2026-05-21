@@ -6,27 +6,33 @@ that unlocks the change.
 
 ---
 
-## When `sankofa_flutter` (or `sankofa_sdk_flutter`) is published to pub.dev
+## When `sankofa_flutter` is published to pub.dev
 
-**Current state:** the Flutter Deploy SDK is `sankofa_deploy`, distributed
-as a path dependency from `flutter-deploy/sankofa-flutter-deploy/flutter-sdk/`.
-It is not on pub.dev. Customers reach it via `dependencies: { sankofa_deploy: { path: ... } }`.
+**Current state:** the unified Flutter SDK lives at
+`sdks/sankofa_sdk_flutter/` (directory) with package name
+`sankofa_flutter` (per pubspec). Phase 7's standalone `sankofa_deploy`
+has been folded into it under `lib/src/deploy/`. The CLI and
+`hello_sankofa` reference it via path dependency:
 
-**Future state:** per `project_unified_flutter_sdk.md`, OTA folds into
-`sankofa_sdk_flutter` under `lib/src/deploy/`. The interim name was
-`sankofa_flutter`.
+```yaml
+sankofa_flutter:
+  path: ../../../sdks/sankofa_sdk_flutter
+```
+
+**Future state:** publish to pub.dev so customers install with
+`flutter pub add sankofa_flutter` — no path dependency needed.
 
 **Files to update when this lands:**
 
 | File | Change |
 |---|---|
-| `src/utils/products.ts` | `SDK_PACKAGE_BY_STACK.flutter` → `sankofa_sdk_flutter` (and flip the "future" branch in `isSDKInstalled`) |
-| `src/commands/init.ts` | `flutter pub add sankofa_deploy` → `flutter pub add sankofa_sdk_flutter` |
-| `src/commands/init.ts` | `import 'package:sankofa_deploy/sankofa_deploy.dart'` → `import 'package:sankofa_sdk_flutter/sankofa_sdk_flutter.dart'` |
-| `src/commands/init.ts` | The `await SankofaDeploy.init(...)` snippet should switch to whatever entry-point the unified SDK exposes (likely `Sankofa.deploy.init(...)`) |
-| `src/commands/doctor.ts` | Same SDK-name detection (after Stage 3 is written) |
+| `cli/sankofa-cli/src/commands/init.ts` | `installDeployFlutter` already prints `flutter pub add sankofa_flutter` — once pub.dev publishes, this is the actual command (no path dep needed) |
+| `flutter-deploy/sankofa-flutter-deploy/hello_sankofa/pubspec.yaml` | Replace `sankofa_flutter: path: ../../../sdks/sankofa_sdk_flutter` with `sankofa_flutter: ^x.y.z` |
+| `sdks/sankofa_sdk_flutter/pubspec.yaml` | Bump version + remove `publish_to: none` (or set it to a private registry URL if going private-by-default) |
 
-**Trigger:** unified SDK published to pub.dev with a stable release.
+**Trigger:** API stable + ready for external customer install.
+
+**Note on the deleted Phase 7 package:** `flutter-deploy/sankofa-flutter-deploy/flutter-sdk/` is now redundant; the Dart + Kotlin + jniLibs have all been migrated to the unified SDK. It can be deleted once we're sure no other branch / WIP work references it (audit: `grep -r "sankofa_deploy" .` should return only legacy-detection compatibility code).
 
 ---
 

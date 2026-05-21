@@ -71,7 +71,7 @@ export function availableProductsForStack(stack: Stack): ProductInfo[] {
 
 export const SDK_PACKAGE_BY_STACK: Record<Stack, string | null> = {
   'react-native': 'sankofa-react-native',
-  flutter: 'sankofa_deploy',
+  flutter: 'sankofa_flutter',
   web: '@sankofa/browser',
   'native-ios': 'sankofa_sdk_ios',
   'native-android': 'dev.sankofa.sdk:sankofa-android',
@@ -139,7 +139,9 @@ function detectProduct(
 
 function detectDeployFlutter(project: ProjectInfo): { installed: boolean; detail: string } {
   const pubspec = readText(join(project.root, 'pubspec.yaml')) || '';
-  const hasSdk = pubspec.includes('sankofa_deploy') || pubspec.includes('sankofa_flutter');
+  // Accept both the unified package and the legacy Phase 7 package
+  // so doctor remains accurate for projects mid-migration.
+  const hasSdk = pubspec.includes('sankofa_flutter') || pubspec.includes('sankofa_deploy');
 
   const manifestPath = join(project.root, 'android', 'app', 'src', 'main', 'AndroidManifest.xml');
   const manifest = readText(manifestPath) || '';
@@ -149,7 +151,7 @@ function detectDeployFlutter(project: ProjectInfo): { installed: boolean; detail
     return { installed: true, detail: 'pubspec + AndroidManifest wired' };
   }
   if (hasApplication && !hasSdk) {
-    return { installed: false, detail: 'native wired but pubspec missing sankofa_deploy — run `flutter pub add sankofa_deploy`' };
+    return { installed: false, detail: 'native wired but pubspec missing sankofa_flutter — run `flutter pub add sankofa_flutter`' };
   }
   if (hasSdk && !hasApplication) {
     return { installed: false, detail: 'pubspec OK but native not wired — run `sankofa init --deploy`' };
@@ -194,13 +196,13 @@ function isSDKInstalled(project: ProjectInfo): { present: boolean; detail: strin
     case 'flutter': {
       const raw = readText(join(project.root, 'pubspec.yaml'));
       if (!raw) return { present: false, detail: 'pubspec.yaml missing' };
-      if (raw.includes('sankofa_deploy')) {
-        return { present: true, detail: 'sankofa_deploy in pubspec.yaml' };
-      }
       if (raw.includes('sankofa_flutter')) {
-        return { present: true, detail: 'sankofa_flutter in pubspec.yaml (future unified SDK)' };
+        return { present: true, detail: 'sankofa_flutter in pubspec.yaml' };
       }
-      return { present: false, detail: 'sankofa_deploy not in pubspec.yaml' };
+      if (raw.includes('sankofa_deploy')) {
+        return { present: true, detail: 'sankofa_deploy in pubspec.yaml (legacy Phase 7; migrate to sankofa_flutter)' };
+      }
+      return { present: false, detail: 'sankofa_flutter not in pubspec.yaml' };
     }
     case 'web': {
       const pkg = readJSON(join(project.root, 'package.json'));

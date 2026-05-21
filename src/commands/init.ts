@@ -306,21 +306,24 @@ async function installDeployRN(project: ProjectInfo, endpoint: string, chalk: an
 async function installDeployFlutter(project: ProjectInfo, endpoint: string, chalk: any) {
   const result = patchFlutterNativeFiles(project.root, endpoint, chalk);
   const pubspecRaw = readFileSync(join(project.root, 'pubspec.yaml'), 'utf-8');
-  const hasSdk = pubspecRaw.includes('sankofa_deploy') || pubspecRaw.includes('sankofa_deploy');
+  // Match either the unified package (current) or the legacy Phase 7
+  // package (for projects mid-migration).
+  const hasSdk = pubspecRaw.includes('sankofa_flutter') || pubspecRaw.includes('sankofa_deploy');
 
   console.log('');
   if (!hasSdk) {
-    console.log(chalk.dim('     Install the runtime SDK:'));
-    console.log(chalk.cyan('       flutter pub add sankofa_deploy'));
+    console.log(chalk.dim('     Install the unified runtime SDK:'));
+    console.log(chalk.cyan('       flutter pub add sankofa_flutter'));
   } else {
     console.log(chalk.dim('     SDK already in pubspec.yaml'));
   }
   console.log(chalk.dim('     Initialize in your main.dart:'));
-  console.log(chalk.cyan(`       await SankofaDeploy.init(
+  console.log(chalk.cyan(`       await Sankofa.instance.init(
          apiKey: 'YOUR_API_KEY',
          endpoint: '${endpoint}',
+         enableDeploy: true,
        );
-       await SankofaDeploy.notifyAppReady();`));
+       await Sankofa.instance.deploy?.notifyAppReady();`));
 
   if (!result.androidPatched && existsSync(join(project.root, 'android'))) {
     console.log('');
@@ -656,22 +659,31 @@ function patchFlutterMainDart(cwd: string, chalk: any) {
     return;
   }
   let src = readFileSync(mainDart, 'utf-8');
-  if (src.includes('SankofaDeploy.init')) {
-    console.log(chalk.dim(`     · lib/main.dart already calls SankofaDeploy.init`));
+  // Migration-friendly detection: match either the legacy Phase 7
+  // `SankofaDeploy.init(...)` call OR the unified `Sankofa.instance.init(`
+  // call so re-running `init` on a project that's already on the new
+  // SDK doesn't re-patch.
+  if (src.includes('SankofaDeploy.init') || src.includes('Sankofa.instance.init(')) {
+    console.log(chalk.dim(`     · lib/main.dart already wires up the Sankofa SDK`));
     return;
   }
-  const importLine = "import 'package:sankofa_deploy/sankofa_deploy.dart';";
+  const importLine = "import 'package:sankofa_flutter/sankofa_flutter.dart';";
   if (!src.includes(importLine)) {
     src = importLine + '\n' + src;
   }
+  // Unified SDK init: single Sankofa.instance.init call with module
+  // enable flags. Matches the React-Native SDK's
+  // `Sankofa.initialize(apiKey, { enableDeploy: true })` shape.
   src = src.replace(
     /void main\(\)\s*(async\s*)?\{/,
-    `Future<void> main() async {\n  WidgetsFlutterBinding.ensureInitialized();\n  await SankofaDeploy.init(apiKey: const String.fromEnvironment('SANKOFA_API_KEY'));`,
+    `Future<void> main() async {\n  WidgetsFlutterBinding.ensureInitialized();\n  await Sankofa.instance.init(\n    apiKey: const String.fromEnvironment('SANKOFA_API_KEY'),\n    enableDeploy: true,\n  );`,
   );
-  // Add notifyAppReady right after runApp(...)
+  // Add notifyAppReady right after runApp(...). The new namespaced
+  // accessor returns null when Deploy isn't enabled, so the `?.` guard
+  // protects hosts that flip enableDeploy off later.
   src = src.replace(
     /(runApp\([^;]+;)/,
-    `$1\n  await SankofaDeploy.notifyAppReady();`,
+    `$1\n  await Sankofa.instance.deploy?.notifyAppReady();`,
   );
   writeFileSync(mainDart, src);
   console.log(chalk.green(`     ✓ Patched ${mainDart}`));
