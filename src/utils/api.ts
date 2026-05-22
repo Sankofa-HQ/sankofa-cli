@@ -76,6 +76,13 @@ export async function uploadRelease(
     environment?: string;
     native_artifact_path?: string;
     native_artifact_kind?: string;
+    /** Phase 8: bundle runtime kind. Defaults to react-native server-side. */
+    runtime?: 'react-native' | 'flutter-code';
+    /**
+     * Phase 8: Flutter engine version this bundle was built against (e.g.
+     * "3.41.9+sankofa-1"). Required when runtime === 'flutter-code'.
+     */
+    engine_version?: string;
   },
   onProgress?: (uploaded: number, total: number) => void,
 ): Promise<any> {
@@ -94,9 +101,17 @@ export async function uploadRelease(
   // whole thing into memory as a Buffer → Uint8Array copy. Node 24's
   // fetch is flaky with Blobs built from >20MB in-memory Uint8Arrays
   // (connection resets mid-upload). openAsBlob lazy-streams the file.
-  const bundleBlob = await openAsBlob(bundlePath, { type: 'application/zip' });
-  form.append('bundle', bundleBlob, 'ota.zip');
-  form.append('bundle_format', 'zip');
+  //
+  // Runtime-specific multipart payload:
+  //   react-native → ota.zip (application/zip), bundle_format=zip
+  //   flutter-code → libapp.so (application/octet-stream), bundle_format=so
+  const isFlutterCode = metadata.runtime === 'flutter-code';
+  const bundleContentType = isFlutterCode ? 'application/octet-stream' : 'application/zip';
+  const bundleFilename = isFlutterCode ? 'libapp.so' : 'ota.zip';
+  const bundleFormat = isFlutterCode ? 'so' : 'zip';
+  const bundleBlob = await openAsBlob(bundlePath, { type: bundleContentType });
+  form.append('bundle', bundleBlob, bundleFilename);
+  form.append('bundle_format', bundleFormat);
   if (metadata.native_artifact_path) {
     const nativeBlob = await openAsBlob(metadata.native_artifact_path, {
       type: 'application/octet-stream',
@@ -119,29 +134,34 @@ export async function uploadRelease(
     // Release uploads can take several minutes when the server does the
     // full pipeline (B2/S3 upload, SHA256 verification, ClickHouse
     // metadata). Node's fetch defaults to a 5-minute headers timeout,
-    // which trips on slow networks + cold storage. Bump to 20 min.
-    //
-    // `dispatcher` is the undici Agent used under the hood — it's
-    // accepted by Node's fetch even though it's not in the standard
-    // Fetch API types. Import is dynamic because undici is a Node
-    // built-in (not available in non-Node runtimes) but bundlers may
-    // complain about a static import.
-    // @ts-ignore — undici ships with Node >= 18 but isn't in @types/node as
-    // an importable module path. Dynamic import resolves at runtime.
-    const undici = await import('undici' as any) as any;
-    const longUploadAgent = new undici.Agent({
-      headersTimeout: 20 * 60 * 1000,
-      bodyTimeout: 20 * 60 * 1000,
-      connectTimeout: 30 * 1000,
-    });
-    res = await fetch(uploadUrl, {
+    // which trips on slow networks + cold storage. Try to bump to 20 min
+    // via an `undici.Agent` dispatcher; fall back to the default fetch
+    // if undici isn't importable (newer Node versions occasionally hide
+    // it, or the binary is running under a runtime that doesn't ship
+    // undici at all).
+    let dispatcher: any = undefined;
+    try {
+      // @ts-ignore — undici ships with Node >= 18 but isn't in @types/node as
+      // an importable module path. Dynamic import resolves at runtime.
+      const undici = await import('undici' as any) as any;
+      dispatcher = new undici.Agent({
+        headersTimeout: 20 * 60 * 1000,
+        bodyTimeout: 20 * 60 * 1000,
+        connectTimeout: 30 * 1000,
+      });
+    } catch {
+      // undici not available — proceed with default fetch timeouts. The
+      // server completes flutter-code uploads (single 1-10 MB libapp.so)
+      // well inside fetch's 5-minute headers window.
+      dispatcher = undefined;
+    }
+    const fetchInit: any = {
       method: 'POST',
-      headers: {
-        ...getAuthHeaders(),
-      },
+      headers: { ...getAuthHeaders() },
       body: form,
-      dispatcher: longUploadAgent,
-    } as any);
+    };
+    if (dispatcher) fetchInit.dispatcher = dispatcher;
+    res = await fetch(uploadUrl, fetchInit);
   } catch (err: any) {
     // Node's fetch throws TypeError("fetch failed") for network-layer
     // problems and hides the real cause in err.cause. Unwrap it so the

@@ -10,6 +10,7 @@ import {
 } from '../utils/bundler.js';
 import { resolvePlatformPrompt } from '../utils/prompts.js';
 import { resolveRNProjectRoot } from '../utils/project.js';
+import { requireSupportedStack } from '../utils/stack.js';
 
 /**
  * Build the signed store binary WITHOUT publishing a new Sankofa release.
@@ -37,6 +38,18 @@ export const distCommand = new Command('dist')
   .action(async (platformArg: string | undefined, opts) => {
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
+
+    await requireSupportedStack({
+      commandName: 'dist',
+      supportedStacks: ['react-native'],
+      explicit: opts.project,
+      unsupportedHint: {
+        flutter:
+          'For Flutter: `flutter build apk --release` or `flutter build appbundle --release`. ' +
+          '`sankofa release` already produces a signed APK as a side-effect — keep that.',
+        web: 'For Web: use your bundler\'s build script (vite build / next build / etc.).',
+      },
+    });
 
     const platform = await resolvePlatformPrompt(platformArg);
 

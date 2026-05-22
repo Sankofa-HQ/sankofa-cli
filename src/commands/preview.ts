@@ -20,6 +20,7 @@ import { getRelease, listReleases } from '../utils/api.js';
 import { requireAuth } from '../utils/config.js';
 import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompts.js';
 import { resolveRNProjectRoot } from '../utils/project.js';
+import { requireSupportedStack } from '../utils/stack.js';
 import { normalizePlatform } from '../utils/validation.js';
 
 function safeFilePart(value: string): string {
@@ -53,6 +54,21 @@ export const previewCommand = new Command('preview')
     const inquirer = (await import('inquirer')).default;
 
     await requireAuth();
+
+    // Stack guard FIRST — before any prompts. preview is RN-only today.
+    await requireSupportedStack({
+      commandName: 'preview',
+      supportedStacks: ['react-native'],
+      explicit: opts.project,
+      unsupportedHint: {
+        flutter:
+          'For Flutter: after `sankofa patch`, install the patched libapp.so on a device with ' +
+          '`flutter install` or rerun `flutter run --release`. Native preview from a published patch is Phase 11.',
+        web: 'For Web: preview is your existing dev server (vite/next/etc.). Sankofa does not stage a preview build for web today.',
+        'native-ios': 'For native iOS: open the project in Xcode and run on Simulator.',
+        'native-android': 'For native Android: open the project in Android Studio and run on an emulator.',
+      },
+    });
 
     let platform: Platform;
     let environment;

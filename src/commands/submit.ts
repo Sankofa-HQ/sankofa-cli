@@ -6,6 +6,7 @@ import { join } from 'path';
 import { requireAuth } from '../utils/config.js';
 import { resolvePlatformPrompt } from '../utils/prompts.js';
 import { formatBytes } from '../utils/bundler.js';
+import { requireSupportedStack } from '../utils/stack.js';
 
 type SupportedPlatform = 'ios' | 'android';
 
@@ -34,6 +35,17 @@ export const submitCommand = new Command('submit')
     const ora = (await import('ora')).default;
 
     await requireAuth();
+
+    await requireSupportedStack({
+      commandName: 'submit',
+      supportedStacks: ['react-native'],
+      explicit: opts.project,
+      unsupportedHint: {
+        flutter:
+          'For Flutter: upload .aab to Play Console manually or use `fastlane supply`. ' +
+          'For iOS, use App Store Connect / Transporter on the .ipa produced by `flutter build ipa`.',
+      },
+    });
 
     const platform = (await resolvePlatformPrompt(platformArg)) as SupportedPlatform;
 

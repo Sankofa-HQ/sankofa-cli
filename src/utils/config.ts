@@ -27,6 +27,13 @@ export interface ProjectConfig {
   apiKey?: string;
   endpoint?: string;
   environment?: 'live' | 'test';
+  /**
+   * Product IDs the user explicitly installed via `sankofa init`. Doctor
+   * uses this as ground truth — without it we can't reliably distinguish
+   * "Switch is installed" from "the shared SDK that also contains Switch
+   * is in pubspec" (they look identical from a file-detection standpoint).
+   */
+  products?: string[];
 }
 
 const GLOBAL_DIR = join(homedir(), '.sankofa');
