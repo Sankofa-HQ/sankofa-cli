@@ -73,6 +73,20 @@ export interface BuildAndExtractResult {
    * build clears the output dir.
    */
   apkContentsDir: string | null;
+  /**
+   * SHA256 of the `libflutter.so` embedded in the customer's APK.
+   * Used by the release-time engine integrity check to verify the
+   * customer built against a Sankofa-trusted engine — a release built
+   * with vanilla Flutter would crash every device on patch install,
+   * so we refuse to publish it.
+   *
+   * Hex-encoded lowercase, e.g. `2ca8b4f959de...`.
+   */
+  libflutterSha256: string;
+  /** Absolute path to the extracted `libflutter.so` (for diagnostics). */
+  libflutterPath: string;
+  /** Byte size of the libflutter.so we hashed. */
+  libflutterSizeBytes: number;
 }
 
 export type FlutterBuildFormat = 'aab' | 'apk';
@@ -181,20 +195,21 @@ export function buildFlutterAOT(
   }
 
   // Unzip the parts of the APK we care about:
-  //  - lib/arm64-v8a/libapp.so (the OTA payload)
-  //  - AndroidManifest.xml (Diff Guard baseline)
-  //  - assets/flutter_assets/* (Diff Guard baseline)
+  //  - lib/arm64-v8a/libapp.so      — the OTA payload
+  //  - lib/arm64-v8a/libflutter.so  — the Sankofa engine (for trust check)
+  //  - AndroidManifest.xml          — Diff Guard baseline
+  //  - assets/flutter_assets/*      — Diff Guard baseline
   const extractDir = join(outputDir, `apk-extract-${Date.now()}`);
   mkdirSync(extractDir, { recursive: true });
   try {
     execSync(
-      `unzip -o -q "${apk}" "lib/arm64-v8a/libapp.so" "AndroidManifest.xml" "assets/flutter_assets/*" -d "${extractDir}"`,
+      `unzip -o -q "${apk}" "lib/arm64-v8a/libapp.so" "lib/arm64-v8a/libflutter.so" "AndroidManifest.xml" "assets/flutter_assets/*" -d "${extractDir}"`,
       { stdio: opts.verbose ? 'inherit' : 'pipe' },
     );
   } catch (err: any) {
     throw new Error(
-      `Failed to extract libapp.so from ${apk}: ${err.message}\n` +
-        `(Check that the APK was built --release and includes the AOT lib for arm64-v8a.)`,
+      `Failed to extract libapp.so / libflutter.so from ${apk}: ${err.message}\n` +
+        `(Check that the APK was built --release and includes the AOT libs for arm64-v8a.)`,
     );
   }
 
@@ -202,11 +217,27 @@ export function buildFlutterAOT(
   if (!existsSync(libappInExtract)) {
     throw new Error(`libapp.so not found in extracted APK at ${libappInExtract}`);
   }
+  const libflutterInExtract = join(extractDir, 'lib', 'arm64-v8a', 'libflutter.so');
+  if (!existsSync(libflutterInExtract)) {
+    throw new Error(
+      `libflutter.so not found in extracted APK at ${libflutterInExtract}.\n` +
+        `This is unusual — Flutter release APKs always bundle the engine. ` +
+        `Did the APK come from a non-Flutter build, or was an unusual --target-platform used?`,
+    );
+  }
+
+  // Hash libflutter.so before we move it — file streams are easier on
+  // the original location. Engines are ~150 MB on Android arm64, so
+  // streaming + chunked update keeps the working set bounded.
+  const libflutterSha256 = sha256OfFile(libflutterInExtract);
+  const libflutterSize = statSync(libflutterInExtract).size;
 
   const finalLibapp = join(outputDir, `libapp.${engine.sankofaEngineVersion}.so`);
-  // Move libapp.so to its final name; keep the rest of the extracted
-  // tree around for Diff Guard.
+  const finalLibflutter = join(outputDir, `libflutter.${engine.sankofaEngineVersion}.so`);
+  // Move libapp.so + libflutter.so to their final names; keep the rest
+  // of the extracted tree around for Diff Guard.
   execSync(`mv "${libappInExtract}" "${finalLibapp}"`);
+  execSync(`mv "${libflutterInExtract}" "${finalLibflutter}"`);
   // Drop the now-empty lib/arm64-v8a/ but keep AndroidManifest.xml +
   // assets/flutter_assets/.
   rmSync(join(extractDir, 'lib'), { recursive: true, force: true });
@@ -219,7 +250,34 @@ export function buildFlutterAOT(
     apkPath: opts.keepApk ? apk : null,
     aabPath,
     apkContentsDir: extractDir,
+    libflutterSha256,
+    libflutterPath: finalLibflutter,
+    libflutterSizeBytes: libflutterSize,
   };
+}
+
+/**
+ * Stream-hash a file with SHA-256. Loads at most 64 KiB at a time so
+ * a 150 MB `libflutter.so` doesn't allocate a contiguous buffer.
+ */
+function sha256OfFile(path: string): string {
+  const hash = createHash('sha256');
+  // We've already established the file exists. `readFileSync` reads the
+  // whole file into memory, which we want to avoid for libflutter.so.
+  // Node's `fs.openSync` + chunked reads keep the working set bounded.
+  const { openSync, readSync, closeSync } = require('fs') as typeof import('fs');
+  const fd = openSync(path, 'r');
+  try {
+    const buf = Buffer.alloc(64 * 1024);
+    while (true) {
+      const bytes = readSync(fd, buf, 0, buf.length, null);
+      if (bytes <= 0) break;
+      hash.update(buf.subarray(0, bytes));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest('hex');
 }
 
 function findAab(projectRoot: string): string | null {

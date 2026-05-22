@@ -13,6 +13,7 @@ import { submitCommand } from './commands/submit.js';
 import { distCommand } from './commands/dist.js';
 import { doctorCommand } from './commands/doctor.js';
 import { initCommand } from './commands/init.js';
+import { engineCommand } from './commands/engine.js';
 import { releasesCommand, patchesCommand, rulesCommand, scheduleCommand, defaultsCommand } from './commands/manage.js';
 import { upgradeCommand } from './commands/upgrade.js';
 import { checkCommand } from './commands/check.js';
@@ -29,6 +30,7 @@ program
   .version('0.1.0');
 
 program.addCommand(initCommand);
+program.addCommand(engineCommand);
 program.addCommand(doctorCommand);
 program.addCommand(loginCommand);
 program.addCommand(logoutCommand);

@@ -310,6 +310,13 @@ async function installDeployFlutter(project: ProjectInfo, endpoint: string, chal
   // package (for projects mid-migration).
   const hasSdk = pubspecRaw.includes('sankofa_flutter') || pubspecRaw.includes('sankofa_deploy');
 
+  // Engine fetch — pull the Sankofa-built libflutter.so into
+  // ~/.sankofa/engines/ so `sankofa release android` later doesn't
+  // refuse the release for "unknown engine". Skipped if Flutter isn't
+  // on PATH or the version detect fails; user will hit the same gate
+  // at release time with a clear `sankofa engine download` hint.
+  await ensureFlutterEngineForInit(project, chalk);
+
   console.log('');
   if (!hasSdk) {
     console.log(chalk.dim('     Install the unified runtime SDK:'));
@@ -330,6 +337,66 @@ async function installDeployFlutter(project: ProjectInfo, endpoint: string, chal
     console.log(chalk.yellow('     ⚠ Could not auto-patch the Android side.'));
     console.log(chalk.dim('       MainActivity.kt should extend SankofaFlutterActivity.'));
     console.log(chalk.dim('       AndroidManifest.xml needs com.sankofa.deploy.SankofaDeployApplication + INTERNET + meta-data.'));
+  }
+}
+
+/**
+ * Best-effort: download every Sankofa-built engine ABI for the
+ * customer's Flutter version into `~/.sankofa/engines/`. Cache hits
+ * are instant; cold cache means a one-time download (~150 MB per ABI
+ * on Android). Failures are non-fatal — release time will surface a
+ * clearer error if the engine ends up missing.
+ */
+async function ensureFlutterEngineForInit(project: ProjectInfo, chalk: any): Promise<void> {
+  const ora = (await import('ora')).default;
+  let flutterVersion: string;
+  try {
+    const { detectFlutterEngineInfo } = await import('../utils/flutterBundler.js');
+    flutterVersion = detectFlutterEngineInfo().flutterVersion;
+  } catch {
+    console.log(chalk.yellow('     ⚠ `flutter` is not on PATH — skipping engine pre-fetch.'));
+    console.log(chalk.dim('       Install Flutter, then run `sankofa engine download` manually.'));
+    return;
+  }
+
+  if (!flutterVersion || flutterVersion === 'unknown') {
+    console.log(chalk.yellow('     ⚠ Could not detect Flutter version — skipping engine pre-fetch.'));
+    return;
+  }
+
+  const { ensureFlutterEnginesForVersion } = await import('./engine.js');
+  const { formatBytesHuman } = await import('../utils/engineCache.js');
+
+  const spinner = ora(`     Resolving Sankofa engines for Flutter ${flutterVersion}…`).start();
+  try {
+    const results = await ensureFlutterEnginesForVersion(flutterVersion, {
+      target: 'android',
+      onProgress: (msg) => {
+        spinner.text = `     ${msg}`;
+      },
+    });
+    const hits = results.filter((r) => r.cached).length;
+    const fresh = results.length - hits;
+    if (results.length === 0) {
+      spinner.warn(
+        `     No Sankofa engine available yet for Flutter ${flutterVersion} — releases will refuse until one ships.`,
+      );
+      return;
+    }
+    spinner.succeed(
+      `     Engine cache ready — ${results.length} ABI${results.length === 1 ? '' : 's'} for Flutter ${flutterVersion}` +
+        (fresh > 0 ? ` (${fresh} freshly downloaded)` : ' (cache hits)'),
+    );
+    // Quick per-ABI line so the developer sees what was actually cached.
+    for (const { engine, cached } of results) {
+      const tag = cached ? chalk.dim('cached') : chalk.green('downloaded');
+      console.log(
+        chalk.dim(`       ${tag}  ${engine.target}/${engine.abi}  (${formatBytesHuman(engine.size_bytes)})`),
+      );
+    }
+  } catch (err: any) {
+    spinner.warn(`     Engine pre-fetch failed: ${err.message}`);
+    console.log(chalk.dim('       You can retry with: `sankofa engine download`'));
   }
 }
 
@@ -490,17 +557,40 @@ function patchIosAppDelegate(src: string): string {
   if (!bundleMethod.test(next)) return next;
 
   return next.replace(bundleMethod, (match) => {
-    const releaseReturn = 'return Bundle.main.url(forResource: "main", withExtension: "jsbundle")';
-    if (match.includes(releaseReturn)) {
-      return match.replace(
-        releaseReturn,
-        'if let sankofaURL = sankofaDeployBundleURL() { return sankofaURL }\n    ' + releaseReturn,
+    let patched = match;
+
+    // Probe OTA in DEBUG *too* — returns nil when no bundle is staged so
+    // Metro keeps serving the JS as before, but the audit's
+    // `bundle_loader_wired` flag fires on first launch, which keeps
+    // `Sankofa.deploy.checkIntegration()` honest in DEBUG builds.
+    const debugMetroReturn = /return RCTBundleURLProvider\.sharedSettings\(\)\.jsBundleURL\(forBundleRoot: "[^"]+"\)/;
+    if (debugMetroReturn.test(patched) && !patched.includes('sankofaDeployBundleURL()')) {
+      patched = patched.replace(
+        debugMetroReturn,
+        (metroReturn) =>
+          `if let sankofaURL = sankofaDeployBundleURL() { return sankofaURL }\n    ${metroReturn}`,
       );
     }
-    return match.replace(
-      /\n\s*return ([^\n]+)\n\s*\}/,
-      '\n    if let sankofaURL = sankofaDeployBundleURL() { return sankofaURL }\n    return $1\n  }',
-    );
+
+    const releaseReturn = 'return Bundle.main.url(forResource: "main", withExtension: "jsbundle")';
+    if (patched.includes(releaseReturn)) {
+      if (!patched.includes('if let sankofaURL = sankofaDeployBundleURL() { return sankofaURL }\n    return Bundle.main.url')) {
+        patched = patched.replace(
+          releaseReturn,
+          `if let sankofaURL = sankofaDeployBundleURL() { return sankofaURL }\n    ${releaseReturn}`,
+        );
+      }
+      return patched;
+    }
+
+    // No canonical RELEASE return — inject before the final `return ...`.
+    if (!patched.includes('sankofaDeployBundleURL()')) {
+      patched = patched.replace(
+        /\n\s*return ([^\n]+)\n\s*\}/,
+        '\n    if let sankofaURL = sankofaDeployBundleURL() { return sankofaURL }\n    return $1\n  }',
+      );
+    }
+    return patched;
   });
 }
 

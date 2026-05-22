@@ -74,8 +74,8 @@ via debug-mode logs.
 | File | Change |
 |---|---|
 | `sdks/sankofa_sdk_flutter/lib/src/sankofa_client.dart` | Add reverse handshake call in `init()` after Deploy audit; encode the audit result via `integration=` query param |
-| `sdks/sankofa_sdk_react_native/src/index.ts` | Already sends `installed=` — extend with the same `integration=` param after RN's `SankofaDeploy.checkIntegration()` lands |
-| `sdks/sankofa_sdk_react_native/src/deploy/SankofaDeploy.ts` | Mirror Flutter's `checkIntegration()` — inspect MainApplication bundle-loader patch, app.json plugins, iOS AppDelegate (when iOS lands), `sankofa-react-native` SDK dep |
+| `sdks/sankofa_sdk_react_native/src/index.ts` | Already sends `installed=`; needs to also encode the cached `Sankofa.lastDeployIntegrationStatus` as `integration=deploy:partial:...` on the reverse handshake. |
+| ~~`sdks/sankofa_sdk_react_native/src/deploy/SankofaDeploy.ts`~~ | ✅ DONE 2026-05-21 — `checkIntegration()` mirrors Flutter shape. Probes `SankofaDeployBundleProvider` wired-flag + INTERNET permission (Android) + storage round-trip + AppDelegate class name (iOS). Auto-runs in `Sankofa.initialize` 1.5s after init; prints warnings only in `__DEV__`. Result cached on `Sankofa.lastDeployIntegrationStatus`. |
 | `server/engine/ee/deploy/handshake.go` | Parse the new `integration` query param into the `DeviceContext`; persist to a new column on the device-attribution table |
 | `dashboard/ee/components/deploy/` | New widget: "SDK Integration Incomplete" with per-module breakdown |
 

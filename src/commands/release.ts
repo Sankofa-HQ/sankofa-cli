@@ -549,7 +549,69 @@ export async function flutterRelease(
     process.exit(1);
   }
 
-  const engineVersion = built.engine.sankofaEngineVersion;
+  // Engine trust check — verify the libflutter.so inside the APK was
+  // built by Sankofa CI. Refuses the release with an actionable error
+  // if the SHA isn't in the server's known-engines registry. Skipped
+  // on --dry-run since the registry lives on the server.
+  let engineVersion = built.engine.sankofaEngineVersion;
+  if (!opts.dryRun) {
+    const trustSpinner = ora(
+      `Verifying engine identity (libflutter.so SHA ${built.libflutterSha256.slice(0, 12)}…)…`,
+    ).start();
+    try {
+      const { findEngineBySha } = await import('../utils/engineRegistry.js');
+      const known = await findEngineBySha(built.libflutterSha256);
+      if (!known) {
+        trustSpinner.fail(
+          `libflutter.so is not a known Sankofa engine — refusing to publish.`,
+        );
+        console.log('');
+        console.log(chalk.red('  ✖ The libflutter.so embedded in your APK was NOT built by Sankofa CI.'));
+        console.log('');
+        console.log(chalk.dim('     SHA256:'));
+        console.log(chalk.dim(`       ${built.libflutterSha256}`));
+        console.log(chalk.dim(`     Size:`));
+        console.log(chalk.dim(`       ${formatBytes(built.libflutterSizeBytes)}`));
+        console.log('');
+        console.log(chalk.dim('     Publishing this release would crash every customer device on patch'));
+        console.log(chalk.dim('     download — Flutter Code patches require the Sankofa engine fork.'));
+        console.log('');
+        console.log(chalk.bold('  Fix:'));
+        console.log(chalk.dim(`     1. Install the Sankofa engine for your Flutter version:`));
+        console.log(chalk.cyan(`        sankofa engine download`));
+        console.log(chalk.dim(`     2. Re-run \`flutter build\` so the new engine is bundled.`));
+        console.log(chalk.dim(`     3. Re-run \`sankofa release ${platformArg || 'android'}\`.`));
+        console.log('');
+        process.exit(1);
+      }
+      if (!known.is_modified) {
+        trustSpinner.warn(
+          `libflutter.so is a Sankofa baseline (vanilla ${known.flutter_version}) — Flutter Code patches won't load on devices running it.`,
+        );
+        console.log(chalk.yellow(
+          `     ⚠ This engine is a vanilla Flutter baseline (no \`+sankofa-N\` modifications).`,
+        ));
+        console.log(chalk.yellow(
+          `       Devices running it cannot load OTA patches; only modified engines support libapp.so swap.`,
+        ));
+        console.log(chalk.dim(`       Continuing — but the release will be tagged as \`${known.sankofa_engine_version}\` and devices that install it won't accept patches.`));
+      } else {
+        trustSpinner.succeed(
+          `Engine verified — ${chalk.bold(known.sankofa_engine_version)} (${known.target} ${known.abi})`,
+        );
+      }
+      // Use the registry-confirmed version so the release row matches
+      // the actual engine bytes, not the local `flutter --version`
+      // heuristic.
+      engineVersion = known.sankofa_engine_version;
+    } catch (err: any) {
+      trustSpinner.fail(`Engine verification failed: ${err.message}`);
+      process.exit(1);
+    }
+  } else {
+    console.log(chalk.dim('  · Skipping engine verification (--dry-run)'));
+  }
+
   const appVersion = built.appVersion;
   const label = `v${appVersion}`;
 

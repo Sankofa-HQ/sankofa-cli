@@ -1,0 +1,419 @@
+import { Command } from 'commander';
+import {
+  fetchKnownEngines,
+  registerKnownEngine,
+  resolveEndpointOnly,
+  type KnownEngine,
+  type RegisterEnginePayload,
+} from '../utils/engineRegistry.js';
+import {
+  downloadEngineIntoCache,
+  ensureEngineCached,
+  engineCacheRoot,
+  formatBytesHuman,
+  listCachedEngines,
+  sha256OfFile,
+  tryEngineCacheHit,
+} from '../utils/engineCache.js';
+import { detectFlutterEngineInfo } from '../utils/flutterBundler.js';
+import { statSync } from 'fs';
+import { resolve as pathResolve } from 'path';
+
+/**
+ * `sankofa engine` — manage the local cache of Sankofa-built Flutter
+ * engine binaries (`libflutter.so` / `Flutter.framework`).
+ *
+ * Subcommands:
+ *
+ *   list        Show what's cached on this machine + what's available.
+ *   download    Pull one or more engines into the cache.
+ *   verify      Check that the cached binaries match the registry's SHAs.
+ *   path        Print the cache directory (handy in shell scripts).
+ *
+ * The cache lives at `~/.sankofa/engines/` by default; override via the
+ * `SANKOFA_HOME` env var (used by CI + tests to keep host caches clean).
+ */
+export const engineCommand = new Command('engine')
+  .description('Manage cached Sankofa Flutter engine binaries (libflutter.so / Flutter.framework)');
+
+// ── sankofa engine list ────────────────────────────────────────────
+engineCommand
+  .command('list')
+  .description('Show cached engines + everything available in the registry')
+  .option('--flutter-version <version>', 'Filter to one Flutter version')
+  .option('--target <android|ios>', 'Filter to one target platform')
+  .option('--modified-only', 'Only show Phase 3+ Sankofa-modified engines')
+  .action(async (opts) => {
+    const chalk = (await import('chalk')).default;
+    let known: KnownEngine[];
+    try {
+      known = await fetchKnownEngines({
+        flutterVersion: opts.flutterVersion,
+        target: opts.target,
+        modifiedOnly: opts.modifiedOnly,
+      });
+    } catch (err: any) {
+      console.error(chalk.red(`  ✖ ${err.message}`));
+      process.exit(1);
+    }
+
+    const cached = listCachedEngines();
+    const cachedShas = new Set(cached.map((c) => c.engine.sha256));
+
+    console.log('');
+    console.log(chalk.bold('  Available engines'));
+    console.log(chalk.dim(`  Cache root: ${engineCacheRoot()}`));
+    console.log('');
+
+    if (known.length === 0) {
+      console.log(chalk.dim('    (registry returned no engines for that filter)'));
+      console.log('');
+      return;
+    }
+
+    const cols = ['', 'VERSION', 'TARGET', 'ABI', 'SIZE', 'MODIFIED', 'STATE'];
+    console.log(
+      chalk.dim(
+        `    ${cols[0].padEnd(2)} ${cols[1].padEnd(20)} ${cols[2].padEnd(8)} ${cols[3].padEnd(14)} ${cols[4].padEnd(10)} ${cols[5].padEnd(10)} ${cols[6]}`,
+      ),
+    );
+    for (const e of known) {
+      const isCached = cachedShas.has(e.sha256);
+      const mark = isCached ? chalk.green('●') : chalk.dim('○');
+      const state = isCached ? chalk.green('cached') : chalk.dim('not cached');
+      const modified = e.is_modified
+        ? chalk.cyan('+sankofa')
+        : chalk.dim('vanilla');
+      console.log(
+        `    ${mark}  ${chalk.bold(e.sankofa_engine_version.padEnd(20))} ${e.target.padEnd(8)} ${e.abi.padEnd(14)} ${formatBytesHuman(e.size_bytes).padEnd(10)} ${modified.padEnd(20)} ${state}`,
+      );
+    }
+    console.log('');
+    console.log(
+      chalk.dim(
+        `    ${chalk.green('●')} cached locally    ${chalk.dim('○')} downloadable via \`sankofa engine download\``,
+      ),
+    );
+    console.log('');
+  });
+
+// ── sankofa engine download ────────────────────────────────────────
+engineCommand
+  .command('download')
+  .description('Download Sankofa engine binaries into the local cache')
+  .option('--flutter-version <version>', 'Flutter version (defaults to the active `flutter --version`)')
+  .option('--target <android|ios>', 'Target platform (defaults to both)')
+  .option('--abi <abi>', 'ABI to download (default: every ABI for the target)')
+  .option('--force', 'Re-download even if a valid cache hit exists')
+  .action(async (opts) => {
+    const chalk = (await import('chalk')).default;
+    const ora = (await import('ora')).default;
+
+    let flutterVersion = opts.flutterVersion;
+    if (!flutterVersion) {
+      try {
+        flutterVersion = detectFlutterEngineInfo().flutterVersion;
+      } catch {
+        console.error(
+          chalk.red('  ✖ Could not detect Flutter version. Pass --flutter-version explicitly.'),
+        );
+        process.exit(1);
+      }
+    }
+
+    let candidates: KnownEngine[];
+    try {
+      candidates = await fetchKnownEngines({ flutterVersion });
+    } catch (err: any) {
+      console.error(chalk.red(`  ✖ ${err.message}`));
+      process.exit(1);
+    }
+
+    if (opts.target) {
+      candidates = candidates.filter((e) => e.target === opts.target);
+    }
+    if (opts.abi) {
+      candidates = candidates.filter((e) => e.abi === opts.abi);
+    }
+
+    if (candidates.length === 0) {
+      console.error(
+        chalk.red(
+          `  ✖ No engines match flutter_version=${flutterVersion}` +
+            (opts.target ? ` target=${opts.target}` : '') +
+            (opts.abi ? ` abi=${opts.abi}` : '') +
+            `.`,
+        ),
+      );
+      console.error(chalk.dim('     Run `sankofa engine list` to see what the registry has.'));
+      process.exit(1);
+    }
+
+    console.log('');
+    console.log(chalk.bold(`  Downloading ${candidates.length} engine${candidates.length === 1 ? '' : 's'} (Flutter ${flutterVersion})`));
+    console.log('');
+
+    for (const engine of candidates) {
+      const label = `${engine.target} ${engine.abi} (${formatBytesHuman(engine.size_bytes)})`;
+      const cached = !opts.force && tryEngineCacheHit(engine);
+      if (cached) {
+        console.log(`  ${chalk.green('✓')} ${label} — cached at ${chalk.dim(cached.path)}`);
+        continue;
+      }
+      const spinner = ora(`  ${label} — starting…`).start();
+      try {
+        let lastPercent = -1;
+        await downloadEngineIntoCache(engine, {
+          onProgress: (received, total) => {
+            const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+            // Tight throttling: redraw the spinner only on integer
+            // percent changes so we don't choke the TTY on ~150 MB
+            // streams.
+            if (pct !== lastPercent) {
+              lastPercent = pct;
+              spinner.text = `  ${label} — ${pct}%  ${formatBytesHuman(received)}/${formatBytesHuman(total)}`;
+            }
+          },
+        });
+        spinner.succeed(`  ${label} — downloaded`);
+      } catch (err: any) {
+        spinner.fail(`  ${label} — ${err.message}`);
+        process.exit(1);
+      }
+    }
+
+    console.log('');
+    console.log(chalk.dim(`  Cache root: ${engineCacheRoot()}`));
+    console.log('');
+  });
+
+// ── sankofa engine verify ──────────────────────────────────────────
+engineCommand
+  .command('verify')
+  .description('Re-hash every cached engine and compare to the registry')
+  .action(async () => {
+    const chalk = (await import('chalk')).default;
+    const cached = listCachedEngines();
+    if (cached.length === 0) {
+      console.log(chalk.dim('  No engines cached. Run `sankofa engine download` to populate the cache.'));
+      return;
+    }
+
+    let known: KnownEngine[];
+    try {
+      known = await fetchKnownEngines();
+    } catch (err: any) {
+      console.error(chalk.red(`  ✖ ${err.message}`));
+      process.exit(1);
+    }
+    const knownBySha = new Map(known.map((e) => [e.sha256, e]));
+
+    let ok = 0;
+    let bad = 0;
+    for (const entry of cached) {
+      const expected = knownBySha.get(entry.engine.sha256);
+      if (!expected) {
+        bad++;
+        console.log(
+          `  ${chalk.yellow('?')} ${entry.engine.sankofa_engine_version} ${entry.engine.target}/${entry.engine.abi} — SHA not in registry (engine was retired or your registry is stale)`,
+        );
+        continue;
+      }
+      // Re-lookup via locateEngineInCache to force an integrity SHA check
+      // when applicable.
+      const refreshed = tryEngineCacheHit(entry.engine);
+      if (refreshed) {
+        ok++;
+        console.log(`  ${chalk.green('✓')} ${entry.engine.sankofa_engine_version} ${entry.engine.target}/${entry.engine.abi}`);
+      } else {
+        bad++;
+        console.log(
+          `  ${chalk.red('✗')} ${entry.engine.sankofa_engine_version} ${entry.engine.target}/${entry.engine.abi} — SHA mismatch. Re-download with \`sankofa engine download --force --target ${entry.engine.target} --abi ${entry.engine.abi}\`.`,
+        );
+      }
+    }
+
+    console.log('');
+    console.log(`  ${ok} ok, ${bad} ${bad === 1 ? 'issue' : 'issues'}`);
+    if (bad > 0) process.exit(2);
+  });
+
+// ── sankofa engine path ────────────────────────────────────────────
+engineCommand
+  .command('path')
+  .description('Print the engine cache root (useful in shell scripts)')
+  .action(() => {
+    console.log(engineCacheRoot());
+  });
+
+// ── sankofa engine register ────────────────────────────────────────
+//
+// Sankofa-internal admin write. POSTs to /api/v1/admin/engines/ so the
+// server adds the SHA to its known_engines trust list. Hidden from
+// `--help` because Deploy is dedicated-hosted only: customers never
+// touch a server, never hold the registry token, and never publish
+// engines. This command exists for Sankofa ops:
+//
+//   - Recovery when CI's register-engine.sh call fails partway through
+//     an engine release
+//   - One-off internal builds (engineers iterating on the engine fork
+//     locally before promoting via CI)
+//   - Bootstrap of a freshly-provisioned dedicated host
+//
+// Auth is the engine registry token (separate from any customer token)
+// sourced from --token or $SANKOFA_ENGINE_REGISTRY_TOKEN. Without it
+// the server refuses the POST with 401.
+//
+// Two modes:
+//   1. --file <path>  → SHA + size auto-computed from the local artifact
+//   2. --sha256 + --size-bytes  → caller supplies values directly (e.g.
+//      in CI after computing them upstream)
+//
+// In either mode the structural fields (--flutter-version, --target,
+// --abi, --sankofa-engine-version, --object-key) are required because
+// they can't be reliably inferred from a stripped libflutter.so.
+engineCommand
+  .command('register')
+  .description('[Sankofa-internal] Register an engine SHA with the server. Requires $SANKOFA_ENGINE_REGISTRY_TOKEN.')
+  .option('--file <path>', 'Compute sha256 + size_bytes from this local binary')
+  .option('--sha256 <hex>', 'Engine SHA-256 (lowercase hex, 64 chars)')
+  .option('--size-bytes <n>', 'Engine size in bytes')
+  .option('--flutter-version <version>', 'Upstream Flutter version, e.g. 3.41.9')
+  .option('--target <android|ios>', 'Target platform')
+  .option('--abi <abi>', 'ABI (arm64-v8a / armeabi-v7a / x86_64 / device-arm64 / sim-arm64 / sim-x64)')
+  .option('--sankofa-engine-version <id>', 'Engine identity, e.g. 3.41.9+sankofa-1')
+  .option('--object-key <key>', 'B2 object key, e.g. engines/flutter/3.41.9/android-arm64-release/libflutter.stripped.so')
+  .option('--runtime-mode <mode>', 'Runtime mode (default: release)', 'release')
+  .option('--no-modified', 'Mark this as a VANILLA engine (default: modified)')
+  .option('--source-commit <sha>', 'Optional source commit hash')
+  .option('--built-at <iso>', 'RFC3339 build timestamp (default: now)')
+  .option('--endpoint <url>', 'Override the server endpoint (default: from config / SANKOFA_ENDPOINT)')
+  .option('--token <hex>', 'Engine registry token (default: $SANKOFA_ENGINE_REGISTRY_TOKEN)')
+  .option('--dry-run', 'Print the payload and skip the POST')
+  .action(async (opts) => {
+    const chalk = (await import('chalk')).default;
+
+    // Resolve sha + size — either from a file or from explicit flags.
+    let sha256: string | undefined = opts.sha256?.toLowerCase();
+    let sizeBytes: number | undefined = opts.sizeBytes ? Number(opts.sizeBytes) : undefined;
+    if (opts.file) {
+      const absolute = pathResolve(opts.file);
+      try {
+        sha256 = sha256OfFile(absolute);
+        sizeBytes = statSync(absolute).size;
+      } catch (err: any) {
+        console.error(chalk.red(`  ✖ Could not hash ${absolute}: ${err?.message ?? err}`));
+        process.exit(1);
+      }
+    }
+
+    const required = {
+      sha256,
+      sizeBytes,
+      flutter_version: opts.flutterVersion,
+      target: opts.target,
+      abi: opts.abi,
+      sankofa_engine_version: opts.sankofaEngineVersion,
+      object_key: opts.objectKey,
+    };
+    const missing = Object.entries(required)
+      .filter(([, v]) => v === undefined || v === null || v === '')
+      .map(([k]) => k);
+    if (missing.length > 0) {
+      console.error(chalk.red(`  ✖ Missing required field(s): ${missing.join(', ')}`));
+      console.error(chalk.dim('     Use --file <path> to auto-derive sha256 + size_bytes,'));
+      console.error(chalk.dim('     or pass --sha256 + --size-bytes explicitly.'));
+      process.exit(1);
+    }
+
+    if (!/^[0-9a-f]{64}$/.test(sha256!)) {
+      console.error(chalk.red(`  ✖ --sha256 must be 64 lowercase hex chars; got ${sha256!.length} chars`));
+      process.exit(1);
+    }
+    if (!Number.isFinite(sizeBytes!) || sizeBytes! <= 0) {
+      console.error(chalk.red(`  ✖ --size-bytes must be a positive integer; got ${opts.sizeBytes}`));
+      process.exit(1);
+    }
+
+    const payload: RegisterEnginePayload = {
+      flutter_version: opts.flutterVersion,
+      target: opts.target,
+      abi: opts.abi,
+      runtime_mode: opts.runtimeMode,
+      sankofa_engine_version: opts.sankofaEngineVersion,
+      is_modified: opts.modified !== false, // commander stores --no-modified as `modified: false`
+      sha256: sha256!,
+      size_bytes: sizeBytes!,
+      source_commit: opts.sourceCommit,
+      object_key: opts.objectKey,
+      built_at: opts.builtAt,
+    };
+
+    const endpoint = opts.endpoint || resolveEndpointOnly();
+
+    console.log('');
+    console.log(chalk.bold('  Engine registry write'));
+    console.log(chalk.dim(`  Endpoint: ${endpoint}/api/v1/admin/engines/`));
+    console.log('');
+    console.log(`    flutter_version          ${payload.flutter_version}`);
+    console.log(`    target / abi             ${payload.target} / ${payload.abi}`);
+    console.log(`    runtime_mode             ${payload.runtime_mode}`);
+    console.log(`    sankofa_engine_version   ${payload.sankofa_engine_version}`);
+    console.log(`    is_modified              ${payload.is_modified ? chalk.cyan('+sankofa') : chalk.dim('vanilla')}`);
+    console.log(`    sha256                   ${payload.sha256}`);
+    console.log(`    size_bytes               ${payload.size_bytes} (${formatBytesHuman(payload.size_bytes)})`);
+    console.log(`    object_key               ${payload.object_key}`);
+    if (payload.source_commit) console.log(`    source_commit            ${payload.source_commit}`);
+    if (payload.built_at) console.log(`    built_at                 ${payload.built_at}`);
+    console.log('');
+
+    if (opts.dryRun) {
+      console.log(chalk.yellow('  ⚠ Dry-run — no POST sent.'));
+      console.log('');
+      return;
+    }
+
+    try {
+      const saved = await registerKnownEngine(payload, {
+        endpoint: opts.endpoint,
+        token: opts.token,
+      });
+      console.log(chalk.green('  ✓ Registered.'));
+      console.log(chalk.dim(`    Server confirms sha=${saved.sha256.slice(0, 12)}… for ${saved.target}/${saved.abi}`));
+      console.log('');
+    } catch (err: any) {
+      console.error(chalk.red(`  ✖ ${err?.message ?? err}`));
+      process.exit(1);
+    }
+  });
+
+// ── Programmatic helper used by `sankofa init` ─────────────────────
+/**
+ * Ensures every Android ABI for `flutterVersion` is in the cache. Used
+ * by `sankofa init --deploy` on Flutter projects so the customer can
+ * `flutter build` immediately without a "missing engine" hiccup.
+ *
+ * Returns the engines that ended up in the cache (cache hits + fresh
+ * downloads). Throws on download failure.
+ */
+export async function ensureFlutterEnginesForVersion(
+  flutterVersion: string,
+  opts: { target?: 'android' | 'ios'; onProgress?: (msg: string) => void } = {},
+): Promise<{ engine: KnownEngine; cached: boolean }[]> {
+  const candidates = await fetchKnownEngines({
+    flutterVersion,
+    target: opts.target,
+  });
+  const results: { engine: KnownEngine; cached: boolean }[] = [];
+  for (const engine of candidates) {
+    const hit = tryEngineCacheHit(engine);
+    if (hit) {
+      results.push({ engine, cached: true });
+      continue;
+    }
+    opts.onProgress?.(`Downloading ${engine.target} ${engine.abi} (${formatBytesHuman(engine.size_bytes)})…`);
+    await ensureEngineCached(engine);
+    results.push({ engine, cached: false });
+  }
+  return results;
+}
