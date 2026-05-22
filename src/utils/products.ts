@@ -143,18 +143,43 @@ function detectDeployFlutter(project: ProjectInfo): { installed: boolean; detail
   // so doctor remains accurate for projects mid-migration.
   const hasSdk = pubspec.includes('sankofa_flutter') || pubspec.includes('sankofa_deploy');
 
-  const manifestPath = join(project.root, 'android', 'app', 'src', 'main', 'AndroidManifest.xml');
-  const manifest = readText(manifestPath) || '';
-  const hasApplication = manifest.includes('SankofaDeployApplication');
+  // Per-platform native wiring. A Flutter project that only ships
+  // Android isn't broken — same goes for iOS-only. We surface whichever
+  // sides are present and whether each is wired correctly.
+  const androidApp = join(project.root, 'android', 'app');
+  const iosRunner = join(project.root, 'ios', 'Runner');
+  const hasAndroid = readText(join(androidApp, 'src', 'main', 'AndroidManifest.xml')) !== null;
+  const hasIos = readText(join(iosRunner, 'AppDelegate.swift')) !== null;
 
-  if (hasSdk && hasApplication) {
-    return { installed: true, detail: 'pubspec + AndroidManifest wired' };
+  const androidWired = hasAndroid
+    ? (readText(join(androidApp, 'src', 'main', 'AndroidManifest.xml')) || '').includes('SankofaDeployApplication')
+    : null;
+  const iosWired = hasIos
+    ? (readText(join(iosRunner, 'AppDelegate.swift')) || '').includes('SankofaFlutterAppDelegate')
+    : null;
+
+  const wiredParts: string[] = [];
+  if (androidWired === true) wiredParts.push('AndroidManifest');
+  if (iosWired === true) wiredParts.push('AppDelegate');
+
+  const unwiredParts: string[] = [];
+  if (androidWired === false) unwiredParts.push('Android');
+  if (iosWired === false) unwiredParts.push('iOS');
+
+  if (hasSdk && unwiredParts.length === 0 && wiredParts.length > 0) {
+    return { installed: true, detail: `pubspec + ${wiredParts.join(' + ')} wired` };
   }
-  if (hasApplication && !hasSdk) {
-    return { installed: false, detail: 'native wired but pubspec missing sankofa_flutter — run `flutter pub add sankofa_flutter`' };
+  if (!hasSdk && (androidWired || iosWired)) {
+    return {
+      installed: false,
+      detail: 'native wired but pubspec missing sankofa_flutter — run `flutter pub add sankofa_flutter`',
+    };
   }
-  if (hasSdk && !hasApplication) {
-    return { installed: false, detail: 'pubspec OK but native not wired — run `sankofa init --deploy`' };
+  if (hasSdk && unwiredParts.length > 0) {
+    return {
+      installed: false,
+      detail: `pubspec OK but native not wired on ${unwiredParts.join(' + ')} — run \`sankofa init --deploy\``,
+    };
   }
   return { installed: false, detail: 'not installed — run `sankofa init --deploy`' };
 }

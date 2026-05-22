@@ -672,6 +672,17 @@ function patchFlutterNativeFiles(
     }
   }
 
+  const iosRunner = join(cwd, 'ios', 'Runner');
+  if (existsSync(iosRunner)) {
+    try {
+      patchFlutterIosAppDelegate(iosRunner, chalk);
+      patchFlutterIosInfoPlist(iosRunner, endpoint, chalk);
+      out.iosPatched = true;
+    } catch (err: any) {
+      console.log(chalk.yellow(`     ⚠ iOS patch failed: ${err.message}`));
+    }
+  }
+
   patchFlutterMainDart(cwd, chalk);
 
   return out;
@@ -740,6 +751,74 @@ function patchFlutterMainActivity(androidApp: string, chalk: any) {
   );
   writeFileSync(mainActivity, src);
   console.log(chalk.green(`     ✓ Patched ${mainActivity}`));
+}
+
+function patchFlutterIosAppDelegate(iosRunner: string, chalk: any) {
+  const appDelegate = join(iosRunner, 'AppDelegate.swift');
+  if (!existsSync(appDelegate)) {
+    console.log(chalk.yellow(`     ⚠ AppDelegate.swift not found at ${appDelegate}`));
+    return;
+  }
+  let src = readFileSync(appDelegate, 'utf-8');
+  if (src.includes('SankofaFlutterAppDelegate')) {
+    console.log(chalk.dim(`     · AppDelegate.swift already extends SankofaFlutterAppDelegate`));
+    return;
+  }
+
+  // 1. Add the sankofa_flutter import alongside the existing Flutter import.
+  if (!src.includes('import sankofa_flutter')) {
+    src = src.replace(/import Flutter\n/, `import Flutter\nimport sankofa_flutter\n`);
+  }
+
+  // 2. Swap the AppDelegate's parent from FlutterAppDelegate to
+  //    SankofaFlutterAppDelegate. Handles both the bare canonical
+  //    shape (`class AppDelegate: FlutterAppDelegate {`) and the
+  //    newer shape that mixes in FlutterImplicitEngineDelegate.
+  src = src.replace(
+    /class AppDelegate:\s*FlutterAppDelegate/,
+    'class AppDelegate: SankofaFlutterAppDelegate',
+  );
+
+  writeFileSync(appDelegate, src);
+  console.log(chalk.green(`     ✓ Patched ${appDelegate}`));
+}
+
+function patchFlutterIosInfoPlist(iosRunner: string, endpoint: string, chalk: any) {
+  const plistPath = join(iosRunner, 'Info.plist');
+  if (!existsSync(plistPath)) {
+    console.log(chalk.yellow(`     ⚠ Info.plist not found at ${plistPath}`));
+    return;
+  }
+  let xml = readFileSync(plistPath, 'utf-8');
+  let changed = false;
+
+  // Anchor inserts at the closing </dict>\n</plist> sequence of the
+  // top-level dict. Keys are matched as literal CDATA so a `<string>`
+  // that happens to contain the substring won't false-positive.
+  const hasKey = (key: string) => xml.includes(`<key>${key}</key>`);
+  const insertBefore = '</dict>\n</plist>';
+
+  if (!hasKey('com.sankofa.apiKey')) {
+    xml = xml.replace(
+      insertBefore,
+      `\t<key>com.sankofa.apiKey</key>\n\t<string>$(SANKOFA_API_KEY)</string>\n${insertBefore}`,
+    );
+    changed = true;
+  }
+  if (!hasKey('com.sankofa.endpoint')) {
+    xml = xml.replace(
+      insertBefore,
+      `\t<key>com.sankofa.endpoint</key>\n\t<string>${endpoint}</string>\n${insertBefore}`,
+    );
+    changed = true;
+  }
+
+  if (changed) {
+    writeFileSync(plistPath, xml);
+    console.log(chalk.green(`     ✓ Patched ${plistPath}`));
+  } else {
+    console.log(chalk.dim(`     · Info.plist already has Sankofa keys`));
+  }
 }
 
 function patchFlutterMainDart(cwd: string, chalk: any) {
