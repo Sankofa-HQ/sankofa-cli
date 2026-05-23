@@ -100,21 +100,28 @@ reference `--android-format`.
 
 ---
 
-## When iOS Flutter Code OTA ships (Phase 6)
+## ~~When iOS Flutter Code OTA ships (Phase 6)~~ — ✅ DONE 2026-05-23
 
-**Current state:** `sankofa init --deploy` for Flutter only auto-patches
-the Android side (AndroidManifest.xml + MainActivity.kt). iOS is untouched.
+Most of this entry has shipped. Tracking remaining items below.
 
-**Trigger:** Phase 6 (iOS engine port) ships.
+**What landed:**
 
-**Files to update when this lands:**
+| ✅ | File | Change |
+|---|---|---|
+| ✅ | `src/commands/init.ts` | `patchFlutterIosAppDelegate` + `patchFlutterIosInfoPlist` (commit `f3a9408` on `phase6/ios-codepush`, merged to main) |
+| ✅ | `src/utils/products.ts` | `detectDeployFlutter` now probes `AppDelegate.swift` alongside `AndroidManifest.xml` |
+| ✅ | Engine fork | iOS engine binaries built + registered with `+sankofa-1` marker (commits `a36966df3ec` workflow registration step, `3661aa1c87b` marker patch) |
+| ✅ | Engine fork | iOS AOT override hook on `FlutterDartProject` (commit `8c331063655` on `phase5/ios-aot-override` — Phase 5 iOS) |
+| ✅ | `sankofa_sdk_flutter` iOS | `SankofaFlutterAppDelegate` + `SankofaUpdaterBridge` + vendored `SankofaUpdaterFFI.xcframework` |
+| ✅ | `sankofa-flutter-deploy` | `updater/build-ios.sh` + Rust iOS targets + xcframework packaging + CI workflow |
+
+**Still pending:**
 
 | File | Change |
 |---|---|
-| `src/commands/init.ts` | Add `patchFlutterIosAppDelegate` and `patchFlutterIosInfoPlist` functions, call them from `patchFlutterNativeFiles` |
-| `src/commands/doctor.ts` | Add iOS-side Flutter integration checks |
-| `src/commands/flutter-push.ts` (or successor) | Remove the "iOS rejected by server" warning; the server will accept iOS flutter-code releases |
-| `flutter-deploy/sankofa-flutter-deploy/docs/compliance-posture.md` | Update §5 Diff Guard checks to include Info.plist + entitlements + iOS asset diff |
+| `src/commands/flutter-push.ts` (or successor) | Remove the "iOS rejected by server" warning; server-side `flutter-push` handler still has it. Server work is independent — flip the rejection to acceptance once an iOS Flutter-code release format is finalised. |
+| `flutter-deploy/sankofa-flutter-deploy/docs/compliance-posture.md` | Update §5 Diff Guard checks to include `Info.plist` + entitlements + iOS asset diff. The CLI's `baseline.ts` / `diffGuard.ts` already handle generic asset diffs; iOS-specific thresholds (Info.plist key changes, entitlement edits) need their own rules. |
+| `sankofa_sdk_flutter` iOS | Replace `respondsToSelector:` dynamic dispatch in `SankofaFlutterAppDelegate` with a direct `FlutterDartProject.sankofaSet…` call once the engine-fork patch reaches every customer's Flutter.framework. Defensive fallback is conservative for now; remove when the Sankofa-built Flutter.framework is the default consumer install. |
 
 ---
 
