@@ -94,9 +94,11 @@ export type FlutterPlatform = 'android' | 'ios';
 
 /**
  * Resolve and validate the platform positional for Flutter release/patch.
- * Today only Android is supported; iOS lands in Phase 6 (engine build
- * pipeline + ios/ wiring). Prompts when no platform is given so the
- * command shape matches RN's `sankofa release [platform]`.
+ *
+ * Android uses the Phase 5 libapp.so binary-diff path. iOS uses the
+ * Path C KBC interpreter pipeline (β.0–η). Both are first-class
+ * targets now; the dispatch happens in flutterPatch / flutterRelease
+ * based on this return value.
  */
 export async function resolveFlutterPlatform(
   platformArg: string | undefined,
@@ -112,25 +114,19 @@ export async function resolveFlutterPlatform(
         name: 'picked',
         message: 'Target platform:',
         choices: [
-          { name: 'Android', value: 'android' },
-          { name: 'iOS (Phase 6 — not yet supported)', value: 'ios', disabled: 'Phase 6' },
+          { name: 'Android (libapp.so binary-diff)', value: 'android' },
+          { name: 'iOS (Path C — KBC interpreter)', value: 'ios' },
         ],
       },
     ]);
     value = picked;
   }
 
-  if (value === 'ios') {
-    console.error(chalk.red('  ✖ iOS Flutter Code OTA is not yet implemented (Phase 6).'));
-    console.error(chalk.dim('     Track progress: docs/ROADMAP.md → Phase 6.'));
-    console.error(chalk.dim('     For now, run `sankofa release android` to ship the Android baseline.'));
+  if (value !== 'android' && value !== 'ios') {
+    console.error(chalk.red(`  ✖ Unknown platform "${value}". Expected: android | ios.`));
     process.exit(1);
   }
-  if (value !== 'android') {
-    console.error(chalk.red(`  ✖ Unknown platform "${value}". Expected: android (or ios — Phase 6).`));
-    process.exit(1);
-  }
-  return 'android';
+  return value;
 }
 
 /**

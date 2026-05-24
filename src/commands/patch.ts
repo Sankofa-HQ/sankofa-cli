@@ -1,6 +1,6 @@
 import { Command } from 'commander';
-import { existsSync, statSync } from 'fs';
-import { join } from 'path';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'fs';
+import { join, resolve } from 'path';
 import {
   bundleJS,
   clearBuildArtifacts,
@@ -19,6 +19,8 @@ import { escapeRegExp, parseRollout } from '../utils/validation.js';
 import { buildFlutterAOT, detectFlutterEngineInfo, resolveFlutterPlatform } from '../utils/flutterBundler.js';
 import { runFlutterDiffGuard } from '../utils/diffGuard.js';
 import { hasBaseline, readBaselineManifest } from '../utils/baseline.js';
+import { buildKbcPatch } from '../utils/flutterKbcBundler.js';
+import { wrapKbc, type KbcEnvelopeMetadata } from '../utils/flutterKbcEnvelope.js';
 
 function isPatchRelease(release: any): boolean {
   return /-patch\.\d+$/.test(String(release.label || ''));
@@ -36,6 +38,12 @@ export const patchCommand = new Command('patch')
   .option('--env <environment>', 'Target environment: live or test')
   .option('--project <path>', 'Project root (defaults to auto-detect)')
   .option('--engine-version <version>', 'Flutter: override the detected engine version (rare)')
+  // ── iOS Path C (KBC interpreter) — sub-phase γ → β.4 → δ ──────────────────
+  .option('--label <label>', 'iOS Path C: label override (default kbc-ios-YYYYMMDDhhmmss)')
+  .option('--target-binary-version <semver>', 'iOS Path C: target host app version (default 1.0.0)', '1.0.0')
+  .option('--engine-commit <sha>', 'iOS Path C: Sankofa engine fork commit baked into envelope metadata')
+  .option('--dart-version <semver>', 'iOS Path C: Dart SDK version baked into envelope metadata')
+  .option('--dynamic-interface <yaml>', 'iOS Path C: dynamic_interface.yaml path (default ./sankofa/dynamic_interface.yaml if present)')
   .option('--dry-run', 'Build + run Diff Guard locally, but do NOT contact the server or upload')
   .action(async (platformArg: string | undefined, opts: any) => {
     const chalk = (await import('chalk')).default;
@@ -269,9 +277,13 @@ export async function flutterPatch(
   const ora = (await import('ora')).default;
   const inquirer = (await import('inquirer')).default;
 
-  // Platform — explicit positional required for parity with RN. iOS is
-  // Phase 6 and refused up-front.
+  // Platform — Android takes the libapp.so binary-diff path; iOS goes
+  // through the Path C KBC interpreter pipeline (handled in
+  // `flutterIosKbcPatch` below).
   const platform = await resolveFlutterPlatform(platformArg);
+  if (platform === 'ios') {
+    return flutterIosKbcPatch(project, opts);
+  }
 
   let environment;
   let initialRollout;
@@ -532,6 +544,199 @@ export async function flutterPatch(
     console.log(chalk.dim(`     Mandatory:       ${release.is_mandatory ? 'Yes' : 'No'}`));
     console.log(chalk.dim(`     ID:              ${release.id}`));
     console.log('');
+  } catch (err: any) {
+    uploadSpinner.fail(`Upload failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ── iOS Path C (KBC interpreter) — sub-phase γ → β.4 → δ end-to-end ─────────
+
+/**
+ * iOS Flutter Code patch — the Path C pipeline:
+ *
+ *   project source (lib/sankofa_patch.dart)
+ *     → γ: dart2bytecode → patch.kbc
+ *       → β.4: SANKOFA_KBC_ENVELOPE wrap → patch.skdp
+ *         → δ: POST /api/v1/deploy/releases (server validates envelope)
+ *           → η (on-device): SDK.applyKbcPatchFromBytes/File → Interpreter::Run
+ *
+ * Tier-A constraint: patches today can only return values constructable
+ * from the patch's own constant pool (strings, ints, doubles). Calling
+ * back into host AOT code (string interpolation, Flutter widgets,
+ * String._create) crashes at `Interpreter::InvokeCompiled` because the
+ * dyn-module:callable pragmas the dynamic-interface YAML emits aren't
+ * yet retained by gen_snapshot during AOT tree-shaking (ε.1 work). Until
+ * that lands, encode UI overrides as a JSON string returned by the
+ * patch's `@pragma('dyn-module:entry-point')` function and decode it on
+ * the host. See sankofa-flutter-deploy/docs/build-log-interpreter-program.md
+ * ε spike entry for the rationale.
+ *
+ * Convention-over-configuration defaults:
+ *   - Patch entry: lib/sankofa_patch.dart (single
+ *     @pragma('dyn-module:entry-point') Object? function)
+ *   - Dynamic interface: sankofa/dynamic_interface.yaml if present;
+ *     otherwise skip --validate (patch is then language-primitives only)
+ *   - Output (transient): .sankofa/build/patch.kbc + patch.skdp
+ *
+ * v0 produces and uploads a BASE release (no -patch.N suffix) per the
+ * server's existing semantics. A future enhancement can resolve the
+ * baseline release for the host's engine and label as -patch.N.
+ */
+async function flutterIosKbcPatch(project: ProjectInfo, opts: any) {
+  const chalk = (await import('chalk')).default;
+  const ora = (await import('ora')).default;
+
+  // ── 1. Engine + environment + label ─────────────────────────────────
+  let engineInfo;
+  try {
+    engineInfo = detectFlutterEngineInfo();
+  } catch (err: any) {
+    console.error(chalk.red(`  ✖ Could not detect Flutter engine: ${err.message}`));
+    console.error(chalk.dim('     Is `flutter` on your PATH? Run `sankofa doctor` to verify.'));
+    process.exit(1);
+  }
+  const engineVersion = opts.engineVersion || engineInfo.sankofaEngineVersion;
+
+  let environment;
+  let initialRollout;
+  try {
+    environment = await resolveEnvironmentPrompt(opts.env);
+    initialRollout = parseRollout(opts.rollout);
+  } catch (err: any) {
+    console.error(chalk.red(err.message));
+    process.exit(1);
+  }
+
+  const timestamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+  const label = opts.label || `kbc-ios-${timestamp}`;
+  const targetBinaryVersion = opts.targetBinaryVersion || '1.0.0';
+
+  // ── 2. Resolve project conventions ──────────────────────────────────
+  const projectRoot = project.root;
+  const entryFile = resolve(projectRoot, opts.entryFile || 'lib/sankofa_patch.dart');
+  if (!existsSync(entryFile)) {
+    console.error(chalk.red(`  ✖ Patch entry not found: ${entryFile}`));
+    console.error(chalk.dim(
+      '     Create it with exactly one entry-point function:\n' +
+      '        @pragma(\'dyn-module:entry-point\')\n' +
+      '        Object? main() => \'sankofa patch v1\';\n' +
+      '     Or pass --entry-file <path>.'
+    ));
+    process.exit(2);
+  }
+
+  let dynamicInterface: string | undefined;
+  const conventional = join(projectRoot, 'sankofa', 'dynamic_interface.yaml');
+  if (opts.dynamicInterface) {
+    dynamicInterface = resolve(projectRoot, opts.dynamicInterface);
+  } else if (existsSync(conventional)) {
+    dynamicInterface = conventional;
+    console.log(chalk.dim(`  · Using conventional dynamic interface ${conventional}`));
+  }
+
+  const buildDir = resolve(projectRoot, opts.outputDir || '.sankofa/build');
+  const kbcPath = join(buildDir, 'patch.kbc');
+  const envelopePath = join(buildDir, 'patch.skdp');
+  mkdirSync(buildDir, { recursive: true });
+
+  // ── 3. γ: compile Dart → KBC ────────────────────────────────────────
+  console.log('');
+  const buildSpinner = ora(`Building KBC patch from ${entryFile}…`).start();
+  let buildResult;
+  try {
+    buildResult = buildKbcPatch({
+      entryFile,
+      outputPath: kbcPath,
+      validateYaml: dynamicInterface,
+    });
+    buildSpinner.succeed(
+      `KBC built (${buildResult.sizeBytes} B, magic ${buildResult.magic})`,
+    );
+  } catch (err: any) {
+    buildSpinner.fail(`KBC build failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  // ── 4. β.4: wrap envelope ───────────────────────────────────────────
+  const wrapSpinner = ora('Wrapping envelope…').start();
+  const meta: KbcEnvelopeMetadata = {
+    label,
+    description: opts.description || `iOS Path C patch from ${entryFile}`,
+    engineCommit: opts.engineCommit,
+    dartVersion: opts.dartVersion,
+    targetBinaryVersion,
+    rollout: initialRollout,
+    mandatory: !!opts.mandatory,
+    createdAt: new Date().toISOString(),
+  };
+  let envelopeBytes: Buffer;
+  try {
+    envelopeBytes = wrapKbc({
+      kbcPayload: readFileSync(kbcPath),
+      metadata: meta,
+    });
+    writeFileSync(envelopePath, envelopeBytes);
+    wrapSpinner.succeed(
+      `Envelope wrapped (${envelopeBytes.length} B → ${envelopePath})`,
+    );
+  } catch (err: any) {
+    wrapSpinner.fail(`Wrap failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  // ── 5. δ: upload to server ──────────────────────────────────────────
+  if (opts.dryRun) {
+    console.log('');
+    console.log(chalk.yellow.bold('  --dry-run set — skipping upload.'));
+    console.log(chalk.dim(`     Envelope at:     ${envelopePath}`));
+    console.log(chalk.dim(`     Label:           ${label}`));
+    console.log(chalk.dim(`     Engine:          ${engineVersion}`));
+    console.log(chalk.dim(`     Rollout:         ${initialRollout}%`));
+    console.log(chalk.dim('     Push manually:'));
+    console.log(chalk.dim(
+      `       xcrun devicectl device copy to --device <udid> \\\n` +
+      `         --domain-type appDataContainer \\\n` +
+      `         --domain-identifier <bundle-id> \\\n` +
+      `         --source ${envelopePath} \\\n` +
+      `         --destination 'Documents/sankofa-deploy/patches/active/patch.skdp'`,
+    ));
+    return;
+  }
+
+  const uploadSpinner = ora(`Uploading ${envelopeBytes.length} B envelope to server…`).start();
+  try {
+    const release = await uploadRelease(envelopePath, {
+      label,
+      target_binary_version: targetBinaryVersion,
+      platform: 'ios',
+      description: meta.description,
+      is_mandatory: !!opts.mandatory,
+      rollout_percentage: initialRollout,
+      environment,
+      runtime: 'flutter-code',
+      engine_version: engineVersion,
+    });
+    uploadSpinner.succeed('Envelope uploaded!');
+    console.log('');
+    console.log(chalk.green.bold('  🚀 iOS Path C patch published'));
+    console.log(chalk.dim(`     ID:              ${release.id}`));
+    console.log(chalk.dim(`     Label:           ${release.label}`));
+    console.log(chalk.dim(`     Object key:      ${release.bundle_object_key}`));
+    console.log(chalk.dim(`     Engine:          ${release.engine_version}`));
+    console.log(chalk.dim(`     Target binary:   ${release.target_binary_version}`));
+    console.log(chalk.dim(`     Rollout:         ${release.rollout_percentage}%`));
+    console.log(chalk.dim(`     Mandatory:       ${release.is_mandatory ? 'Yes' : 'No'}`));
+    console.log('');
+    console.log(
+      chalk.dim(
+        'Until in-app fetch lands (η v1), pull the bundle via\n' +
+        `  curl -H "Authorization: Bearer $TOKEN" -H "x-project-id: $PROJECT" \\\n` +
+        `       ${process.env.SANKOFA_ENDPOINT || ''}/api/v1/deploy/releases/${release.id} \\\n` +
+        '    | jq -r .download_url | xargs curl -o /tmp/patch.skdp\n' +
+        'then push to the device via xcrun devicectl device copy to.',
+      ),
+    );
   } catch (err: any) {
     uploadSpinner.fail(`Upload failed: ${err.message}`);
     process.exit(1);

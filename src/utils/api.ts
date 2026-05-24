@@ -103,12 +103,21 @@ export async function uploadRelease(
   // (connection resets mid-upload). openAsBlob lazy-streams the file.
   //
   // Runtime-specific multipart payload:
-  //   react-native → ota.zip (application/zip), bundle_format=zip
-  //   flutter-code → libapp.so (application/octet-stream), bundle_format=so
+  //   react-native           → ota.zip      (application/zip),         bundle_format=zip
+  //   flutter-code / android → libapp.so    (application/octet-stream), bundle_format=so
+  //   flutter-code / ios     → patch.skdp   (application/octet-stream), bundle_format=skdp
+  //                            (SANKOFA_KBC_ENVELOPE, β.4 spec — the
+  //                            server validates magic+sha+version before
+  //                            persisting; see ee/deploy/kbc_envelope.go)
   const isFlutterCode = metadata.runtime === 'flutter-code';
+  const isIos = (platform || '').toLowerCase() === 'ios';
   const bundleContentType = isFlutterCode ? 'application/octet-stream' : 'application/zip';
-  const bundleFilename = isFlutterCode ? 'libapp.so' : 'ota.zip';
-  const bundleFormat = isFlutterCode ? 'so' : 'zip';
+  const bundleFilename = isFlutterCode
+    ? (isIos ? 'patch.skdp' : 'libapp.so')
+    : 'ota.zip';
+  const bundleFormat = isFlutterCode
+    ? (isIos ? 'skdp' : 'so')
+    : 'zip';
   const bundleBlob = await openAsBlob(bundlePath, { type: bundleContentType });
   form.append('bundle', bundleBlob, bundleFilename);
   form.append('bundle_format', bundleFormat);
