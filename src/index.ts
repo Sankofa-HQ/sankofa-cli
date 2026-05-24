@@ -21,6 +21,7 @@ import { flagsCommand } from './commands/flags.js';
 import { configCommand } from './commands/config.js';
 import { catchCommand } from './commands/catch.js';
 import { demoCommand } from './commands/demo.js';
+import { kbcCommand } from './commands/kbc.js';
 
 const program = new Command();
 
@@ -56,5 +57,7 @@ program.addCommand(configCommand);
 // Sankofa Catch — error tracking
 program.addCommand(catchCommand);
 program.addCommand(demoCommand);
+// γ — Sankofa Deploy: Flutter Code KBC patch producer (iOS Path C).
+program.addCommand(kbcCommand);
 
 program.parse();
