@@ -12,7 +12,7 @@ import {
   syncNativeFromAppJson,
 } from '../utils/bundler.js';
 import { listReleases, uploadRelease } from '../utils/api.js';
-import { requireAuth } from '../utils/config.js';
+import { requireAuth, findProjectConfig } from '../utils/config.js';
 import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompts.js';
 import { resolveProjectRoot, type ProjectInfo } from '../utils/stack.js';
 import { escapeRegExp, parseRollout } from '../utils/validation.js';
@@ -21,6 +21,7 @@ import { runFlutterDiffGuard } from '../utils/diffGuard.js';
 import { hasBaseline, readBaselineManifest } from '../utils/baseline.js';
 import { buildKbcPatch } from '../utils/flutterKbcBundler.js';
 import { wrapKbc, type KbcEnvelopeMetadata } from '../utils/flutterKbcEnvelope.js';
+import { loadSigningKey, signEd25519 } from './keys.js';
 
 function isPatchRelease(release: any): boolean {
   return /-patch\.\d+$/.test(String(release.label || ''));
@@ -670,15 +671,28 @@ async function flutterIosKbcPatch(project: ProjectInfo, opts: any) {
     mandatory: !!opts.mandatory,
     createdAt: new Date().toISOString(),
   };
+  // v2 envelope MVP: if a project signing key exists, sign the envelope
+  // with Ed25519 so the SDK can refuse tampered patches. Absent key
+  // means unsigned envelope (sig_alg=0) — backwards-compatible with
+  // SDKs that don't enforce signing.
+  const projectCfg = findProjectConfig();
+  const signingKey = projectCfg?.projectId
+    ? loadSigningKey(projectCfg.projectId)
+    : null;
   let envelopeBytes: Buffer;
   try {
     envelopeBytes = wrapKbc({
       kbcPayload: readFileSync(kbcPath),
       metadata: meta,
+      sigAlg: signingKey ? 1 : 0,
+      signer: signingKey
+        ? (bytes) => signEd25519(signingKey.privateKeyPem, bytes)
+        : undefined,
     });
     writeFileSync(envelopePath, envelopeBytes);
+    const signedNote = signingKey ? ' (Ed25519-signed)' : ' (unsigned)';
     wrapSpinner.succeed(
-      `Envelope wrapped (${envelopeBytes.length} B → ${envelopePath})`,
+      `Envelope wrapped${signedNote} (${envelopeBytes.length} B → ${envelopePath})`,
     );
   } catch (err: any) {
     wrapSpinner.fail(`Wrap failed: ${err.message}`);

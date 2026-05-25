@@ -22,6 +22,7 @@ import { configCommand } from './commands/config.js';
 import { catchCommand } from './commands/catch.js';
 import { demoCommand } from './commands/demo.js';
 import { kbcCommand } from './commands/kbc.js';
+import { keysCommand } from './commands/keys.js';
 
 const program = new Command();
 
@@ -59,5 +60,7 @@ program.addCommand(catchCommand);
 program.addCommand(demoCommand);
 // γ — Sankofa Deploy: Flutter Code KBC patch producer (iOS Path C).
 program.addCommand(kbcCommand);
+// v2 envelopes — Ed25519 signing key management.
+program.addCommand(keysCommand);
 
 program.parse();

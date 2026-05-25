@@ -97,11 +97,17 @@ export type WrapOptions = {
   /** Metadata that travels with the patch. */
   metadata: KbcEnvelopeMetadata;
   /**
-   * Signature algorithm. v1 supports 0 (unsigned) only. When the
-   * Sankofa key-management story lands, callers will pass 1 + a
-   * private key + signing function.
+   * Signature algorithm. 0 = unsigned, 1 = Ed25519. When 1, `signer`
+   * is required — it gets called with the bytes [0..trailer_offset)
+   * and must return a 64-byte Ed25519 signature.
    */
   sigAlg?: SigAlg;
+  /**
+   * Signing callback. Called with all envelope bytes BEFORE the trailer
+   * (header + metadata + kbc payload). Must return a 64-byte Ed25519
+   * signature. Only consulted when `sigAlg === 1`.
+   */
+  signer?: (bytesToSign: Buffer) => Buffer;
 };
 
 export type ParsedEnvelope = {
@@ -131,10 +137,13 @@ export type ParsedEnvelope = {
  */
 export function wrapKbc(opts: WrapOptions): Buffer {
   const sigAlg: SigAlg = opts.sigAlg ?? 0;
-  if (sigAlg !== 0) {
+  if (sigAlg !== 0 && sigAlg !== 1) {
     throw new Error(
-      `Envelope v1 supports sig_alg=0 only (unsigned). Got: ${sigAlg}.`,
+      `Envelope sig_alg must be 0 (unsigned) or 1 (Ed25519). Got: ${sigAlg}.`,
     );
+  }
+  if (sigAlg === 1 && !opts.signer) {
+    throw new Error('Envelope sig_alg=1 (Ed25519) requires opts.signer.');
   }
 
   const kbcPayload = Buffer.from(opts.kbcPayload);
@@ -147,7 +156,8 @@ export function wrapKbc(opts: WrapOptions): Buffer {
 
   const bodySize =
     HEADER_SIZE + metadataJson.length + kbcPayload.length;
-  const trailerSize = TRAILER_FIXED_SIZE; // unsigned → 0-byte signature
+  const sigLength = sigAlg === 1 ? 64 : 0; // Ed25519 signatures are always 64 bytes
+  const trailerSize = TRAILER_FIXED_SIZE + sigLength;
   const totalSize = bodySize + trailerSize;
 
   const buf = Buffer.alloc(totalSize);
@@ -165,11 +175,27 @@ export function wrapKbc(opts: WrapOptions): Buffer {
   metadataJson.copy(buf, HEADER_SIZE);
   kbcPayload.copy(buf, HEADER_SIZE + metadataJson.length);
 
-  // Trailer.
+  // Trailer header (sig_alg + reserved + sig_length).
   const trailerOffset = bodySize;
-  buf.writeUInt8(0, trailerOffset); // sig_alg = unsigned
+  buf.writeUInt8(sigAlg, trailerOffset);
   buf.writeUInt8(0, trailerOffset + 1); // reserved
-  buf.writeUInt16LE(0, trailerOffset + 2); // sig_length = 0
+  buf.writeUInt16LE(sigLength, trailerOffset + 2);
+
+  // Signature bytes (if signing). The signature covers
+  // bytes[0..trailerOffset) — everything BEFORE the trailer. This
+  // commits the producer to: (a) the magic + version, (b) the metadata
+  // JSON, (c) the KBC payload itself (via payload_sha + the actual
+  // bytes). Any post-sign tamper invalidates the signature.
+  if (sigAlg === 1) {
+    const bytesToSign = buf.subarray(0, trailerOffset);
+    const sig = opts.signer!(bytesToSign);
+    if (sig.length !== 64) {
+      throw new Error(
+        `Ed25519 signature must be 64 bytes, got ${sig.length}.`,
+      );
+    }
+    sig.copy(buf, trailerOffset + TRAILER_FIXED_SIZE);
+  }
 
   return buf;
 }
