@@ -45,7 +45,7 @@ import {
   createPrivateKey,
   createPublicKey,
 } from 'crypto';
-import { findProjectConfig } from '../utils/config.js';
+import { findProjectConfig, resolveAuth, requireAuth } from '../utils/config.js';
 
 const SANKOFA_KEYS_DIR = join(homedir(), '.config', 'sankofa', 'keys');
 
@@ -245,4 +245,81 @@ keysCommand
       process.exit(1);
     }
     console.log(privatePath);
+  });
+
+// v2.1 — enroll the local pubkey with the server so the upload handler
+// can verify signatures at the gate (defense in depth on top of the SDK's
+// on-device check). Without this, the server accepts ed25519 envelopes
+// but doesn't verify them — only the host app's embedded pubkey gates.
+keysCommand
+  .command('register')
+  .description('Register the local pubkey with the server so it verifies envelope signatures at upload time')
+  .option('--project <projectId>', 'Project ID (defaults to .sankofa.json)')
+  .option('--env <environment>', 'Environment to enroll the key for (default: live)', 'live')
+  .option('--description <desc>', 'Human label so dashboards / audits can identify this key')
+  .action(async (opts: any) => {
+    const chalk = (await import('chalk')).default;
+
+    await requireAuth();
+    let projectId: string;
+    try {
+      projectId = await resolveProjectId(opts);
+    } catch (err: any) {
+      console.error(chalk.red(`  ✖ ${err.message}`));
+      process.exit(1);
+    }
+    const key = loadSigningKey(projectId);
+    if (!key) {
+      console.error(chalk.red(`  ✖ No local signing key for project ${projectId}.`));
+      console.error(chalk.dim('     Run `sankofa keys generate` first.'));
+      process.exit(1);
+    }
+
+    const auth = resolveAuth();
+    if (!auth.endpoint) {
+      console.error(chalk.red('  ✖ No server endpoint configured. Run `sankofa login` first.'));
+      process.exit(1);
+    }
+    if (auth.token.startsWith('sk_live_') || auth.token.startsWith('sk_test_')) {
+      console.error(chalk.red('  ✖ `sankofa keys register` needs a dashboard JWT (admin role), not an SDK key.'));
+      console.error(chalk.dim('     Run `sankofa login` (interactive flow) to get a session JWT.'));
+      process.exit(1);
+    }
+
+    const url = `${auth.endpoint.replace(/\/$/, '')}/api/v1/deploy/signing-keys`;
+    const body = {
+      environment: opts.env || 'live',
+      pubkey_b64: key.publicKeyB64,
+      description: opts.description || `Registered via sankofa-cli on ${new Date().toISOString()}`,
+    };
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${auth.token}`,
+          'x-project-id': projectId,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (err: any) {
+      console.error(chalk.red(`  ✖ POST ${url} failed: ${err.message}`));
+      process.exit(1);
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      console.error(chalk.red(`  ✖ Server rejected (HTTP ${res.status}): ${text}`));
+      process.exit(1);
+    }
+    const out = (await res.json()) as any;
+    console.log('');
+    console.log(chalk.green('  ✔ Pubkey registered with server'));
+    console.log(`     Key ID:      ${chalk.cyan(out.signing_key?.id)}`);
+    console.log(`     Project:     ${projectId}`);
+    console.log(`     Environment: ${opts.env || 'live'}`);
+    console.log(`     Algorithm:   ${out.signing_key?.algorithm}`);
+    console.log('');
+    console.log(chalk.dim('  Server will now verify every uploaded envelope against this key.'));
+    console.log(chalk.dim('  Unsigned uploads + uploads signed by a non-enrolled key are rejected at the gate.'));
   });
