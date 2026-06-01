@@ -1,6 +1,106 @@
-import { statSync, openAsBlob } from 'fs';
+import { statSync, openAsBlob, createReadStream } from 'fs';
+import { createHash } from 'crypto';
 import { resolveAuth } from './config.js';
 import { normalizeEnvironment, normalizePlatform } from './validation.js';
+
+/**
+ * Build an undici dispatcher with generous timeouts for large uploads.
+ * Returns undefined if undici isn't importable (the default fetch
+ * timeouts then apply). Shared by the presigned PUT and the release POST.
+ */
+async function makeUploadDispatcher(): Promise<any> {
+  try {
+    // @ts-ignore — undici ships with Node >= 18 but isn't typed as an
+    // importable module path. Dynamic import resolves at runtime.
+    const undici = (await import('undici' as any)) as any;
+    return new undici.Agent({
+      headersTimeout: 20 * 60 * 1000,
+      bodyTimeout: 20 * 60 * 1000,
+      connectTimeout: 30 * 1000,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/** Stream a file through SHA-256 without loading it into memory. */
+function sha256File(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(path);
+    stream.on('error', reject);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+interface PresignedUpload {
+  object_key: string;
+  upload_url: string;
+  method: string;
+  headers: Record<string, string>;
+}
+
+/**
+ * Ask the server for a presigned PUT URL for a large native/preview
+ * artifact. Returns null when the server doesn't expose the endpoint
+ * (older deploy build → 404), so the caller can fall back to the legacy
+ * inline multipart upload.
+ */
+async function presignNativeArtifact(
+  endpoint: string,
+  projectId: string,
+  kind: string,
+  sizeBytes: number,
+  sha256: string,
+  dispatcher: any,
+): Promise<PresignedUpload | null> {
+  const url = `${endpoint}/api/v1/deploy/releases/presign?projectId=${projectId}`;
+  const init: any = {
+    method: 'POST',
+    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ native_artifact_kind: kind, size_bytes: sizeBytes, sha256 }),
+  };
+  if (dispatcher) init.dispatcher = dispatcher;
+  const res = await fetch(url, init);
+  if (res.status === 404) return null; // server predates presigned uploads
+  if (!res.ok) throw await readAPIError(res, `Presign failed (${res.status})`);
+  return (await res.json()) as PresignedUpload;
+}
+
+/** PUT a file straight to object storage using a presigned URL. */
+async function putToPresignedUrl(
+  presigned: PresignedUpload,
+  filePath: string,
+  dispatcher: any,
+): Promise<void> {
+  const contentType = presigned.headers['Content-Type'] || presigned.headers['content-type'] || 'application/octet-stream';
+  const blob = await openAsBlob(filePath, { type: contentType });
+  const init: any = {
+    method: presigned.method || 'PUT',
+    headers: { ...presigned.headers },
+    body: blob,
+  };
+  if (dispatcher) init.dispatcher = dispatcher;
+  let res;
+  try {
+    res = await fetch(presigned.upload_url, init);
+  } catch (err: any) {
+    const detail = err?.cause?.message || err?.message || 'network error';
+    throw new Error(`Direct upload of the native artifact to storage failed: ${detail}`);
+  }
+  if (!res.ok) {
+    let hint = '';
+    if (res.status === 403) {
+      hint = ' — the upload URL may have expired (60-min limit) or the file changed mid-upload; re-run the command.';
+    } else if (res.status === 413) {
+      hint = ' — the storage provider rejected the object size.';
+    }
+    const body = await res.text().catch(() => '');
+    const snippet = body ? `: ${body.replace(/\s+/g, ' ').slice(0, 180)}` : '';
+    throw new Error(`Direct upload of the native artifact to storage failed (HTTP ${res.status})${hint}${snippet}`);
+  }
+}
 
 interface FetchOptions {
   method?: string;
@@ -37,10 +137,47 @@ function getAuthHeaders(): Record<string, string> {
   };
 }
 
+/** Humanize a deploy metric key for user-facing quota messages. */
+function metricLabel(metric: string): string {
+  switch (metric) {
+    case 'native_artifact_mb':
+      return 'preview/native artifact';
+    case 'bundle_mb':
+      return 'bundle';
+    case 'app':
+      return 'apps';
+    default:
+      return metric;
+  }
+}
+
 async function readAPIError(res: Response, fallback: string): Promise<Error> {
-  const body = await res.json().catch(() => null) as any;
-  const message = body?.error || body?.message || fallback;
-  return new Error(message);
+  const body = (await res.json().catch(() => null)) as any;
+  if (body && typeof body === 'object') {
+    // Structured tier/quota errors → clear, actionable messages.
+    if (body.error === 'quota_exceeded') {
+      const what = metricLabel(String(body.metric || ''));
+      const used = body.used != null ? `${body.used} MB` : 'this upload';
+      // tier "*" means the absolute hard cap, not a plan allowance.
+      if (body.current === '*') {
+        return new Error(
+          `This ${what} is ${used}, over the maximum allowed ${body.limit} MB. Split or shrink the artifact.`,
+        );
+      }
+      return new Error(
+        `This ${what} is ${used}, over your ${body.current ?? 'current'} plan's ${body.limit} MB limit. ` +
+          `Upgrade your plan or reduce the size — https://sankofa.dev/pricing`,
+      );
+    }
+    if (body.error === 'tier_required') {
+      return new Error(
+        `${body.feature ?? 'This feature'} requires the ${body.required ?? 'a higher'} plan ` +
+          `(you're on ${body.current ?? 'your current plan'}). Upgrade at https://sankofa.dev/pricing`,
+      );
+    }
+    if (body.error || body.message) return new Error(body.error || body.message);
+  }
+  return new Error(fallback);
 }
 
 /** List releases for the current project */
@@ -121,12 +258,45 @@ export async function uploadRelease(
   const bundleBlob = await openAsBlob(bundlePath, { type: bundleContentType });
   form.append('bundle', bundleBlob, bundleFilename);
   form.append('bundle_format', bundleFormat);
+  // Large native/preview artifacts (simulator .app.zip / .apk) upload
+  // DIRECTLY to object storage via a presigned PUT, so they never
+  // traverse the API request body (Cloudflare/nginx/Fiber size limits).
+  // Falls back to inline multipart when the server predates the
+  // presign endpoint (404).
+  const dispatcher = await makeUploadDispatcher();
   if (metadata.native_artifact_path) {
-    const nativeBlob = await openAsBlob(metadata.native_artifact_path, {
-      type: 'application/octet-stream',
-    });
-    form.append('native_artifact', nativeBlob, metadata.native_artifact_path.split('/').pop() || 'native-artifact');
-    form.append('native_artifact_kind', metadata.native_artifact_kind || '');
+    const kind = metadata.native_artifact_kind || '';
+    const nativeStat = statSync(metadata.native_artifact_path);
+    const nativeSha = await sha256File(metadata.native_artifact_path);
+    // presignNativeArtifact THROWS a clear error on real failures
+    // (size/quota exceeded → 402, rate limited → 429, etc.) and returns
+    // null ONLY when the server predates the presign endpoint (404).
+    // We deliberately do NOT swallow errors here — a quota rejection
+    // must reach the user, not silently fall back and fail confusingly.
+    const presigned = await presignNativeArtifact(
+      endpoint,
+      projectId,
+      kind,
+      nativeStat.size,
+      nativeSha,
+      dispatcher,
+    );
+    if (presigned) {
+      await putToPresignedUrl(presigned, metadata.native_artifact_path, dispatcher);
+      form.append('native_artifact_object_key', presigned.object_key);
+      form.append('native_artifact_kind', kind);
+      form.append('native_artifact_sha256', nativeSha);
+      form.append('native_artifact_size_bytes', String(nativeStat.size));
+    } else {
+      // Server has no presign endpoint (older build) → inline multipart.
+      // Only succeeds if the artifact is under the API body limits; a
+      // large one will fail at the POST below with a clear message.
+      const nativeBlob = await openAsBlob(metadata.native_artifact_path, {
+        type: 'application/octet-stream',
+      });
+      form.append('native_artifact', nativeBlob, metadata.native_artifact_path.split('/').pop() || 'native-artifact');
+      form.append('native_artifact_kind', kind);
+    }
   }
   form.append('metadata', JSON.stringify({
     ...metadata,
@@ -142,28 +312,10 @@ export async function uploadRelease(
   try {
     // Release uploads can take several minutes when the server does the
     // full pipeline (B2/S3 upload, SHA256 verification, ClickHouse
-    // metadata). Node's fetch defaults to a 5-minute headers timeout,
-    // which trips on slow networks + cold storage. Try to bump to 20 min
-    // via an `undici.Agent` dispatcher; fall back to the default fetch
-    // if undici isn't importable (newer Node versions occasionally hide
-    // it, or the binary is running under a runtime that doesn't ship
-    // undici at all).
-    let dispatcher: any = undefined;
-    try {
-      // @ts-ignore — undici ships with Node >= 18 but isn't in @types/node as
-      // an importable module path. Dynamic import resolves at runtime.
-      const undici = await import('undici' as any) as any;
-      dispatcher = new undici.Agent({
-        headersTimeout: 20 * 60 * 1000,
-        bodyTimeout: 20 * 60 * 1000,
-        connectTimeout: 30 * 1000,
-      });
-    } catch {
-      // undici not available — proceed with default fetch timeouts. The
-      // server completes flutter-code uploads (single 1-10 MB libapp.so)
-      // well inside fetch's 5-minute headers window.
-      dispatcher = undefined;
-    }
+    // metadata). The shared `dispatcher` (built above) bumps fetch's
+    // 5-minute headers timeout to 20 min for slow networks + cold
+    // storage; it's undefined when undici isn't importable, in which
+    // case the default fetch timeouts apply.
     const fetchInit: any = {
       method: 'POST',
       headers: { ...getAuthHeaders() },

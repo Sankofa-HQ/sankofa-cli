@@ -44,6 +44,7 @@ import {
   generateKeyPairSync,
   createPrivateKey,
   createPublicKey,
+  sign as cryptoSign,
 } from 'crypto';
 import { findProjectConfig, resolveAuth, requireAuth } from '../utils/config.js';
 
@@ -100,10 +101,8 @@ export function signEd25519(
 ): Buffer {
   const key = createPrivateKey({ key: privateKeyPem, format: 'pem' });
   // Ed25519 in Node's crypto API uses algorithm=null. The signature is
-  // always exactly 64 bytes; sign() returns a Buffer.
-  const { sign } = require('crypto');
-  const sig = sign(null, bytesToSign, key);
-  return sig;
+  // always exactly 64 bytes.
+  return cryptoSign(null, bytesToSign, key);
 }
 
 function exportEd25519PublicKeyB64(privateKeyPem: string): string {
