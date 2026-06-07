@@ -294,12 +294,12 @@ function rnToolchainChecks(cwd: string): CheckResult[] {
 function flutterToolchainChecks(cwd: string): CheckResult[] {
   const results: CheckResult[] = [];
 
-  results.push(check('Flutter SDK', () => {
+  results.push(check('Flutter SDK (PATH)', () => {
     try {
       const v = execSync('flutter --version', { encoding: 'utf-8' }).split('\n')[0];
       return { status: 'ok', detail: v };
     } catch {
-      return { status: 'fail', detail: 'flutter not on PATH — install from flutter.dev' };
+      return { status: 'warn', detail: 'flutter not on PATH (Sankofa uses bundled flutter — this is OK)' };
     }
   }));
 
@@ -322,6 +322,112 @@ function flutterToolchainChecks(cwd: string): CheckResult[] {
     if (!existsSync(path)) return { status: 'fail', detail: 'missing' };
     return { status: 'ok', detail: path };
   }));
+
+  results.push(...sankofaFlutterDeployChecks(cwd));
+
+  return results;
+}
+
+/**
+ * Sankofa-specific Flutter health checks that go beyond the bare
+ * Flutter toolchain: bundled flutter presence, engine cache integrity,
+ * sankofa.yaml + sankofa_flutter pubspec entry, native-config wiring.
+ */
+function sankofaFlutterDeployChecks(cwd: string): CheckResult[] {
+  const results: CheckResult[] = [];
+
+  // sankofa.yaml — Deploy's config-of-record.
+  const yamlPath = join(cwd, 'sankofa.yaml');
+  let engineVersion: string | undefined;
+  let appId: string | undefined;
+  results.push(check('sankofa.yaml', () => {
+    if (!existsSync(yamlPath)) {
+      return {
+        status: 'warn',
+        detail: 'not found — run `sankofa init` to add Sankofa Deploy',
+      };
+    }
+    try {
+      const text = readFileSync(yamlPath, 'utf-8');
+      const mEngine = text.match(/^\s*engine_version:\s*['"]?([\w.+-]+)['"]?\s*$/m);
+      const mAppId = text.match(/^\s*app_id:\s*['"]?([\w.+-]+)['"]?\s*$/m);
+      const mApiKey = text.match(/^\s*api_key:\s*['"]?([\w._+-]+)['"]?\s*$/m);
+      engineVersion = mEngine?.[1];
+      appId = mAppId?.[1];
+      const issues: string[] = [];
+      if (!appId) issues.push('missing app_id');
+      if (!mApiKey) issues.push('missing api_key');
+      if (issues.length) return { status: 'fail', detail: issues.join(', ') };
+      return { status: 'ok', detail: `app_id=${appId}${engineVersion ? `, engine=${engineVersion}` : ''}` };
+    } catch (err: any) {
+      return { status: 'fail', detail: `parse error: ${err.message}` };
+    }
+  }));
+
+  // sankofa_flutter dep in pubspec.yaml.
+  results.push(check('sankofa_flutter (pubspec)', () => {
+    const pubspecPath = join(cwd, 'pubspec.yaml');
+    if (!existsSync(pubspecPath)) return { status: 'skip', detail: 'no pubspec.yaml' };
+    const text = readFileSync(pubspecPath, 'utf-8');
+    if (text.includes('sankofa_flutter')) {
+      return { status: 'ok', detail: 'present' };
+    }
+    return { status: 'warn', detail: 'not in pubspec.yaml — run `sankofa init`' };
+  }));
+
+  // Bundled flutter for the pinned engine version.
+  results.push(check('Sankofa bundled Flutter', () => {
+    if (!engineVersion) {
+      return { status: 'skip', detail: 'no engine_version in sankofa.yaml' };
+    }
+    try {
+      // Dynamic require to keep doctor portable when CLI is invoked from CI.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { bundledFlutterInfo } = require('../utils/flutterBundleCache.js');
+      const info = bundledFlutterInfo(engineVersion);
+      if (info.exists) {
+        return { status: 'ok', detail: info.root };
+      }
+      return {
+        status: 'fail',
+        detail: `missing at ${info.root} — run \`sankofa engine install ${engineVersion}\``,
+      };
+    } catch (err: any) {
+      return { status: 'warn', detail: `check skipped: ${err.message}` };
+    }
+  }));
+
+  // Native config wiring — Phase 0.75 manifest meta-data (Android) +
+  // Info.plist keys (iOS) — engine reads these so the host doesn't have
+  // to call ConfigureSankofa() manually.
+  if (existsSync(join(cwd, 'android'))) {
+    results.push(check('Android: sankofa meta-data', () => {
+      const manifestPath = join(cwd, 'android', 'app', 'src', 'main', 'AndroidManifest.xml');
+      if (!existsSync(manifestPath)) return { status: 'skip', detail: 'no AndroidManifest.xml' };
+      const text = readFileSync(manifestPath, 'utf-8');
+      if (text.includes('com.sankofa.deploy.app_id')) {
+        return { status: 'ok', detail: 'meta-data present' };
+      }
+      return {
+        status: 'warn',
+        detail: 'no <meta-data android:name="com.sankofa.deploy.app_id" /> — engine will fall back to sankofa.yaml asset',
+      };
+    }));
+  }
+  if (existsSync(join(cwd, 'ios'))) {
+    results.push(check('iOS: sankofa Info.plist keys', () => {
+      const plistPath = join(cwd, 'ios', 'Runner', 'Info.plist');
+      if (!existsSync(plistPath)) return { status: 'skip', detail: 'no ios/Runner/Info.plist' };
+      const text = readFileSync(plistPath, 'utf-8');
+      if (text.includes('SankofaDeployAppId')) {
+        return { status: 'ok', detail: 'SankofaDeploy* keys present' };
+      }
+      return {
+        status: 'warn',
+        detail: 'no SankofaDeployAppId in Info.plist — engine will fall back to sankofa.yaml asset',
+      };
+    }));
+  }
 
   return results;
 }

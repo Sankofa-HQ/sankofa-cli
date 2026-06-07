@@ -50,6 +50,11 @@ interface RegistryQuery {
   flutterVersion?: string;
   target?: 'android' | 'ios';
   modifiedOnly?: boolean;
+  /**
+   * Friendly Sankofa engine identity (e.g. "3.44.0+sankofa-1"). Lets the
+   * CLI ask for "every ABI of this Sankofa engine" in one round-trip.
+   */
+  sankofaEngineVersion?: string;
 }
 
 const TTL_MS = 15 * 60 * 1000;
@@ -227,6 +232,7 @@ function filterEngines(
     if (query.flutterVersion && e.flutter_version !== query.flutterVersion) return false;
     if (query.target && e.target !== query.target) return false;
     if (query.modifiedOnly && !e.is_modified) return false;
+    if (query.sankofaEngineVersion && e.sankofa_engine_version !== query.sankofaEngineVersion) return false;
     return true;
   });
 }

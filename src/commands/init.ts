@@ -305,25 +305,33 @@ async function installDeployRN(project: ProjectInfo, endpoint: string, chalk: an
 
 async function installDeployFlutter(project: ProjectInfo, endpoint: string, chalk: any) {
   const result = patchFlutterNativeFiles(project.root, endpoint, chalk);
-  const pubspecRaw = readFileSync(join(project.root, 'pubspec.yaml'), 'utf-8');
+  const pubspecPath = join(project.root, 'pubspec.yaml');
+  const pubspecRaw = readFileSync(pubspecPath, 'utf-8');
   // Match either the unified package (current) or the legacy Phase 7
   // package (for projects mid-migration).
   const hasSdk = pubspecRaw.includes('sankofa_flutter') || pubspecRaw.includes('sankofa_deploy');
 
-  // Engine fetch — pull the Sankofa-built libflutter.so into
-  // ~/.sankofa/engines/ so `sankofa release android` later doesn't
-  // refuse the release for "unknown engine". Skipped if Flutter isn't
-  // on PATH or the version detect fails; user will hit the same gate
-  // at release time with a clear `sankofa engine download` hint.
+  // 1. Auto-install bundled Flutter SDK + engine binaries when missing.
+  await ensureBundledFlutterForInit(project, chalk);
+
+  // 2. Pull per-ABI engine binaries (libflutter.so / Flutter.framework) so
+  //    `sankofa release` later doesn't trip the "unknown engine" gate.
+  //    Best-effort: failures are non-fatal — clearer error appears at
+  //    release time with a `sankofa engine download` hint.
   await ensureFlutterEngineForInit(project, chalk);
 
-  console.log('');
+  // 3. Auto-add the SDK to pubspec.yaml when missing.
   if (!hasSdk) {
-    console.log(chalk.dim('     Install the unified runtime SDK:'));
-    console.log(chalk.cyan('       flutter pub add sankofa_flutter'));
+    const added = await tryAddSankofaFlutterToPubspec(pubspecPath, chalk);
+    if (!added) {
+      console.log(chalk.dim('     Install the unified runtime SDK manually:'));
+      console.log(chalk.cyan('       flutter pub add sankofa_flutter'));
+    }
   } else {
-    console.log(chalk.dim('     SDK already in pubspec.yaml'));
+    console.log(chalk.dim('     ✓ sankofa_flutter already in pubspec.yaml'));
   }
+
+  console.log('');
   console.log(chalk.dim('     Initialize in your main.dart:'));
   console.log(chalk.cyan(`       await Sankofa.instance.init(
          apiKey: 'YOUR_API_KEY',
@@ -341,6 +349,87 @@ async function installDeployFlutter(project: ProjectInfo, endpoint: string, chal
 }
 
 /**
+ * Install the Sankofa-forked Flutter SDK into ~/.sankofa/flutter/<version>/
+ * if not already present. Reads the engine version from the project's
+ * sankofa.yaml (or defaults to 3.44.0+sankofa-1).
+ *
+ * Failures are non-fatal — `sankofa engine install` can be re-run later.
+ */
+async function ensureBundledFlutterForInit(project: ProjectInfo, chalk: any): Promise<void> {
+  const ora = (await import('ora')).default;
+  const { installBundledFlutter, bundledFlutterInfo } = await import('../utils/flutterBundleCache.js');
+
+  // Resolve which engine version this project targets.
+  let engineVersion = process.env.SANKOFA_ENGINE_VERSION;
+  if (!engineVersion) {
+    const yamlPath = join(project.root, 'sankofa.yaml');
+    if (existsSync(yamlPath)) {
+      const text = readFileSync(yamlPath, 'utf-8');
+      const m = text.match(/^\s*engine_version:\s*['"]?([\w.+-]+)['"]?\s*$/m);
+      if (m) engineVersion = m[1];
+    }
+  }
+  engineVersion = engineVersion || '3.44.0+sankofa-1';
+
+  const present = bundledFlutterInfo(engineVersion);
+  if (present.exists) {
+    console.log(chalk.dim(`     ✓ Bundled Flutter SDK present (${engineVersion})`));
+    return;
+  }
+
+  const spinner = ora(`  Installing Sankofa bundled Flutter SDK (${engineVersion})…`).start();
+  try {
+    installBundledFlutter(engineVersion, {
+      onProgress: (msg) => {
+        spinner.text = `  ${msg}`;
+      },
+    });
+    spinner.succeed(`  Bundled Flutter SDK ready (${engineVersion})`);
+  } catch (err: any) {
+    spinner.warn(`  Bundled Flutter install skipped: ${err.message}`);
+    console.log(chalk.dim('       Re-run `sankofa engine install` later.'));
+  }
+}
+
+/**
+ * Auto-add the Sankofa Flutter SDK to the project's pubspec.yaml. Returns
+ * true if the file was modified, false if we punted (e.g. couldn't find
+ * the `dependencies:` block — better to let the user `flutter pub add`
+ * than corrupt their pubspec).
+ */
+async function tryAddSankofaFlutterToPubspec(pubspecPath: string, chalk: any): Promise<boolean> {
+  try {
+    const text = readFileSync(pubspecPath, 'utf-8');
+    // Find the `dependencies:` block and inject sankofa_flutter under it.
+    // Match the bare key at start-of-line (not dev_dependencies).
+    const depsMatch = text.match(/^(dependencies:[ \t]*\n)((?:[ \t]+.*\n|\n)+?)(?=^[^ \t\n]|\Z)/m);
+    if (!depsMatch) {
+      return false;
+    }
+    // Use a path: dep pointing at the bundled SDK in the user's cache for
+    // dev workflows; once sankofa_flutter is on pub.dev we'll switch to
+    // a version constraint. The version comment makes the swap obvious.
+    const injected =
+      depsMatch[1] +
+      `  # Sankofa unified SDK (Analytics, Deploy, Catch, Switch, Config, Pulse).\n` +
+      `  # TODO: swap to a pub.dev version once published.\n` +
+      `  sankofa_flutter:\n` +
+      `    git:\n` +
+      `      url: https://github.com/Sankofa-HQ/sankofa_sdk_flutter.git\n` +
+      `      ref: main\n` +
+      depsMatch[2];
+    const next = text.replace(depsMatch[0], injected);
+    writeFileSync(pubspecPath, next);
+    console.log(chalk.green('     ✓ Added sankofa_flutter to pubspec.yaml (git ref)'));
+    console.log(chalk.dim('       Run `flutter pub get` to resolve.'));
+    return true;
+  } catch (err: any) {
+    console.log(chalk.yellow(`     ⚠ Could not auto-edit pubspec.yaml: ${err.message}`));
+    return false;
+  }
+}
+
+/**
  * Best-effort: download every Sankofa-built engine ABI for the
  * customer's Flutter version into `~/.sankofa/engines/`. Cache hits
  * are instant; cold cache means a one-time download (~150 MB per ABI
@@ -352,7 +441,7 @@ async function ensureFlutterEngineForInit(project: ProjectInfo, chalk: any): Pro
   let flutterVersion: string;
   try {
     const { detectFlutterEngineInfo } = await import('../utils/flutterBundler.js');
-    flutterVersion = detectFlutterEngineInfo().flutterVersion;
+    flutterVersion = detectFlutterEngineInfo(project.root).flutterVersion;
   } catch {
     console.log(chalk.yellow('     ⚠ `flutter` is not on PATH — skipping engine pre-fetch.'));
     console.log(chalk.dim('       Install Flutter, then run `sankofa engine download` manually.'));

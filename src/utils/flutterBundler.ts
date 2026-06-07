@@ -2,6 +2,7 @@ import { execSync } from 'child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'fs';
 import { createHash } from 'crypto';
 import { join, resolve } from 'path';
+import { resolveBundledFlutter } from './flutterBundleCache.js';
 
 export interface FlutterEngineInfo {
   flutterVersion: string;
@@ -9,6 +10,36 @@ export interface FlutterEngineInfo {
   engineRevision: string;
   /** What we send to the server as `engine_version`. e.g. "3.41.9+sankofa-1". */
   sankofaEngineVersion: string;
+}
+
+/**
+ * Resolve which `flutter` binary to invoke for the active project.
+ *
+ * Order, most specific first:
+ *   1. The Sankofa BUNDLED flutter at ~/.sankofa/flutter/<engine-version>/
+ *      (resolved from the project's sankofa.yaml engine_version)
+ *   2. The customer's own `flutter` on PATH (fallback for unconfigured
+ *      projects, doctor, etc.)
+ *
+ * The bundled-first policy is the same isolation pattern Shorebird uses
+ * — the customer's upstream Flutter dev loop is never touched, but
+ * everything Sankofa runs goes through our fork.
+ */
+export function resolveFlutterBinary(projectRoot?: string): string {
+  if (projectRoot) {
+    const bundled = resolveBundledFlutter(projectRoot);
+    if (bundled?.exists) {
+      return bundled.bin;
+    }
+  }
+  return 'flutter';
+}
+
+function flutterCmd(projectRoot: string | undefined, args: string): string {
+  const bin = resolveFlutterBinary(projectRoot);
+  // Quote if path has spaces (uncommon, but homedir on macOS can have spaces).
+  const quoted = /\s/.test(bin) ? `"${bin}"` : bin;
+  return `${quoted} ${args}`;
 }
 
 /**
@@ -23,13 +54,15 @@ export interface FlutterEngineInfo {
  * this by reading the embedded version string from the customer's
  * `libflutter.so`.
  */
-export function detectFlutterEngineInfo(): FlutterEngineInfo {
-  const out = execSync('flutter --version --machine', { encoding: 'utf-8' });
+export function detectFlutterEngineInfo(projectRoot?: string): FlutterEngineInfo {
+  const out = execSync(flutterCmd(projectRoot, '--version --machine'), { encoding: 'utf-8' });
   let parsed: any;
   try {
     parsed = JSON.parse(out);
   } catch {
-    parsed = parseFlutterVersionFallback(execSync('flutter --version', { encoding: 'utf-8' }));
+    parsed = parseFlutterVersionFallback(
+      execSync(flutterCmd(projectRoot, '--version'), { encoding: 'utf-8' }),
+    );
   }
   const flutterVersion = String(parsed.flutterVersion || parsed.version || 'unknown');
   const channel = String(parsed.channel || 'unknown');
@@ -165,12 +198,12 @@ export function buildFlutterAOT(
   mkdirSync(outputDir, { recursive: true });
 
   const appVersion = detectFlutterAppVersion(cwd);
-  const engine = detectFlutterEngineInfo();
+  const engine = detectFlutterEngineInfo(cwd);
 
   // Always build the APK (cheap when AAB build is also queued — Flutter
   // shares the build graph). We need it to extract libapp.so +
   // AndroidManifest + flutter_assets for Diff Guard.
-  const apkCmd = 'flutter build apk --release --target-platform android-arm64';
+  const apkCmd = flutterCmd(cwd, 'build apk --release --target-platform android-arm64');
   if (opts.verbose) console.log(`  $ ${apkCmd}`);
   execSync(apkCmd, { cwd, stdio: opts.verbose ? 'inherit' : 'pipe' });
 
@@ -178,7 +211,7 @@ export function buildFlutterAOT(
   // artifact for Play Console.
   let aabPath: string | null = null;
   if (format === 'aab') {
-    const aabCmd = 'flutter build appbundle --release --target-platform android-arm64';
+    const aabCmd = flutterCmd(cwd, 'build appbundle --release --target-platform android-arm64');
     if (opts.verbose) console.log(`  $ ${aabCmd}`);
     execSync(aabCmd, { cwd, stdio: opts.verbose ? 'inherit' : 'pipe' });
     aabPath = findAab(cwd);

@@ -68,10 +68,30 @@ export type KbcBuildOptions = {
 };
 
 /**
- * Locate the Flutter SDK's dart-sdk root. Walks up from `flutter` on PATH.
- * Throws if Flutter isn't installed or layout is unexpected.
+ * Locate the Flutter SDK's dart-sdk root. Prefers the Sankofa BUNDLED
+ * flutter at ~/.sankofa/flutter/<engine-version>/ (resolved from the
+ * project's sankofa.yaml engine_version) — falls back to `which flutter`
+ * for unconfigured projects.
+ *
+ * Throws if neither layout yields a valid dart-sdk path.
  */
-export function resolveFlutterDartSdk(): string {
+export function resolveFlutterDartSdk(projectRoot?: string): string {
+  // 1) Bundled flutter (Shorebird-style isolation).
+  if (projectRoot) {
+    try {
+      // Lazy require to avoid a circular import on flutterBundleCache.
+      const { resolveBundledFlutter } = require('./flutterBundleCache.js');
+      const bundled = resolveBundledFlutter(projectRoot);
+      if (bundled?.exists) {
+        const dartSdk = join(dirname(dirname(bundled.bin)), 'bin', 'cache', 'dart-sdk');
+        if (existsSync(dartSdk)) return dartSdk;
+      }
+    } catch {
+      // Fall through to PATH lookup.
+    }
+  }
+
+  // 2) Customer's flutter on PATH.
   let flutterBin: string;
   try {
     flutterBin = execFileSync('which', ['flutter'], { encoding: 'utf-8' }).trim();
@@ -106,7 +126,10 @@ export function buildKbcPatch(opts: KbcBuildOptions): KbcBuildResult {
     throw new Error(`Patch entry file must end in .dart: ${entryFile}`);
   }
 
-  const flutterDartSdk = opts.flutterDartSdk ?? resolveFlutterDartSdk();
+  // Resolve dart-sdk from the bundled flutter when this build is anchored
+  // to a project — falls back to PATH for standalone CLI invocations.
+  const flutterDartSdk =
+    opts.flutterDartSdk ?? resolveFlutterDartSdk(opts.entryFile ? dirname(resolve(opts.entryFile)) : undefined);
   const dartaotruntime = join(flutterDartSdk, 'bin', 'dartaotruntime');
   const snapshot = join(
     flutterDartSdk,

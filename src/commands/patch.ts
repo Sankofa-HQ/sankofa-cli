@@ -301,7 +301,7 @@ export async function flutterPatch(
   // in rare situations (e.g. test a hand-built engine).
   let engineInfo;
   try {
-    engineInfo = detectFlutterEngineInfo();
+    engineInfo = detectFlutterEngineInfo(project.root);
   } catch (err: any) {
     console.error(chalk.red(`  ✖ Could not detect Flutter engine: ${err.message}`));
     console.error(chalk.dim('     Is `flutter` on your PATH? Run `sankofa doctor` to verify.'));
@@ -591,7 +591,7 @@ async function flutterIosKbcPatch(project: ProjectInfo, opts: any) {
   // ── 1. Engine + environment + label ─────────────────────────────────
   let engineInfo;
   try {
-    engineInfo = detectFlutterEngineInfo();
+    engineInfo = detectFlutterEngineInfo(project.root);
   } catch (err: any) {
     console.error(chalk.red(`  ✖ Could not detect Flutter engine: ${err.message}`));
     console.error(chalk.dim('     Is `flutter` on your PATH? Run `sankofa doctor` to verify.'));

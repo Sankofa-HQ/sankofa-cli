@@ -16,6 +16,10 @@ import {
   tryEngineCacheHit,
 } from '../utils/engineCache.js';
 import { detectFlutterEngineInfo } from '../utils/flutterBundler.js';
+import {
+  installBundledFlutter,
+  bundledFlutterInfo,
+} from '../utils/flutterBundleCache.js';
 import { statSync } from 'fs';
 import { resolve as pathResolve } from 'path';
 
@@ -184,6 +188,127 @@ engineCommand
 
     console.log('');
     console.log(chalk.dim(`  Cache root: ${engineCacheRoot()}`));
+    console.log('');
+  });
+
+// ── sankofa engine install ─────────────────────────────────────────
+//
+// The "do everything for this engine version" command. Customers run this
+// once per Sankofa engine version on a fresh machine. It:
+//
+//   1. Clones the Sankofa-HQ/sankofa-flutter fork into
+//      ~/.sankofa/flutter/<version>/  (bundled SDK; customer's own
+//      `flutter` on PATH is untouched).
+//   2. Downloads every engine ABI artifact for that version into
+//      ~/.sankofa/engines/<flutter-version>/ via `engine download`.
+//
+// After this, `sankofa release` / `sankofa patch` / `sankofa preview`
+// all shell out to the bundled flutter at the version pinned by
+// sankofa.yaml's `engine_version`. The customer never has to think
+// about engine wiring again.
+engineCommand
+  .command('install [version]')
+  .description('Install the Sankofa bundled Flutter SDK + engine binaries for a version')
+  .option('--local-path <path>', 'Use a local sankofa-flutter checkout instead of cloning')
+  .option('--ref <branch|tag|sha>', 'Specific git ref to install (default: branch tracking the version)')
+  .option('--force', 'Re-clone / re-download even if already present')
+  .option('--skip-engines', 'Only install the bundled flutter SDK; skip the per-ABI engine download')
+  .action(async (version: string | undefined, opts) => {
+    const chalk = (await import('chalk')).default;
+    const ora = (await import('ora')).default;
+
+    // Resolve version: arg > env > default.
+    const resolved = version
+      || process.env.SANKOFA_ENGINE_VERSION
+      || '3.44.0+sankofa-1';
+
+    console.log('');
+    console.log(chalk.bold(`  Installing Sankofa engine ${resolved}`));
+    console.log('');
+
+    // Step 1: bundled flutter SDK.
+    const present = bundledFlutterInfo(resolved);
+    if (present.exists && !opts.force) {
+      console.log(`  ${chalk.green('✓')} Bundled flutter already present at ${chalk.dim(present.root)}`);
+    } else {
+      const spinner = ora('  Installing bundled flutter SDK…').start();
+      try {
+        const info = installBundledFlutter(resolved, {
+          reuseIfPresent: !opts.force,
+          localPath: opts.localPath,
+          ref: opts.ref,
+          onProgress: (msg) => {
+            spinner.text = `  ${msg}`;
+          },
+        });
+        spinner.succeed(`  Bundled flutter ready at ${chalk.dim(info.root)}`);
+      } catch (err: any) {
+        spinner.fail(`  Bundled flutter install failed: ${err.message}`);
+        process.exit(1);
+      }
+    }
+
+    // Step 2: per-ABI engine binaries (Android libflutter.so / iOS framework).
+    if (opts.skipEngines) {
+      console.log('');
+      console.log(chalk.dim('  (skipping engine binary download — --skip-engines)'));
+      console.log('');
+      return;
+    }
+
+    let knownEngines: KnownEngine[];
+    try {
+      knownEngines = await fetchKnownEngines({
+        sankofaEngineVersion: resolved,
+      });
+    } catch (err: any) {
+      console.error(chalk.yellow(`  ⚠ Could not reach the registry (${err.message}).`));
+      console.error(chalk.dim('     The bundled SDK is installed; run `sankofa engine download` later to pull engine binaries.'));
+      console.log('');
+      return;
+    }
+
+    if (knownEngines.length === 0) {
+      console.log(chalk.yellow(`  ⚠ Registry has no engines tagged ${resolved}.`));
+      console.log(chalk.dim('     Run `sankofa engine list` to inspect available versions.'));
+      console.log('');
+      return;
+    }
+
+    console.log('');
+    console.log(chalk.bold(`  Downloading ${knownEngines.length} engine binar${knownEngines.length === 1 ? 'y' : 'ies'}`));
+    console.log('');
+
+    for (const engine of knownEngines) {
+      const label = `${engine.target} ${engine.abi} (${formatBytesHuman(engine.size_bytes)})`;
+      const cached = !opts.force && tryEngineCacheHit(engine);
+      if (cached) {
+        console.log(`  ${chalk.green('✓')} ${label} — cached at ${chalk.dim(cached.path)}`);
+        continue;
+      }
+      const spinner = ora(`  ${label} — starting…`).start();
+      try {
+        let lastPercent = -1;
+        await downloadEngineIntoCache(engine, {
+          onProgress: (received, total) => {
+            const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+            if (pct !== lastPercent) {
+              lastPercent = pct;
+              spinner.text = `  ${label} — ${pct}%  ${formatBytesHuman(received)}/${formatBytesHuman(total)}`;
+            }
+          },
+        });
+        spinner.succeed(`  ${label} — downloaded`);
+      } catch (err: any) {
+        spinner.fail(`  ${label} — ${err.message}`);
+        process.exit(1);
+      }
+    }
+
+    console.log('');
+    console.log(chalk.green(`  ✓ Sankofa engine ${resolved} ready.`));
+    console.log(chalk.dim(`    Bundled flutter:  ~/.sankofa/flutter/${resolved}/`));
+    console.log(chalk.dim(`    Engine cache:     ${engineCacheRoot()}`));
     console.log('');
   });
 
