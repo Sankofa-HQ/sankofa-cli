@@ -1,4 +1,17 @@
-import { existsSync, mkdirSync, statSync, createWriteStream, renameSync, unlinkSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  statSync,
+  createWriteStream,
+  renameSync,
+  unlinkSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+  openSync,
+  readSync,
+  closeSync,
+} from 'fs';
 import { createHash } from 'crypto';
 import { homedir } from 'os';
 import { join, dirname } from 'path';
@@ -210,7 +223,6 @@ export function listCachedEngines(): EngineCacheEntry[] {
   const root = engineCacheRoot();
   if (!existsSync(root)) return [];
   const out: EngineCacheEntry[] = [];
-  const { readdirSync, readFileSync } = require('fs') as typeof import('fs');
 
   for (const fv of readdirSync(root, { withFileTypes: true })) {
     if (!fv.isDirectory()) continue;
@@ -238,7 +250,6 @@ export function listCachedEngines(): EngineCacheEntry[] {
 }
 
 function writeMeta(path: string, engine: KnownEngine): void {
-  const { writeFileSync } = require('fs') as typeof import('fs');
   writeFileSync(path, JSON.stringify(engine, null, 2), 'utf-8');
 }
 
@@ -251,7 +262,6 @@ function writeMeta(path: string, engine: KnownEngine): void {
  */
 export function sha256OfFile(path: string): string {
   const hash = createHash('sha256');
-  const { openSync, readSync, closeSync } = require('fs') as typeof import('fs');
   const fd = openSync(path, 'r');
   try {
     const buf = Buffer.alloc(64 * 1024);

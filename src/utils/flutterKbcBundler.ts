@@ -36,6 +36,7 @@
 import { execFileSync } from 'child_process';
 import { existsSync, statSync, readFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
+import { resolveBundledFlutter } from './flutterBundleCache.js';
 
 export type KbcBuildResult = {
   /** Absolute path to the produced .kbc file. */
@@ -78,16 +79,10 @@ export type KbcBuildOptions = {
 export function resolveFlutterDartSdk(projectRoot?: string): string {
   // 1) Bundled flutter (Shorebird-style isolation).
   if (projectRoot) {
-    try {
-      // Lazy require to avoid a circular import on flutterBundleCache.
-      const { resolveBundledFlutter } = require('./flutterBundleCache.js');
-      const bundled = resolveBundledFlutter(projectRoot);
-      if (bundled?.exists) {
-        const dartSdk = join(dirname(dirname(bundled.bin)), 'bin', 'cache', 'dart-sdk');
-        if (existsSync(dartSdk)) return dartSdk;
-      }
-    } catch {
-      // Fall through to PATH lookup.
+    const bundled = resolveBundledFlutter(projectRoot);
+    if (bundled?.exists) {
+      const dartSdk = join(dirname(dirname(bundled.bin)), 'bin', 'cache', 'dart-sdk');
+      if (existsSync(dartSdk)) return dartSdk;
     }
   }
 
