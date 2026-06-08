@@ -306,39 +306,36 @@ async function installDeployRN(project: ProjectInfo, endpoint: string, chalk: an
 async function installDeployFlutter(project: ProjectInfo, endpoint: string, chalk: any) {
   const result = patchFlutterNativeFiles(project.root, endpoint, chalk);
   const pubspecPath = join(project.root, 'pubspec.yaml');
-  const pubspecRaw = readFileSync(pubspecPath, 'utf-8');
-  // Match either the unified package (current) or the legacy Phase 7
-  // package (for projects mid-migration).
-  const hasSdk = pubspecRaw.includes('sankofa_flutter') || pubspecRaw.includes('sankofa_deploy');
 
   // 1. Auto-install bundled Flutter SDK + engine binaries when missing.
   await ensureBundledFlutterForInit(project, chalk);
 
   // 2. Pull per-ABI engine binaries (libflutter.so / Flutter.framework) so
   //    `sankofa release` later doesn't trip the "unknown engine" gate.
-  //    Best-effort: failures are non-fatal — clearer error appears at
-  //    release time with a `sankofa engine download` hint.
   await ensureFlutterEngineForInit(project, chalk);
 
-  // 3. Auto-add the SDK to pubspec.yaml when missing.
-  if (!hasSdk) {
-    const added = await tryAddSankofaFlutterToPubspec(pubspecPath, chalk);
-    if (!added) {
-      console.log(chalk.dim('     Install the unified runtime SDK manually:'));
-      console.log(chalk.cyan('       flutter pub add sankofa_flutter'));
-    }
-  } else {
-    console.log(chalk.dim('     ✓ sankofa_flutter already in pubspec.yaml'));
-  }
+  // 3. Vendor the dynamic_modules trampoline into <project>/.sankofa/
+  //    so customer's pubspec doesn't carry a GitHub URL. Adds the
+  //    dir to .gitignore so it isn't committed; team members re-run
+  //    `sankofa init` on first checkout to populate locally.
+  await ensureVendoredDynamicModules(project.root, chalk);
+
+  // 4. Add sankofa_flutter to pubspec.yaml + a managed
+  //    `dependency_overrides` stanza pointing at the vendored trampoline.
+  //    Wires sankofa.yaml into flutter.assets too. Idempotent.
+  await tryAddSankofaFlutterToPubspec(pubspecPath, chalk);
+
+  // 5. Create sankofa.yaml with placeholder values if missing.
+  tryCreateSankofaYaml(project.root, '', endpoint, chalk);
+
+  // 6. Inject the `registerLoader` + `preFlight` calls into lib/main.dart.
+  tryWireFlutterMainDart(project.root, chalk);
 
   console.log('');
-  console.log(chalk.dim('     Initialize in your main.dart:'));
-  console.log(chalk.cyan(`       await Sankofa.instance.init(
-         apiKey: 'YOUR_API_KEY',
-         endpoint: '${endpoint}',
-         enableDeploy: true,
-       );
-       await Sankofa.instance.deploy?.notifyAppReady();`));
+  console.log(chalk.green('     ✓ Sankofa Deploy wired into the project.'));
+  console.log(chalk.dim('       Open `sankofa.yaml` and replace the placeholders with your'));
+  console.log(chalk.dim('       project\'s api_key + app_id (see app.sankofa.dev → Settings → API Keys).'));
+  console.log(chalk.dim('       Then run `flutter pub get && flutter run`.'));
 
   if (!result.androidPatched && existsSync(join(project.root, 'android'))) {
     console.log('');
@@ -392,41 +389,351 @@ async function ensureBundledFlutterForInit(project: ProjectInfo, chalk: any): Pr
 }
 
 /**
- * Auto-add the Sankofa Flutter SDK to the project's pubspec.yaml. Returns
- * true if the file was modified, false if we punted (e.g. couldn't find
- * the `dependencies:` block — better to let the user `flutter pub add`
- * than corrupt their pubspec).
+ * Auto-add the Sankofa Flutter SDK + its transitive `dynamic_modules`
+ * git dep to the project's pubspec.yaml, and ensure `sankofa.yaml` is
+ * listed under `flutter.assets`. Idempotent — does nothing if the
+ * stanzas are already present. Returns true on any write.
+ *
+ * The two-dep setup is forced by pub.dev policy: published packages
+ * can't carry git/path deps, and `dynamic_modules` imports
+ * `dart:_internal` which pub.dev refuses outright. So sankofa_flutter
+ * ships hosted; the customer carries the VM binding alongside.
  */
-async function tryAddSankofaFlutterToPubspec(pubspecPath: string, chalk: any): Promise<boolean> {
-  try {
-    const text = readFileSync(pubspecPath, 'utf-8');
-    // Find the `dependencies:` block and inject sankofa_flutter under it.
-    // Match the bare key at start-of-line (not dev_dependencies).
-    const depsMatch = text.match(/^(dependencies:[ \t]*\n)((?:[ \t]+.*\n|\n)+?)(?=^[^ \t\n]|\Z)/m);
-    if (!depsMatch) {
+/**
+ * Clone the standalone `dynamic_modules` trampoline into
+ * `<project>/.sankofa/dynamic_modules/`. Adds `.sankofa/` to the
+ * project's `.gitignore`. Idempotent — re-running is a `git fetch +
+ * reset` to keep the local copy current. Returns true on any change.
+ *
+ * Why vendor at all: pub.dev refuses dart:_internal imports + git
+ * deps in published packages, so the binding can't ride inside
+ * sankofa_flutter or be a hosted pub package. Vendoring lets the
+ * customer's `pubspec.yaml` reference a local path via the standard
+ * `dependency_overrides` mechanism — no GitHub URL exposed in the
+ * file customer normally reads.
+ */
+async function ensureVendoredDynamicModules(projectRoot: string, chalk: any): Promise<boolean> {
+  const { execSync } = await import('child_process');
+  const ora = (await import('ora')).default;
+  const target = join(projectRoot, '.sankofa', 'dynamic_modules');
+  const repoUrl = 'https://github.com/Sankofa-HQ/sankofa-dart-sdk.git';
+  const refSpec = 'main';
+  const pathInRepo = 'standalone/dynamic_modules';
+
+  let needFetch = true;
+  if (existsSync(join(target, 'pubspec.yaml')) &&
+      existsSync(join(target, 'lib', 'dynamic_modules.dart'))) {
+    needFetch = false; // already vendored — leave alone
+  }
+
+  if (needFetch) {
+    const spinner = ora('  Vendoring dynamic_modules into .sankofa/…').start();
+    try {
+      const tmpDir = join(projectRoot, '.sankofa', '_clone-tmp');
+      // Clean any stale tmp.
+      try {
+        execSync(`rm -rf ${shellQuote(tmpDir)}`);
+      } catch {/* noop */}
+      // Clone a shallow copy of just main into the tmp dir.
+      execSync(
+        `git clone --depth 1 --branch ${shellQuote(refSpec)} --filter=blob:none --sparse ${shellQuote(repoUrl)} ${shellQuote(tmpDir)}`,
+        { stdio: 'ignore' },
+      );
+      // Sparse-checkout just the standalone subpath.
+      execSync(`git -C ${shellQuote(tmpDir)} sparse-checkout set ${shellQuote(pathInRepo)}`, {
+        stdio: 'ignore',
+      });
+      // Move the extracted subtree into place.
+      try {
+        execSync(`rm -rf ${shellQuote(target)}`);
+      } catch {/* noop */}
+      execSync(`mkdir -p ${shellQuote(target)}`);
+      execSync(`cp -R ${shellQuote(join(tmpDir, pathInRepo))}/. ${shellQuote(target)}/`);
+      execSync(`rm -rf ${shellQuote(tmpDir)}`);
+      spinner.succeed('  Vendored dynamic_modules → .sankofa/dynamic_modules/');
+    } catch (err: any) {
+      spinner.fail(`  Could not vendor dynamic_modules: ${err.message}`);
+      console.log(chalk.dim('       Falling back to a git ref in pubspec — see README.'));
       return false;
     }
-    // Use a path: dep pointing at the bundled SDK in the user's cache for
-    // dev workflows; once sankofa_flutter is on pub.dev we'll switch to
-    // a version constraint. The version comment makes the swap obvious.
-    const injected =
-      depsMatch[1] +
-      `  # Sankofa unified SDK (Analytics, Deploy, Catch, Switch, Config, Pulse).\n` +
-      `  # TODO: swap to a pub.dev version once published.\n` +
-      `  sankofa_flutter:\n` +
-      `    git:\n` +
-      `      url: https://github.com/Sankofa-HQ/sankofa_sdk_flutter.git\n` +
-      `      ref: main\n` +
-      depsMatch[2];
-    const next = text.replace(depsMatch[0], injected);
-    writeFileSync(pubspecPath, next);
-    console.log(chalk.green('     ✓ Added sankofa_flutter to pubspec.yaml (git ref)'));
-    console.log(chalk.dim('       Run `flutter pub get` to resolve.'));
-    return true;
+  } else {
+    console.log(chalk.dim('     ✓ dynamic_modules already vendored at .sankofa/dynamic_modules/'));
+  }
+
+  // Append to .gitignore so the vendor dir doesn't get committed.
+  const gitignorePath = join(projectRoot, '.gitignore');
+  let gitignore = existsSync(gitignorePath) ? readFileSync(gitignorePath, 'utf-8') : '';
+  if (!gitignore.split('\n').some((l) => l.trim() === '.sankofa/' || l.trim() === '.sankofa')) {
+    if (gitignore.length > 0 && !gitignore.endsWith('\n')) gitignore += '\n';
+    gitignore += '\n# Sankofa CLI-managed (regenerated by `sankofa init`).\n.sankofa/\n';
+    writeFileSync(gitignorePath, gitignore);
+    console.log(chalk.green('     ✓ Added .sankofa/ to .gitignore'));
+  }
+  return true;
+}
+
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+async function tryAddSankofaFlutterToPubspec(pubspecPath: string, chalk: any): Promise<boolean> {
+  try {
+    let text = readFileSync(pubspecPath, 'utf-8');
+    let touched = false;
+
+    // ── 1. Add sankofa_flutter under `dependencies:` ──
+    if (!text.includes('sankofa_flutter:')) {
+      const depsMatch = text.match(/^(dependencies:[ \t]*\n)((?:[ \t]+.*\n|\n)+?)(?=^[^ \t\n]|\Z)/m);
+      if (!depsMatch) {
+        console.log(chalk.yellow('     ⚠ pubspec.yaml has no `dependencies:` block — skipping'));
+      } else {
+        const injected =
+          depsMatch[1] +
+          `  # Sankofa unified SDK (Analytics, Deploy, Catch, Switch, Config, Pulse, Replay).\n` +
+          `  sankofa_flutter: ^0.2.1\n` +
+          depsMatch[2];
+        text = text.replace(depsMatch[0], injected);
+        touched = true;
+        console.log(chalk.green('     ✓ Added sankofa_flutter to pubspec.yaml'));
+      }
+    } else {
+      console.log(chalk.dim('     ✓ sankofa_flutter already in pubspec.yaml'));
+    }
+
+    // ── 2. Add the dependency_overrides stanza pointing at the
+    //       vendored trampoline. Customer SEES this block but doesn't
+    //       touch it — managed by `sankofa init`.
+    if (!/dependency_overrides:[\s\S]*?dynamic_modules:/.test(text)) {
+      const block =
+        `\n# Sankofa-managed — do not edit by hand. Re-run \`sankofa init\` if\n` +
+        `# you need to regenerate the vendored package.\n` +
+        `dependency_overrides:\n` +
+        `  dynamic_modules:\n` +
+        `    path: .sankofa/dynamic_modules\n`;
+      // Append to the END of the file (idempotent — the regex above
+      // already short-circuited if the block exists).
+      if (!text.endsWith('\n')) text += '\n';
+      text += block;
+      touched = true;
+      console.log(chalk.green('     ✓ Wired dependency_overrides → .sankofa/dynamic_modules'));
+    }
+
+    // ── 3. Ensure sankofa.yaml is in flutter.assets ──
+    if (!text.includes('sankofa.yaml')) {
+      const flutterMatch = text.match(/^(flutter:[ \t]*\n)((?:[ \t]+.*\n|\n)+?)(?=^[^ \t\n]|\Z)/m);
+      if (flutterMatch) {
+        const flutterBody = flutterMatch[2];
+        const assetsMatch = flutterBody.match(/^(\s+assets:[ \t]*\n)((?:\s+-.*\n)*)/m);
+        if (assetsMatch) {
+          const newAssets = assetsMatch[1] + assetsMatch[2] + '    - sankofa.yaml\n';
+          const newFlutterBody = flutterBody.replace(assetsMatch[0], newAssets);
+          text = text.replace(flutterMatch[0], flutterMatch[1] + newFlutterBody);
+        } else {
+          const newFlutterBody =
+            flutterBody +
+            `  assets:\n` +
+            `    - sankofa.yaml\n`;
+          text = text.replace(flutterMatch[0], flutterMatch[1] + newFlutterBody);
+        }
+        touched = true;
+        console.log(chalk.green('     ✓ Added sankofa.yaml to flutter.assets'));
+      } else {
+        console.log(chalk.yellow('     ⚠ pubspec.yaml has no `flutter:` block — skipping assets entry'));
+      }
+    }
+
+    if (touched) {
+      writeFileSync(pubspecPath, text);
+      console.log(chalk.dim('       Run `flutter pub get` to resolve.'));
+    }
+    return touched;
   } catch (err: any) {
     console.log(chalk.yellow(`     ⚠ Could not auto-edit pubspec.yaml: ${err.message}`));
     return false;
   }
+}
+
+/**
+ * Write `sankofa.yaml` to the project root with the supplied apiKey +
+ * endpoint. Does nothing if the file already exists (host-managed
+ * file, never clobber). Returns true when written.
+ */
+function tryCreateSankofaYaml(projectRoot: string, apiKey: string, endpoint: string, chalk: any): boolean {
+  const yamlPath = join(projectRoot, 'sankofa.yaml');
+  if (existsSync(yamlPath)) {
+    console.log(chalk.dim('     ✓ sankofa.yaml already exists — not overwriting'));
+    return false;
+  }
+  try {
+    const content =
+      `# Sankofa project config — read at runtime from the asset bundle.\n` +
+      `# Add this file to flutter.assets in pubspec.yaml (\`sankofa init\` did\n` +
+      `# that for you). The CLI writes engine_version + signing_pubkey here\n` +
+      `# when you run \`sankofa engine install\` / \`sankofa keys generate\`.\n` +
+      `# Customer code never edits this file by hand.\n` +
+      `\n` +
+      `app_id: ${apiKey.startsWith('sk_') ? '<your-app-id; sankofa init prompts for this>' : apiKey}\n` +
+      `api_key: ${apiKey || '<paste sk_live_* key from app.sankofa.dev>'}\n` +
+      (endpoint && endpoint !== 'https://api.sankofa.dev' ? `base_url: ${endpoint}\n` : ``);
+    writeFileSync(yamlPath, content);
+    console.log(chalk.green('     ✓ Created sankofa.yaml'));
+    return true;
+  } catch (err: any) {
+    console.log(chalk.yellow(`     ⚠ Could not create sankofa.yaml: ${err.message}`));
+    return false;
+  }
+}
+
+/**
+ * Inject `SankofaUpdater.registerLoader(loadModuleFromBytes)` +
+ * `await SankofaUpdater.preFlight()` into the project's lib/main.dart.
+ *
+ * Strategy:
+ *  1. Add the two `import` lines if missing.
+ *  2. Find `void main(` and check if it's already async — if not,
+ *     convert (`void main() {` → `Future<void> main() async {`).
+ *  3. Find the first statement (typically `runApp(...)`) and inject
+ *     our two lines before it, with `WidgetsFlutterBinding.ensureInitialized()`
+ *     if it's not already there.
+ *
+ * If main.dart's shape is unusual (no recognisable `main`, multiple
+ * declarations, etc.), print clear manual instructions instead of
+ * risking a corrupted file.
+ */
+function tryWireFlutterMainDart(projectRoot: string, chalk: any): boolean {
+  const mainPath = join(projectRoot, 'lib', 'main.dart');
+  if (!existsSync(mainPath)) {
+    console.log(chalk.dim('     ✓ lib/main.dart not found — skipping (apply the snippet from the cookbook manually)'));
+    return false;
+  }
+  try {
+    let src = readFileSync(mainPath, 'utf-8');
+
+    // Already wired? Bail.
+    if (src.includes('SankofaUpdater.preFlight')) {
+      console.log(chalk.dim('     ✓ lib/main.dart already calls SankofaUpdater.preFlight'));
+      return false;
+    }
+
+    // ── Add imports if missing ──
+    const importsToAdd: string[] = [];
+    if (!/import\s+['"]package:dynamic_modules\/dynamic_modules\.dart['"]/.test(src)) {
+      importsToAdd.push(`import 'package:dynamic_modules/dynamic_modules.dart';`);
+    }
+    if (!/import\s+['"]package:sankofa_flutter\/sankofa_flutter\.dart['"]/.test(src)) {
+      importsToAdd.push(`import 'package:sankofa_flutter/sankofa_flutter.dart';`);
+    }
+    if (importsToAdd.length > 0) {
+      // Find the last `import` line and append after it; else inject at top.
+      const importLines = [...src.matchAll(/^import\s+['"][^'"]+['"];$/gm)];
+      if (importLines.length > 0) {
+        const last = importLines[importLines.length - 1];
+        const insertAt = last.index! + last[0].length;
+        src = src.slice(0, insertAt) + '\n' + importsToAdd.join('\n') + src.slice(insertAt);
+      } else {
+        src = importsToAdd.join('\n') + '\n\n' + src;
+      }
+    }
+
+    // ── Locate main() and ensure it's async ──
+    // Patterns we accept:
+    //   void main() {...}
+    //   void main() async {...}
+    //   Future<void> main() async {...}
+    //   void main(List<String> args) async {...}
+    //   void main() => runApp(...);   ← arrow form, needs rewrite
+    const mainSig = /^(\s*)((?:Future<void>|void)\s+main\s*\([^)]*\))\s*(async\s*)?({|=>)/m;
+    const m = mainSig.exec(src);
+    if (!m) {
+      console.log(chalk.yellow('     ⚠ Could not find `main()` in lib/main.dart — wire it manually:'));
+      printManualMainSnippet(chalk);
+      writeFileSync(mainPath, src); // still save the import additions
+      return importsToAdd.length > 0;
+    }
+    const indent = m[1] || '';
+    const signature = m[2];
+    const wasAsync = !!m[3];
+    const opener = m[4];
+
+    let injectedBody: string;
+    if (opener === '=>') {
+      // Arrow form — find the expression up to `;`
+      const arrowMatch = src.slice(m.index).match(/^[^=>]*=>\s*([^;]+);/);
+      if (!arrowMatch) {
+        console.log(chalk.yellow('     ⚠ Unusual arrow `main()` — wire it manually:'));
+        printManualMainSnippet(chalk);
+        writeFileSync(mainPath, src);
+        return importsToAdd.length > 0;
+      }
+      const expr = arrowMatch[1].trim();
+      injectedBody =
+        `${indent}Future<void> main() async {\n` +
+        `${indent}  WidgetsFlutterBinding.ensureInitialized();\n` +
+        `${indent}  SankofaUpdater.registerLoader(loadModuleFromBytes);\n` +
+        `${indent}  await SankofaUpdater.preFlight();\n` +
+        `${indent}  ${expr};\n` +
+        `${indent}}`;
+      src = src.slice(0, m.index) + injectedBody + src.slice(m.index + arrowMatch[0].length);
+    } else {
+      // Block form — inject before the FIRST statement inside { }.
+      // Find the opening `{` index, then the first non-whitespace inside.
+      const blockStart = m.index + m[0].length - 1; // index of `{`
+      // Insert just after `{` and the following newline.
+      let cursor = blockStart + 1;
+      // Skip leading whitespace inside the block.
+      while (cursor < src.length && /[ \t]/.test(src[cursor])) cursor++;
+      // Find current first-line indent of the block body.
+      const nextNewline = src.indexOf('\n', cursor);
+      const firstStmtMatch = nextNewline >= 0
+        ? src.slice(nextNewline + 1).match(/^([ \t]*)/)
+        : null;
+      const bodyIndent = firstStmtMatch ? firstStmtMatch[1] : indent + '  ';
+
+      // Make signature async if it isn't already.
+      if (!wasAsync) {
+        // Mutate the function-signature region.
+        const sigRegion = src.slice(m.index, blockStart);
+        const newSig = sigRegion
+          .replace(/^(\s*)void\s+main\s*\(/, '$1Future<void> main(')
+          .replace(/\)\s*$/, ') async ');
+        src = src.slice(0, m.index) + newSig + src.slice(blockStart);
+      }
+
+      // Recompute block-start after sig mutation.
+      const m2 = mainSig.exec(src);
+      const blockStart2 = m2!.index + m2![0].length - 1;
+      const insertAt = blockStart2 + 1; // right after `{`
+      const ensureLine = src.slice(blockStart2).includes('ensureInitialized()')
+        ? ''
+        : `${bodyIndent}WidgetsFlutterBinding.ensureInitialized();\n`;
+      const inject =
+        `\n${ensureLine}` +
+        `${bodyIndent}SankofaUpdater.registerLoader(loadModuleFromBytes);\n` +
+        `${bodyIndent}await SankofaUpdater.preFlight();`;
+      src = src.slice(0, insertAt) + inject + src.slice(insertAt);
+    }
+
+    writeFileSync(mainPath, src);
+    console.log(chalk.green('     ✓ Wired SankofaUpdater into lib/main.dart'));
+    return true;
+  } catch (err: any) {
+    console.log(chalk.yellow(`     ⚠ Could not auto-edit lib/main.dart: ${err.message}`));
+    printManualMainSnippet(chalk);
+    return false;
+  }
+}
+
+function printManualMainSnippet(chalk: any): void {
+  console.log(chalk.dim('       Paste at the top of lib/main.dart\'s `main()`:\n'));
+  console.log(chalk.cyan(`         import 'package:dynamic_modules/dynamic_modules.dart';
+         import 'package:sankofa_flutter/sankofa_flutter.dart';
+
+         void main() async {
+           WidgetsFlutterBinding.ensureInitialized();
+           SankofaUpdater.registerLoader(loadModuleFromBytes);
+           await SankofaUpdater.preFlight();
+           runApp(const MyApp());
+         }`));
 }
 
 /**

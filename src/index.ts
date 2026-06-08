@@ -29,8 +29,8 @@ const program = new Command();
 
 program
   .name('sankofa')
-  .description('Sankofa Deploy — push OTA updates to your React Native apps')
-  .version('0.1.0');
+  .description('Sankofa CLI — one command to scaffold, ship, and verify Sankofa across Flutter, React Native, Web, iOS, and Android')
+  .version('0.2.0');
 
 program.addCommand(initCommand);
 program.addCommand(engineCommand);

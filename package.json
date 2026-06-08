@@ -1,26 +1,48 @@
 {
   "name": "sankofa-cli",
-  "version": "0.1.0",
-  "description": "Sankofa Deploy CLI — push OTA updates to your React Native apps",
+  "version": "0.2.0",
+  "description": "Sankofa CLI — one command to scaffold, ship, and verify Sankofa across Flutter, React Native, Web, iOS, and Android. Includes Sankofa Deploy (OTA patches), keys, doctor, release, and patch flows.",
   "bin": {
     "sankofa": "./dist/index.js"
   },
   "scripts": {
-    "build": "node --max-old-space-size=8192 ./node_modules/typescript/bin/tsc",
+    "build": "node --max-old-space-size=8192 ./node_modules/typescript/bin/tsc && chmod +x dist/index.js",
     "dev": "tsx src/index.ts",
     "prepublishOnly": "npm run build"
   },
   "type": "module",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "keywords": [
     "sankofa",
     "ota",
     "deploy",
+    "code-push",
+    "codepush",
+    "flutter",
     "react-native",
-    "codepush"
+    "expo",
+    "mobile",
+    "cli"
   ],
+  "author": "Sankofa-HQ",
   "license": "MIT",
+  "homepage": "https://sankofa.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sankofa-HQ/sankofa-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Sankofa-HQ/sankofa-cli/issues"
+  },
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {
     "chalk": "^5.3.0",
