@@ -1,12 +1,15 @@
 # Sankofa CLI
 
-The command-line tool for [Sankofa](https://sankofa.dev) — analytics, OTA updates, and crash reporting for mobile and web apps. One CLI to set up, verify, and ship across every platform Sankofa supports.
+The command-line tool for [Sankofa](https://sankofa.dev) — **OTA updates** for Flutter and React Native, plus analytics, error tracking, feature flags, and remote config across mobile and web. One CLI to set up, verify, and ship.
 
-**Deploy** — Ship JavaScript changes to your React Native / Expo apps without cutting a new native build. CodePush-style OTA with phased rollouts, auto-rollback, and a kill switch.
+**Sankofa Deploy** — Ship code changes to your already-released app without cutting a new native build.
 
-**Analytics** — Event tracking, session replays, heatmaps, and funnels. Works on React Native, Flutter, Web (npm and CDN), iOS (Swift), and Android (Kotlin).
+- **Flutter** — Dart kernel bytecode patches running inside the Sankofa-forked Flutter engine. App Store + Play Store compliant (Apple PLA § 3.3.2 + Google Play DNA interpreted-VM carve-out). No JIT entitlement.
+- **React Native / Expo** — JS bundle patches with phased rollouts, auto-rollback, and a kill switch.
 
-**Check** — Verify your SDK integration is correct across any platform before you ship.
+**Analytics + Catch + Switch + Config + Pulse + Replay** — Event tracking, session replays, heatmaps, crash reporting, feature flags, and remote config. Works on Flutter, React Native, Web (npm + CDN), iOS (Swift), and Android (Kotlin).
+
+**Verify before you ship** — `sankofa doctor` walks the full toolchain + integration; every failure shows the exact command to fix it.
 
 ---
 
@@ -47,11 +50,11 @@ The command-line tool for [Sankofa](https://sankofa.dev) — analytics, OTA upda
 
 | Command | Purpose | Platforms |
 |---|---|---|
-| `sankofa init` | Auto-detect platform, create `.sankofa.json`, patch native files (Expo plugin / bare RN / Flutter / iOS / Android / Web), update `.gitignore`. | All |
+| `sankofa init` | Auto-detect platform, create `.sankofa.json`, patch native files (Expo plugin / bare RN / Flutter / iOS / Android / Web), update `.gitignore`. Pass `--deploy` / `--catch` / `--flag` / `--config` / `--all` to skip the picker. Idempotent. | All |
 | `sankofa check` | Verify the full SDK integration — credentials, native wiring, initialization, tracking, server connectivity. Shows exactly what to fix. | All |
 | `sankofa check analytics` | Analytics-specific checks: SDK install, `init()`, API key, session replay, screen/event tracking, user identification. | All |
-| `sankofa check deploy` | Deploy-specific checks: bundle provider, Expo plugin, `notifyAppReady()`, `checkForUpdate()`. | React Native |
-| `sankofa doctor` | Diagnose the local toolchain (Node, Xcode, CocoaPods, Java, Android SDK, adb, altool) and server reachability. | React Native |
+| `sankofa check deploy` | Deploy-specific checks: bundle provider, Expo plugin, `notifyAppReady()`, `checkForUpdate()`. Defers to `sankofa doctor` on Flutter. | React Native + Flutter |
+| `sankofa doctor` | Diagnose the local toolchain (Node, Xcode, CocoaPods, Java, Android SDK, Flutter, adb, altool) and Sankofa Deploy native wiring (pubspec deps, sankofa.yaml, AndroidManifest + Info.plist meta-data, MainActivity + AppDelegate, bundled Sankofa Flutter SDK + engine cache). | All |
 
 ### Authentication
 
@@ -61,18 +64,40 @@ The command-line tool for [Sankofa](https://sankofa.dev) — analytics, OTA upda
 | `sankofa logout` | Remove stored credentials (project-scoped, global, or both). |
 | `sankofa switch` | Switch to a different project on the same server. Reuses the stored JWT — no browser round-trip. |
 
-### Deploy (React Native)
+### Deploy (Flutter + React Native)
+
+The same `release` / `patch` / `deploy` / `preview` / `status` commands cover both Flutter and React Native — the CLI detects the stack from your `pubspec.yaml` / `package.json` and runs the right pipeline. Flutter ships Dart kernel bytecode (KBC) patches; React Native ships JS bundles.
 
 | Command | Purpose |
 |---|---|
-| `sankofa release` | Build native + stage OTA archive + publish base release + produce signed store binary (`.ipa` / `.aab`). |
-| `sankofa patch` | Ship a JS+assets-only OTA patch against an existing base release. |
+| `sankofa release` | Build native + stage OTA archive + publish base release + produce signed store binary (`.ipa` / `.aab` / `.apk`). |
+| `sankofa patch` | Ship a code-only OTA patch — Dart bytecode (Flutter) or JS bundle (React Native) — against an existing base release. iOS Flutter uses the Sankofa engine's bytecode interpreter (no JIT entitlement required). |
+| `sankofa deploy` | Smart wrapper that picks `release` (first time) or `patch` (subsequent) automatically. |
 | `sankofa preview` | Download + install + launch a release on a simulator/emulator. Streams runtime logs. |
 | `sankofa status` | Read-only summary of all releases for the current project. |
 | `sankofa releases` | Manage base releases: `list`, `rollout`, `mandatory`, `kill`, `unkill`. |
 | `sankofa patches` | Manage patches: `list`, `rollout`, `mandatory`, `kill`, `unkill`. |
+| `sankofa rules` / `sankofa schedule` / `sankofa defaults` | Per-release gating, staged rollouts, project-wide deploy defaults. |
 | `sankofa dist` | Build ONLY the signed store binary. No Sankofa release is published. |
 | `sankofa submit` | Upload the signed binary to App Store Connect (iOS) or Play Console (Android). |
+
+### Flutter Deploy: keys + engine + KBC
+
+Flutter-only — these become relevant after `sankofa init --deploy`. The setup writes `.sankofa/flutter-version` (engine pin) and `sankofa.yaml` (project keys); the commands below read them automatically.
+
+| Command | Purpose |
+|---|---|
+| `sankofa keys generate` | Create an Ed25519 keypair for signing patches in this project. |
+| `sankofa keys show` / `path` / `register` | Print the public key, print the on-disk private-key path (back this up), POST the public key to the server. |
+| `sankofa engine list` / `download` / `install` | Manage the cached Sankofa-fork Flutter engine binaries. `install [version]` brings down the bundled SDK + every engine ABI in one shot. |
+| `sankofa engine verify` / `path` | Re-hash every cached engine against the registry; print the cache root. |
+| `sankofa kbc build` / `wrap` / `inspect` | Low-level Dart kernel bytecode tools. Most customers never run these — `sankofa release` and `sankofa patch` orchestrate them. |
+
+### Keeping the stack fresh
+
+| Command | Purpose |
+|---|---|
+| `sankofa update` | Refresh everything Sankofa knows about — CLI itself, bundled Sankofa Flutter SDK, engine cache, project SDK. Pass `--check` for a dry-run. |
 | `sankofa upgrade` | Check npm for a newer `sankofa-cli` and install it. |
 
 Every command that hits the server short-circuits with a clean "you are not logged in" message when credentials are missing — no stray prompts before the auth check.
@@ -83,15 +108,15 @@ Every command that hits the server short-circuits with a clean "you are not logg
 
 `sankofa init` and `sankofa check` auto-detect the platform from the project root:
 
-| Platform | Detection | SDK Package | `init` does | `check analytics` validates |
+| Platform | Detection | SDK Package | `init --deploy` does | Deploy support |
 |---|---|---|---|---|
-| **React Native (Expo)** | `expo` in package.json | `sankofa-react-native` | Adds config plugin to app.json | SDK, init, API key, replay, `useSankofaScreen()`, events |
-| **React Native (bare)** | `react-native` in package.json | `sankofa-react-native` | Patches `MainApplication.kt` + `AppDelegate.swift` | Same as Expo |
-| **Flutter** | `pubspec.yaml` exists | `sankofa_flutter` | Creates config, shows Dart setup | SDK, `Sankofa.instance.init()`, replay, `SankofaNavigatorObserver`, events, identify |
-| **Web (npm)** | `react`/`next`/`vue`/`vite` in package.json | `@sankofa/browser` | Creates config, shows import setup | SDK, `Sankofa.init()`, API key, replay plugin, events, identify, page tracking |
-| **Web (CDN)** | `index.html` exists, no package.json | `@sankofa/browser` (CDN) | Creates config, shows `<script>` setup | CDN script tag, `Sankofa.init()`, `SankofaReplay`, events, identify, screen |
-| **iOS (Swift)** | `Package.swift` exists | `SankofaIOS` (SPM/CocoaPods) | Creates config, shows SPM setup | SPM/Pod dep, `Sankofa.shared.initialize()`, `.sankofaScreen()`, events, identify |
-| **Android (Kotlin)** | `app/build.gradle` exists | `dev.sankofa.sdk:sankofa-android` | Creates config, shows Gradle setup | Gradle dep, `Sankofa.init()`, `@SankofaScreen`, events, identify |
+| **Flutter** | `pubspec.yaml` exists | `sankofa_flutter` (pub.dev) | Adds `sankofa_flutter` + `dependency_overrides:` for `dynamic_modules`, creates `sankofa.yaml` with `app_id` pre-filled, vendors the binding into `.sankofa/`, wires `lib/main.dart` with `SankofaUpdater.registerLoader` + `preFlight`, adds Sankofa meta-data to `AndroidManifest.xml` + `Info.plist`, rewrites `MainActivity.kt` + `AppDelegate.swift` to extend the Sankofa base classes. | ✅ Dart bytecode patches via Sankofa-forked engine interpreter (iOS + Android). |
+| **React Native (Expo)** | `expo` in package.json | `sankofa-react-native` | Adds config plugin to app.json | ✅ JS bundle patches. |
+| **React Native (bare)** | `react-native` in package.json | `sankofa-react-native` | Patches `MainApplication.kt` + `AppDelegate.swift` | ✅ JS bundle patches. |
+| **Web (npm)** | `react`/`next`/`vue`/`vite` in package.json | `@sankofa/browser` | Creates config, shows import setup | Analytics only. |
+| **Web (CDN)** | `index.html` exists, no package.json | `@sankofa/browser` (CDN) | Creates config, shows `<script>` setup | Analytics only. |
+| **iOS (Swift)** | `Package.swift` exists | `SankofaIOS` (SPM/CocoaPods) | Creates config, shows SPM setup | Analytics + Catch + Switch + Config. |
+| **Android (Kotlin)** | `app/build.gradle` exists | `dev.sankofa.sdk:sankofa-android` | Creates config, shows Gradle setup | Analytics + Catch + Switch + Config. |
 
 ---
 
@@ -131,26 +156,49 @@ Requirements:
 
 ## Quickstart
 
-### Any platform (Analytics)
+### Flutter (Analytics + Deploy)
 
 ```bash
-# 1. Set up the project.
-sankofa init
-
-# 2. Log in.
+# 1. Log in (one-time).
 sankofa login
 
-# 3. Verify everything is wired up.
-sankofa check
+# 2. From your Flutter project root — scaffolds everything in ~30s.
+sankofa init --deploy
 
-# Done. Events flow to your Sankofa dashboard.
+# 3. Open sankofa.yaml and paste your sk_live_* api_key.
+
+# 4. Verify the full setup.
+sankofa doctor
+
+# 5. Build + ship.
+flutter pub get
+flutter run                            # baseline build, on iPhone or Android device
+
+# 6. Ship the first base release.
+sankofa release android
+sankofa release ios
+
+# 7. After a code change, ship a Dart-only OTA patch:
+sankofa patch android
+sankofa patch ios                      # iOS Path C — bytecode interpreter, no JIT entitlement
 ```
+
+What `sankofa init --deploy` writes (all idempotent — safe to re-run):
+
+- `pubspec.yaml`: `sankofa_flutter: ^0.2.1` + a `dependency_overrides:` block pointing at `.sankofa/dynamic_modules` (the VM-binding helper is vendored locally — no GitHub URL in your file).
+- `sankofa.yaml`: project keys, with `app_id` pre-filled from your login session.
+- `.sankofa/`: vendored `dynamic_modules` trampoline + `flutter-version` pin (auto-added to `.gitignore`).
+- `lib/main.dart`: imports `dynamic_modules` + `sankofa_flutter`, injects `WidgetsFlutterBinding.ensureInitialized()` + `SankofaUpdater.registerLoader(loadModuleFromBytes)` + `await SankofaUpdater.preFlight()` into `main()`.
+- `android/app/src/main/AndroidManifest.xml`: `INTERNET` permission + Sankofa `<meta-data>` keys.
+- `android/.../MainActivity.kt`: extends `SankofaFlutterActivity`.
+- `ios/Runner/AppDelegate.swift`: extends `SankofaFlutterAppDelegate`.
+- `ios/Runner/Info.plist`: Sankofa `com.sankofa.appId` + `com.sankofa.endpoint` keys.
 
 ### React Native (Analytics + Deploy)
 
 ```bash
 # 1. Set up — auto-patches native files + adds Expo plugin.
-sankofa init
+sankofa init --deploy
 
 # 2. Log in.
 sankofa login
@@ -168,6 +216,21 @@ sankofa patch ios
 # 6. Need to rebuild JUST the signed binary?
 sankofa dist ios
 sankofa submit ios
+```
+
+### Any platform (Analytics only)
+
+```bash
+# 1. Set up the project (no Deploy wiring).
+sankofa init --catch                   # or --all for every product
+
+# 2. Log in.
+sankofa login
+
+# 3. Verify everything is wired up.
+sankofa check
+
+# Done. Events flow to your Sankofa dashboard.
 ```
 
 ---
@@ -209,13 +272,20 @@ Resolution order (highest wins):
 
 ### `init`
 
-Set up Sankofa in any project. Auto-detects the platform and does the right thing.
+Set up Sankofa in any project. Auto-detects the platform and does the right thing. Idempotent — re-running on an already-configured project skips each step that's already in place.
 
 ```bash
-sankofa init                             # auto-detect platform, create config
+sankofa init                             # interactive product picker
+sankofa init --deploy                    # install Sankofa Deploy (OTA)
+sankofa init --catch                     # install Sankofa Catch (errors)
+sankofa init --flag                      # install Sankofa Switch (feature flags)
+sankofa init --config                    # install Sankofa Config
+sankofa init --all                       # install every product available for this stack
 sankofa init --endpoint https://api.sankofa.dev --project-id proj_...
 sankofa init --force                     # overwrite existing .sankofa.json
 ```
+
+For **Flutter** projects, `sankofa init --deploy` does the full setup automatically — see the [Flutter quickstart above](#flutter-analytics--deploy) for the file-by-file breakdown.
 
 **What it does per platform:**
 

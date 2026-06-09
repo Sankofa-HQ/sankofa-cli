@@ -26,6 +26,17 @@ type CheckResult = {
   detail: string;
 };
 
+// A module-level announcer the `check` / `checkAsync` helpers call
+// before running a probe. Set by `sankofa doctor` to update its
+// spinner with "Checking <name>…" so users see live progress even
+// while a slow `execSync('flutter --version')` blocks. No-op by
+// default so non-spinner callers (tests, programmatic use) aren't
+// affected.
+let announcer: ((label: string) => void) | null = null;
+export function setSpinnerAnnouncer(fn: ((label: string) => void) | null): void {
+  announcer = fn;
+}
+
 export const doctorCommand = new Command('doctor')
   .description('Diagnose the local toolchain + Sankofa integration across all installed products')
   .option('--project <path>', 'Project root (defaults to cwd)')
@@ -36,8 +47,20 @@ export const doctorCommand = new Command('doctor')
   .option('--all', 'Run checks for every available product (default when no product flags)')
   .action(async (opts) => {
     const chalk = (await import('chalk')).default;
+    const ora = (await import('ora')).default;
 
     const results: CheckResult[] = [];
+
+    // The previous implementation ran every check synchronously and
+    // buffered results, printing them only at the end. The
+    // `flutter --version` shell-out alone takes 3-8s on a cold Dart
+    // cache, so users sat in front of a blank terminal and assumed
+    // the CLI was hung. Wrap the whole sweep in one spinner that
+    // narrates the in-flight check.
+    const spinner = ora({ text: 'Running diagnostics…', spinner: 'dots' }).start();
+    setSpinnerAnnouncer((label) => {
+      spinner.text = label;
+    });
 
     // 1. Universal toolchain checks (always run).
     results.push(check('Node.js', () => {
@@ -135,6 +158,10 @@ export const doctorCommand = new Command('doctor')
         return { status: 'fail', detail: `${endpoint} — ${err.message}` };
       }
     }));
+
+    // All checks are done — stop the spinner before printing the report.
+    spinner.stop();
+    setSpinnerAnnouncer(null);
 
     // 6. Print results.
     const pad = Math.max(...results.map((r) => r.name.length));
@@ -592,6 +619,7 @@ function androidToolchainChecks(cwd: string): CheckResult[] {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function check(name: string, fn: () => { status: CheckResult['status']; detail: string }): CheckResult {
+  if (announcer) announcer(`Checking ${name}…`);
   try {
     const { status, detail } = fn();
     return { name, status, detail };
@@ -604,6 +632,7 @@ async function checkAsync(
   name: string,
   fn: () => Promise<{ status: CheckResult['status']; detail: string }>,
 ): Promise<CheckResult> {
+  if (announcer) announcer(`Checking ${name}…`);
   try {
     const { status, detail } = await fn();
     return { name, status, detail };

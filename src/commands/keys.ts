@@ -291,6 +291,8 @@ keysCommand
       pubkey_b64: key.publicKeyB64,
       description: opts.description || `Registered via sankofa-cli on ${new Date().toISOString()}`,
     };
+    const ora = (await import('ora')).default;
+    const spinner = ora(`Registering pubkey with ${auth.endpoint}…`).start();
     let res: Response;
     try {
       res = await fetch(url, {
@@ -303,17 +305,17 @@ keysCommand
         body: JSON.stringify(body),
       });
     } catch (err: any) {
-      console.error(chalk.red(`  ✖ POST ${url} failed: ${err.message}`));
+      spinner.fail(`POST ${url} failed: ${err.message}`);
       process.exit(1);
     }
     if (!res.ok) {
       const text = await res.text();
-      console.error(chalk.red(`  ✖ Server rejected (HTTP ${res.status}): ${text}`));
+      spinner.fail(`Server rejected (HTTP ${res.status}): ${text}`);
       process.exit(1);
     }
     const out = (await res.json()) as any;
+    spinner.succeed('Pubkey registered with server');
     console.log('');
-    console.log(chalk.green('  ✔ Pubkey registered with server'));
     console.log(`     Key ID:      ${chalk.cyan(out.signing_key?.id)}`);
     console.log(`     Project:     ${projectId}`);
     console.log(`     Environment: ${opts.env || 'live'}`);

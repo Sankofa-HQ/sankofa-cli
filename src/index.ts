@@ -30,7 +30,7 @@ const program = new Command();
 program
   .name('sankofa')
   .description('Sankofa CLI — one command to scaffold, ship, and verify Sankofa across Flutter, React Native, Web, iOS, and Android')
-  .version('0.1.0');
+  .version('0.1.1');
 
 program.addCommand(initCommand);
 program.addCommand(engineCommand);

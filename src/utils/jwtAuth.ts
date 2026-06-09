@@ -98,7 +98,39 @@ export async function jwtFetch<T = unknown>(
     'Content-Type': 'application/json',
     ...((init.headers as Record<string, string>) || {}),
   };
-  const res = await fetch(url, { ...init, headers });
+  // Show a deferred "Talking to server…" spinner. It only renders if
+  // the request takes longer than 200ms — fast endpoints stay silent,
+  // slow ones surface live progress so the CLI never *looks* hung. The
+  // spinner is the same import (ora) used elsewhere; lazy-loaded so
+  // unit tests that bypass network calls don't pay for it.
+  let spinner: any = null;
+  let spinnerTimer: NodeJS.Timeout | null = null;
+  if (process.stdout.isTTY && !process.env.SANKOFA_CLI_SUPPRESS_SPINNER) {
+    spinnerTimer = setTimeout(async () => {
+      try {
+        const ora = (await import('ora')).default;
+        spinner = ora({ text: `  Talking to ${auth.endpoint}…`, spinner: 'dots' }).start();
+      } catch {
+        /* spinner is a nicety, not a contract */
+      }
+    }, 200);
+  }
+  const finalizeSpinner = (ok: boolean, msg?: string) => {
+    if (spinnerTimer) clearTimeout(spinnerTimer);
+    if (spinner) {
+      if (ok) spinner.stop();
+      else spinner.fail(msg ?? '  Request failed');
+      spinner = null;
+    }
+  };
+
+  let res: Response;
+  try {
+    res = await fetch(url, { ...init, headers });
+  } catch (err: any) {
+    finalizeSpinner(false, `  ${err.message ?? 'network error'}`);
+    throw err;
+  }
   const text = await res.text();
   let body: any;
   try {
@@ -107,6 +139,7 @@ export async function jwtFetch<T = unknown>(
     body = null;
   }
   if (!res.ok) {
+    finalizeSpinner(false, `  ${res.status} from ${url}`);
     // The server returns "Invalid token" for expired + bad-sig + bad-
     // shape JWTs alike. All three have the same user-facing fix, so we
     // collapse them into a single actionable message.
@@ -118,5 +151,6 @@ export async function jwtFetch<T = unknown>(
     const message = (body && (body.error || body.message)) || `HTTP ${res.status}`;
     throw new Error(message);
   }
+  finalizeSpinner(true);
   return body as T;
 }
