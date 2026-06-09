@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { execSync } from 'child_process';
@@ -79,6 +79,96 @@ export interface InstallBundledFlutterOptions {
 }
 
 /**
+ * Returns true when the bundled SDK's dart-sdk cache is fully populated
+ * (i.e. the dart executable exists at the standard path). Used to decide
+ * whether a warm-up is needed.
+ */
+function isDartSdkUsable(root: string): boolean {
+  const dart = join(root, 'bin', 'cache', 'dart-sdk', 'bin', 'dart');
+  try {
+    return statSync(dart).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Force the bundled Flutter SDK to download + extract its dart-sdk
+ * cache. This is what the first invocation of `bin/flutter` does
+ * implicitly via `update_dart_sdk.sh`, but invoking it here turns the
+ * one-time ~30s pause + ~80 MB network fetch into a visible step of
+ * `sankofa init --deploy` (with a clear "first-time bootstrap" label)
+ * instead of a confusing silent pause inside the first
+ * `sankofa release` / `sankofa patch`.
+ *
+ * If the warm-up fails (network blip, restrictive proxy, mid-download
+ * SIGINT, etc.), wipe any half-populated dart-sdk + stamp state so the
+ * next `sankofa init --deploy` rerun starts from a clean slate instead
+ * of relying on a stamp file that lies about what's on disk.
+ */
+function warmDartSdkCache(root: string, onProgress?: (msg: string) => void): void {
+  if (isDartSdkUsable(root)) {
+    return;
+  }
+  onProgress?.('Warming Dart SDK cache (first-time bootstrap, ~30 s)…');
+  const bin = join(root, 'bin', 'flutter');
+  try {
+    execSync(`${shellQuote(bin)} --version`, {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        FLUTTER_SUPPRESS_ANALYTICS: 'true',
+        // We don't want analytics popups + we don't want this to update the
+        // user's normal flutter cache (FLUTTER_ROOT scopes the invocation).
+        FLUTTER_ROOT: root,
+      },
+    });
+  } catch (err: any) {
+    // Wipe the partial state so the customer can re-run init and get a
+    // clean download. Without this, the broken stamp files convince
+    // shared.sh "dart-sdk is fresh, no need to redownload" — and every
+    // subsequent flutter invocation fails the same way.
+    cleanDartSdkCache(root);
+    throw new Error(
+      `Sankofa bundled Flutter dart-sdk bootstrap failed: ${err?.message ?? err}\n` +
+        `Re-run \`sankofa init --deploy\` once network/proxy access is available.`,
+    );
+  }
+  if (!isDartSdkUsable(root)) {
+    cleanDartSdkCache(root);
+    throw new Error(
+      'Sankofa bundled Flutter dart-sdk bootstrap completed but produced no usable `dart` ' +
+        'binary. Re-run `sankofa init --deploy` to retry.',
+    );
+  }
+}
+
+/**
+ * Remove every artifact the dart-sdk download writes, so the next warm-up
+ * fully redownloads instead of trusting a stale stamp.
+ */
+function cleanDartSdkCache(root: string): void {
+  const cacheDir = join(root, 'bin', 'cache');
+  for (const name of [
+    'dart-sdk',
+    'engine-dart-sdk.stamp',
+    'engine.stamp',
+    'engine.realm',
+    'engine_stamp.json',
+    'engine_stamp.stamp',
+    'flutter_tools.stamp',
+    'flutter_tools.snapshot',
+  ]) {
+    try {
+      rmSync(join(cacheDir, name), { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+}
+
+
+/**
  * Install the Sankofa Flutter fork at the requested version into the
  * bundled cache. Returns the resulting BundledFlutterInfo.
  *
@@ -96,6 +186,10 @@ export function installBundledFlutter(
 
   if (reuse && info.exists) {
     opts.onProgress?.(`Bundled flutter already present at ${info.root}`);
+    // Even on a cache hit, force the dart-sdk warm-up if the previous
+    // run's bootstrap didn't complete (interrupted download, manual
+    // cleanup, etc). Idempotent: no-op when dart-sdk is already usable.
+    warmDartSdkCache(info.root, opts.onProgress);
     return info;
   }
 
@@ -149,6 +243,13 @@ export function installBundledFlutter(
       2,
     ),
   );
+
+  // Force the first-run dart-sdk download NOW (during init), not later
+  // (during the customer's first release/patch). If anything goes wrong
+  // — bad network, restrictive proxy, Ctrl-C during download — this
+  // surfaces immediately with a clear "rerun init" message instead of
+  // silently corrupting the cache for next time.
+  warmDartSdkCache(root, opts.onProgress);
 
   return bundledFlutterInfo(sankofaEngineVersion);
 }
