@@ -46,7 +46,7 @@ engineCommand
   .description('Show cached engines + everything available in the registry')
   .option('--flutter-version <version>', 'Filter to one Flutter version')
   .option('--target <android|ios>', 'Filter to one target platform')
-  .option('--modified-only', 'Only show Phase 3+ Sankofa-modified engines')
+  .option('--modified-only', 'Only show Sankofa-modified engine builds')
   .action(async (opts) => {
     const chalk = (await import('chalk')).default;
     let known: KnownEngine[];

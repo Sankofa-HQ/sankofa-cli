@@ -63,7 +63,7 @@ export const releaseCommand = new Command('release')
   .option('--upload-mapping <path>', 'Upload Android ProGuard/R8 mapping.txt for this release')
   .option('--upload-ndk <path>', 'Upload Android NDK symbols for this release (directory of .so files)')
   .option('--upload-dart-symbols <path>', 'Upload Flutter/Dart symbol bundle for this release')
-  .option('--dry-run', 'Build + capture Diff Guard baseline locally, but do NOT contact the server or upload')
+  .option('--dry-run', 'Build + capture the local safety-check baseline, but do NOT contact the server or upload')
   .option('--apk', 'Android: produce an APK (sideload-installable). Default is --appbundle. (RN + Flutter)')
   .option('--appbundle', 'Android: produce an AAB (Play Store). This is the default. (RN + Flutter)')
   .action(async (platformArg: string | undefined, opts) => {
@@ -574,7 +574,7 @@ export async function flutterRelease(
         console.log(chalk.dim(`       ${formatBytes(built.libflutterSizeBytes)}`));
         console.log('');
         console.log(chalk.dim('     Publishing this release would crash every customer device on patch'));
-        console.log(chalk.dim('     download — Flutter Code patches require the Sankofa engine fork.'));
+        console.log(chalk.dim('     download — Flutter patches require the Sankofa-customized Flutter engine.'));
         console.log('');
         console.log(chalk.bold('  Fix:'));
         console.log(chalk.dim(`     1. Install the Sankofa engine for your Flutter version:`));
@@ -586,7 +586,7 @@ export async function flutterRelease(
       }
       if (!known.is_modified) {
         trustSpinner.warn(
-          `libflutter.so is a Sankofa baseline (vanilla ${known.flutter_version}) — Flutter Code patches won't load on devices running it.`,
+          `Bundled Flutter engine is a vanilla baseline (${known.flutter_version}) — patches won't load on devices running it.`,
         );
         console.log(chalk.yellow(
           `     ⚠ This engine is a vanilla Flutter baseline (no \`+sankofa-N\` modifications).`,
@@ -649,7 +649,7 @@ export async function flutterRelease(
   // 3. Capture the Diff Guard baseline snapshot. Done BEFORE the upload
   //    so we never have a published release without a corresponding
   //    on-disk baseline.
-  const baselineSpinner = ora('Capturing Diff Guard baseline...').start();
+  const baselineSpinner = ora('Capturing safety-check baseline...').start();
   const libappSha = computeSHA256(built.libappPath);
   const baselineManifest: BaselineManifest = {
     version: 1,
@@ -681,8 +681,8 @@ export async function flutterRelease(
   console.log(chalk.dim(`  Label:            ${label}`));
   console.log(chalk.dim(`  Engine version:   ${engineVersion}`));
   console.log(chalk.dim(`  Target binary:    ${appVersion}`));
-  console.log(chalk.dim(`  libapp.so SHA256: ${libappSha}`));
-  console.log(chalk.dim(`  libapp.so size:   ${formatBytes(libappSize)}`));
+  console.log(chalk.dim(`  SHA256:           ${libappSha}`));
+  console.log(chalk.dim(`  Size:             ${formatBytes(libappSize)}`));
 
   // 4. --dry-run: stop here, baseline is captured, nothing to upload.
   if (opts.dryRun) {
@@ -703,7 +703,7 @@ export async function flutterRelease(
     }
     console.log('');
     console.log(chalk.dim('     Baseline saved to .sankofa/baseline/'));
-    console.log(chalk.dim('     Future `sankofa patch` runs will Diff-Guard against this snapshot.'));
+    console.log(chalk.dim('     Future `sankofa patch` runs will safety-check against this snapshot.'));
     console.log(chalk.dim('     Re-run without --dry-run to publish the release to Sankofa.'));
     console.log('');
     return;
@@ -716,7 +716,7 @@ export async function flutterRelease(
       {
         type: 'confirm',
         name: 'confirm',
-        message: `Publish ${chalk.bold(label)} as the Flutter Code baseline for ${chalk.bold(appVersion)}?`,
+        message: `Publish ${chalk.bold(label)} as the Flutter baseline for ${chalk.bold(appVersion)}?`,
         default: true,
       },
     ]);
@@ -728,24 +728,24 @@ export async function flutterRelease(
     return;
   }
 
-  // 5. Upload as runtime=flutter-code, no base release — this IS the base.
-  const uploadSpinner = ora('Uploading libapp.so to Sankofa...').start();
+  // No base release yet — this IS the base.
+  const uploadSpinner = ora('Uploading release to Sankofa…').start();
   try {
     const release = await uploadRelease(built.libappPath, {
       label,
       target_binary_version: appVersion,
       platform,
-      description: opts.description || `Flutter Code baseline ${label}`,
+      description: opts.description || `Flutter baseline ${label}`,
       is_mandatory: opts.mandatory || false,
       rollout_percentage: rollout,
       environment,
       runtime: 'flutter-code',
       engine_version: engineVersion,
     });
-    uploadSpinner.succeed('libapp.so uploaded');
+    uploadSpinner.succeed('Release uploaded.');
 
     console.log('');
-    console.log(chalk.green.bold('  🚀 Flutter Code baseline released'));
+    console.log(chalk.green.bold('  🚀 Flutter baseline released'));
     console.log(chalk.dim(`     Label:           ${release.label}`));
     console.log(chalk.dim(`     Runtime:         ${release.runtime}`));
     console.log(chalk.dim(`     Engine:          ${release.engine_version}`));
@@ -780,7 +780,7 @@ export async function flutterRelease(
 
     console.log('');
     console.log(chalk.dim('  Future hot-patches: ') + chalk.cyan('sankofa patch'));
-    console.log(chalk.dim('  Diff Guard will refuse patches that change AndroidManifest, flutter_assets, or add new native bindings.'));
+    console.log(chalk.dim('  The patch safety check refuses anything that changes AndroidManifest, native assets, or adds new native bindings.'));
     console.log('');
   } catch (err: any) {
     uploadSpinner.fail(`Upload failed: ${err.message}`);

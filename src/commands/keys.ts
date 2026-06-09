@@ -190,7 +190,7 @@ keysCommand
     console.log(`       ${chalk.cyan(`deploySigningPubkey: '${rawPubB64}',`)}`);
     console.log(`     ${chalk.cyan(`);`)}`);
     console.log('');
-    console.log(chalk.dim('  Subsequent `sankofa patch` runs will sign every envelope.'));
+    console.log(chalk.dim('  Subsequent `sankofa patch` runs will sign every patch with this key.'));
     console.log(chalk.dim('  The SDK rejects any patch whose signature doesn\'t verify against this pubkey.'));
     console.log('');
     console.log(chalk.yellow('  ⚠  Back up the private key file before changing machines.'));
@@ -252,7 +252,7 @@ keysCommand
 // but doesn't verify them — only the host app's embedded pubkey gates.
 keysCommand
   .command('register')
-  .description('Register the local pubkey with the server so it verifies envelope signatures at upload time')
+  .description('Register the local public key with the server so it verifies patch signatures at upload time')
   .option('--project <projectId>', 'Project ID (defaults to .sankofa.json)')
   .option('--env <environment>', 'Environment to enroll the key for (default: live)', 'live')
   .option('--description <desc>', 'Human label so dashboards / audits can identify this key')
@@ -321,6 +321,6 @@ keysCommand
     console.log(`     Environment: ${opts.env || 'live'}`);
     console.log(`     Algorithm:   ${out.signing_key?.algorithm}`);
     console.log('');
-    console.log(chalk.dim('  Server will now verify every uploaded envelope against this key.'));
-    console.log(chalk.dim('  Unsigned uploads + uploads signed by a non-enrolled key are rejected at the gate.'));
+    console.log(chalk.dim('  Server will now verify every uploaded patch against this key.'));
+    console.log(chalk.dim('  Unsigned uploads + uploads signed by a non-enrolled key are rejected.'));
   });

@@ -39,13 +39,13 @@ export const patchCommand = new Command('patch')
   .option('--env <environment>', 'Target environment: live or test')
   .option('--project <path>', 'Project root (defaults to auto-detect)')
   .option('--engine-version <version>', 'Flutter: override the detected engine version (rare)')
-  // ── iOS Path C (KBC interpreter) — sub-phase γ → β.4 → δ ──────────────────
-  .option('--label <label>', 'iOS Path C: label override (default kbc-ios-YYYYMMDDhhmmss)')
-  .option('--target-binary-version <semver>', 'iOS Path C: target host app version (default 1.0.0)', '1.0.0')
-  .option('--engine-commit <sha>', 'iOS Path C: Sankofa engine fork commit baked into envelope metadata')
-  .option('--dart-version <semver>', 'iOS Path C: Dart SDK version baked into envelope metadata')
-  .option('--dynamic-interface <yaml>', 'iOS Path C: dynamic_interface.yaml path (default ./sankofa/dynamic_interface.yaml if present)')
-  .option('--dry-run', 'Build + run Diff Guard locally, but do NOT contact the server or upload')
+  // iOS patch options (Flutter only — RN ignores these).
+  .option('--label <label>', 'Flutter iOS: label override (default sankofa-ios-YYYYMMDDhhmmss)')
+  .option('--target-binary-version <semver>', 'Flutter iOS: target host app version (default 1.0.0)', '1.0.0')
+  .option('--engine-commit <sha>', 'Flutter iOS: Sankofa Flutter engine commit baked into patch metadata')
+  .option('--dart-version <semver>', 'Flutter iOS: Dart SDK version baked into patch metadata')
+  .option('--dynamic-interface <yaml>', 'Flutter iOS: dynamic_interface.yaml path (default ./sankofa/dynamic_interface.yaml if present)')
+  .option('--dry-run', 'Build + run the safety check locally, but do NOT contact the server or upload')
   .action(async (platformArg: string | undefined, opts: any) => {
     const chalk = (await import('chalk')).default;
 
@@ -330,7 +330,7 @@ export async function flutterPatch(
     };
     console.log(chalk.dim(`  · Using local baseline ${selectedRelease.label} (--dry-run, no server)`));
   } else {
-    const spinner = ora('Fetching Flutter Code releases...').start();
+    const spinner = ora('Fetching Flutter releases...').start();
     let baseReleases: any[];
     try {
       releases = await listReleases(environment, platform);
@@ -344,10 +344,10 @@ export async function flutterPatch(
     }
 
     if (baseReleases.length === 0) {
-      spinner.fail(`No Flutter Code base releases found. Run ${chalk.cyan('sankofa release')} first.`);
+      spinner.fail(`No Flutter releases found. Run ${chalk.cyan('sankofa release')} first.`);
       process.exit(1);
     }
-    spinner.succeed(`Found ${baseReleases.length} Flutter Code base release(s)`);
+    spinner.succeed(`Found ${baseReleases.length} Flutter release(s).`);
 
     if (baseReleases.length === 1) {
       selectedRelease = baseReleases[0];
@@ -368,10 +368,10 @@ export async function flutterPatch(
     }
   }
 
-  // Build the APK and extract libapp.so (plus AndroidManifest + flutter_assets
-  // for Diff Guard comparison).
+  // Build the APK and extract the Flutter binary (plus AndroidManifest
+  // + flutter_assets for the safety-check comparison).
   console.log('');
-  const buildSpinner = ora(`Building Flutter APK and extracting libapp.so (engine ${engineVersion})...`).start();
+  const buildSpinner = ora(`Building Flutter APK (engine ${engineVersion})...`).start();
   let built;
   try {
     built = buildFlutterAOT(project.root, {
@@ -379,23 +379,24 @@ export async function flutterPatch(
       keepApk: false,
       verbose: false,
     });
-    buildSpinner.succeed(`Built libapp.so (${formatBytes(statSync(built.libappPath).size)})`);
+    buildSpinner.succeed(`Build complete (${formatBytes(statSync(built.libappPath).size)})`);
   } catch (err: any) {
     buildSpinner.fail(`Flutter build failed: ${err.message}`);
     process.exit(1);
   }
 
-  // ── Diff Guard ──
+  // ── Patch safety check ──
   // Refuse the patch if anything outside the OTA-eligible scope changed
-  // since the baseline. See compliance-posture.md §5.
+  // since the baseline (AndroidManifest, native assets, new native
+  // bindings).
   if (hasBaseline(project.root)) {
-    const diffSpinner = ora('Running Diff Guard...').start();
+    const diffSpinner = ora('Running patch safety check...').start();
     const outcome = runFlutterDiffGuard({
       projectRoot: project.root,
       apkContentsDir: built.apkContentsDir || '',
     });
     if (outcome.refusals.length > 0) {
-      diffSpinner.fail(`Diff Guard refused this patch (${outcome.refusals.length} blocker${outcome.refusals.length === 1 ? '' : 's'}).`);
+      diffSpinner.fail(`Safety check refused this patch (${outcome.refusals.length} blocker${outcome.refusals.length === 1 ? '' : 's'}).`);
       console.log('');
       for (const f of outcome.refusals) {
         console.log(chalk.red(`  ✖ ${f.label}`));
@@ -410,24 +411,24 @@ export async function flutterPatch(
         }
         console.log('');
       }
-      console.log(chalk.dim('  See docs/compliance-posture.md §5 for the full list of guarded changes.'));
+      console.log(chalk.dim('  Patches can only change Dart code — not native config, manifests, or assets.'));
       process.exit(1);
     }
     if (outcome.warnings.length > 0) {
-      diffSpinner.succeed(`Diff Guard passed with ${outcome.warnings.length} warning(s)`);
+      diffSpinner.succeed(`Safety check passed with ${outcome.warnings.length} warning(s)`);
       for (const f of outcome.warnings) {
         console.log(chalk.yellow(`  ! ${f.label}: ${f.detail.split('\n')[0]}`));
         console.log(chalk.dim(`     → ${f.remedy}`));
       }
     } else {
-      diffSpinner.succeed('Diff Guard passed — Dart-only change');
+      diffSpinner.succeed('Safety check passed — Dart-only change');
     }
   } else {
     // No baseline yet. This is the case where the dev never ran
     // `sankofa release` for this project, OR they're patching against
     // a baseline they've since deleted. We can't enforce; warn loudly
     // and proceed.
-    console.log(chalk.yellow(`  ! No Diff Guard baseline at .sankofa/baseline/ — skipping safety check.`));
+    console.log(chalk.yellow(`  ! No baseline at .sankofa/baseline/ — skipping safety check.`));
     console.log(chalk.dim(`     Run \`sankofa release\` to capture a baseline so future patches are guarded.`));
   }
 
@@ -455,7 +456,7 @@ export async function flutterPatch(
   if (opts.dryRun) {
     console.log('');
     console.log(chalk.green.bold('  ✓ Dry-run complete'));
-    console.log(chalk.dim('     Diff Guard passed; patch would be safe to publish.'));
+    console.log(chalk.dim('     Safety check passed; patch would be safe to publish.'));
     console.log(chalk.dim('     Re-run without --dry-run when the server is reachable.'));
     console.log('');
     return;
@@ -520,13 +521,13 @@ export async function flutterPatch(
     return;
   }
 
-  const uploadSpinner = ora('Uploading libapp.so to Sankofa...').start();
+  const uploadSpinner = ora('Uploading patch to Sankofa...').start();
   try {
     const release = await uploadRelease(built.libappPath, {
       label,
       target_binary_version: selectedRelease.target_binary_version,
       platform,
-      description: opts.description || `Flutter Code patch for ${selectedRelease.label}`,
+      description: opts.description || `Flutter patch for ${selectedRelease.label}`,
       is_mandatory: isMandatory,
       rollout_percentage: rollout,
       environment,
@@ -534,9 +535,9 @@ export async function flutterPatch(
       engine_version: engineVersion,
     });
 
-    uploadSpinner.succeed('libapp.so uploaded!');
+    uploadSpinner.succeed('Patch uploaded.');
     console.log('');
-    console.log(chalk.green.bold('  🩹 Flutter Code patch published'));
+    console.log(chalk.green.bold('  🩹 Flutter patch published'));
     console.log(chalk.dim(`     Label:           ${release.label}`));
     console.log(chalk.dim(`     Runtime:         ${release.runtime}`));
     console.log(chalk.dim(`     Engine:          ${release.engine_version}`));
@@ -651,19 +652,17 @@ async function flutterIosKbcPatch(project: ProjectInfo, opts: any) {
       outputPath: kbcPath,
       validateYaml: dynamicInterface,
     });
-    buildSpinner.succeed(
-      `KBC built (${buildResult.sizeBytes} B, magic ${buildResult.magic})`,
-    );
+    buildSpinner.succeed(`Patch compiled (${buildResult.sizeBytes} B).`);
   } catch (err: any) {
-    buildSpinner.fail(`KBC build failed: ${err.message}`);
+    buildSpinner.fail(`Patch compile failed: ${err.message}`);
     process.exit(1);
   }
 
-  // ── 4. β.4: wrap envelope ───────────────────────────────────────────
-  const wrapSpinner = ora('Wrapping envelope…').start();
+  // Wrap the compiled patch into a signed envelope.
+  const wrapSpinner = ora('Packaging patch…').start();
   const meta: KbcEnvelopeMetadata = {
     label,
-    description: opts.description || `iOS Path C patch from ${entryFile}`,
+    description: opts.description || `Flutter iOS patch from ${entryFile}`,
     engineCommit: opts.engineCommit,
     dartVersion: opts.dartVersion,
     targetBinaryVersion,
@@ -690,35 +689,27 @@ async function flutterIosKbcPatch(project: ProjectInfo, opts: any) {
         : undefined,
     });
     writeFileSync(envelopePath, envelopeBytes);
-    const signedNote = signingKey ? ' (Ed25519-signed)' : ' (unsigned)';
+    const signedNote = signingKey ? ' (signed)' : ' (unsigned)';
     wrapSpinner.succeed(
-      `Envelope wrapped${signedNote} (${envelopeBytes.length} B → ${envelopePath})`,
+      `Patch packaged${signedNote} (${envelopeBytes.length} B).`,
     );
   } catch (err: any) {
-    wrapSpinner.fail(`Wrap failed: ${err.message}`);
+    wrapSpinner.fail(`Packaging failed: ${err.message}`);
     process.exit(1);
   }
 
-  // ── 5. δ: upload to server ──────────────────────────────────────────
+  // Upload to server.
   if (opts.dryRun) {
     console.log('');
     console.log(chalk.yellow.bold('  --dry-run set — skipping upload.'));
-    console.log(chalk.dim(`     Envelope at:     ${envelopePath}`));
+    console.log(chalk.dim(`     Patch file:      ${envelopePath}`));
     console.log(chalk.dim(`     Label:           ${label}`));
     console.log(chalk.dim(`     Engine:          ${engineVersion}`));
     console.log(chalk.dim(`     Rollout:         ${initialRollout}%`));
-    console.log(chalk.dim('     Push manually:'));
-    console.log(chalk.dim(
-      `       xcrun devicectl device copy to --device <udid> \\\n` +
-      `         --domain-type appDataContainer \\\n` +
-      `         --domain-identifier <bundle-id> \\\n` +
-      `         --source ${envelopePath} \\\n` +
-      `         --destination 'Documents/sankofa-deploy/patches/active/patch.skdp'`,
-    ));
     return;
   }
 
-  const uploadSpinner = ora(`Uploading ${envelopeBytes.length} B envelope to server…`).start();
+  const uploadSpinner = ora(`Uploading patch to server…`).start();
   try {
     const release = await uploadRelease(envelopePath, {
       label,
@@ -731,9 +722,9 @@ async function flutterIosKbcPatch(project: ProjectInfo, opts: any) {
       runtime: 'flutter-code',
       engine_version: engineVersion,
     });
-    uploadSpinner.succeed('Envelope uploaded!');
+    uploadSpinner.succeed('Patch uploaded.');
     console.log('');
-    console.log(chalk.green.bold('  🚀 iOS Path C patch published'));
+    console.log(chalk.green.bold('  🚀 iOS patch published'));
     console.log(chalk.dim(`     ID:              ${release.id}`));
     console.log(chalk.dim(`     Label:           ${release.label}`));
     console.log(chalk.dim(`     Object key:      ${release.bundle_object_key}`));
@@ -744,11 +735,8 @@ async function flutterIosKbcPatch(project: ProjectInfo, opts: any) {
     console.log('');
     console.log(
       chalk.dim(
-        'Until in-app fetch lands (η v1), pull the bundle via\n' +
-        `  curl -H "Authorization: Bearer $TOKEN" -H "x-project-id: $PROJECT" \\\n` +
-        `       ${process.env.SANKOFA_ENDPOINT || ''}/api/v1/deploy/releases/${release.id} \\\n` +
-        '    | jq -r .download_url | xargs curl -o /tmp/patch.skdp\n' +
-        'then push to the device via xcrun devicectl device copy to.',
+        'Devices in this rollout will fetch the patch on their next launch via\n' +
+        '`SankofaUpdater.checkForUpdate()` and apply it transparently.',
       ),
     );
   } catch (err: any) {

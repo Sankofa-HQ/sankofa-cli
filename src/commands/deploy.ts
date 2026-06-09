@@ -32,7 +32,7 @@ export const deployCommand = new Command('deploy')
   .option('--engine-version <version>', 'Flutter: override the detected engine version (rare)')
   .option('--apk', 'Flutter Android: produce an APK when releasing (default is --appbundle)')
   .option('--appbundle', 'Flutter Android: produce an AAB when releasing (default)')
-  .option('--dry-run', 'Build + Diff Guard locally; do NOT contact server or upload')
+  .option('--dry-run', 'Build + safety check locally; do NOT contact server or upload')
   .action(async (platformArg: string | undefined, opts: any) => {
     const chalk = (await import('chalk')).default;
 

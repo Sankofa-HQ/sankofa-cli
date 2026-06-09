@@ -30,7 +30,7 @@ const program = new Command();
 program
   .name('sankofa')
   .description('Sankofa CLI — one command to scaffold, ship, and verify Sankofa across Flutter, React Native, Web, iOS, and Android')
-  .version('0.1.1');
+  .version('0.1.2');
 
 program.addCommand(initCommand);
 program.addCommand(engineCommand);
@@ -60,9 +60,11 @@ program.addCommand(configCommand);
 // Sankofa Catch — error tracking
 program.addCommand(catchCommand);
 program.addCommand(demoCommand);
-// γ — Sankofa Deploy: Flutter Code KBC patch producer (iOS Path C).
-program.addCommand(kbcCommand);
-// v2 envelopes — Ed25519 signing key management.
+// Advanced low-level patch tooling — hidden from `sankofa --help`
+// because `sankofa patch` orchestrates these steps already. Still
+// callable via `sankofa kbc <subcommand>` for power users / CI.
+program.addCommand(kbcCommand, { hidden: true });
+// Ed25519 signing key management.
 program.addCommand(keysCommand);
 
 program.parse();

@@ -36,11 +36,16 @@ import {
   type KbcEnvelopeMetadata,
 } from '../utils/flutterKbcEnvelope.js';
 
+// Advanced patch tooling. Hidden from `sankofa --help` because 99%
+// of customers should use `sankofa patch` instead — these are the
+// low-level build/wrap/inspect steps `patch` orchestrates internally.
+// Still callable as `sankofa kbc <subcommand>` for power users and
+// CI scripts that need fine-grained control.
 export const kbcCommand = new Command('kbc')
-  .description('Sankofa Deploy: Flutter Code — KBC bytecode patch tools')
+  .description('Advanced: low-level Flutter patch tooling (compile, package, inspect)')
   .addCommand(
     new Command('build')
-      .description('Compile a Dart entry-point file into a .kbc patch')
+      .description('Compile a Dart entry-point file into a Sankofa patch')
       .option(
         '-e, --entry-file <file>',
         'Dart entry-point file (single @pragma("dyn-module:entry-point") fn)',
@@ -119,29 +124,27 @@ export const kbcCommand = new Command('kbc')
         const elapsedMs = Date.now() - startedAt;
 
         console.log('');
-        console.log(chalk.bold('─── Sankofa KBC patch built ───'));
-        console.log(`  Entry file       ${entryFile}`);
+        console.log(chalk.bold('─── Patch compiled ───'));
+        console.log(`  Entry file         ${entryFile}`);
         console.log(
           `  Dynamic interface  ${
             result.validatedAgainst ?? chalk.dim('(none — patch may only use language primitives)')
           }`,
         );
-        console.log(`  Output           ${result.outputPath}`);
-        console.log(`  Size             ${result.sizeBytes} bytes`);
+        console.log(`  Output             ${result.outputPath}`);
+        console.log(`  Size               ${result.sizeBytes} bytes`);
         console.log(
-          `  Magic            ${result.magic} ${
-            result.magicOk
-              ? chalk.green('✓ DBC3')
-              : chalk.red('✗ EXPECTED 33434244')
+          `  Format check       ${
+            result.magicOk ? chalk.green('✓ ok') : chalk.red('✗ mismatch')
           }`,
         );
-        console.log(`  Flutter dart-sdk ${result.flutterDartSdk}`);
-        console.log(`  Build time       ${elapsedMs} ms`);
+        console.log(`  Flutter SDK        ${result.flutterDartSdk}`);
+        console.log(`  Build time         ${elapsedMs} ms`);
         console.log('');
         if (!result.magicOk) {
           console.error(
             chalk.red(
-              '  ✖ Output magic mismatch — produced file is not a valid KBC. Aborting.',
+              '  ✖ Format check failed — produced file is not a valid Sankofa patch. Aborting.',
             ),
           );
           process.exit(1);
@@ -151,30 +154,18 @@ export const kbcCommand = new Command('kbc')
         console.log(chalk.bold('Next steps:'));
         console.log(
           chalk.dim(
-            `  • For manual device test (current β.3 workflow):\n` +
-              `      xcrun devicectl device copy to --device <udid> \\\n` +
-              `        --domain-type appDataContainer \\\n` +
-              `        --domain-identifier <your-bundle-id> \\\n` +
-              `        --source ${result.outputPath} \\\n` +
-              `        --destination 'Documents/sankofa-deploy/patches/active/patch.kbc'\n`,
-          ),
-        );
-        console.log(
-          chalk.dim(
-            `  • To produce a transport-ready envelope (β.4), pipe through:\n` +
+            `  • Package + ship in one command:\n` +
+              `      sankofa patch ios\n` +
+              `  • Or, to package manually for later upload:\n` +
               `      sankofa kbc wrap -i ${result.outputPath} -o patch.skdp \\\n` +
-              `        --label 'my-patch-v1' --rollout 100\n` +
-              `  • Server upload + signed envelope (signing in v2) land via\n` +
-              `    \`sankofa patch ios\` once δ ships. Track in ROADMAP.`,
+              `        --label 'my-patch-v1' --rollout 100`,
           ),
         );
       }),
   )
   .addCommand(
     new Command('wrap')
-      .description(
-        'Wrap a raw .kbc into a signed-capable SANKOFA_KBC_ENVELOPE (β.4)',
-      )
+      .description('Package a compiled patch into a signed-capable upload artifact')
       .requiredOption('-i, --input <file>', 'Path to raw .kbc input')
       .requiredOption(
         '-o, --output <file>',
@@ -222,13 +213,11 @@ export const kbcCommand = new Command('kbc')
           kbcBytes[3] !== 0x44
         ) {
           console.error(
-            chalk.red(
-              `  ✖ Input doesn't look like a raw KBC (magic 33 43 42 44 = DBC3).`,
-            ),
+            chalk.red(`  ✖ Input is not a Sankofa-compiled patch.`),
           );
           console.error(
             chalk.dim(
-              `     If it's already an envelope, use \`sankofa kbc inspect\` instead.`,
+              `     If it's already a packaged patch, use \`sankofa kbc inspect\` instead.`,
             ),
           );
           process.exit(1);
@@ -275,15 +264,15 @@ export const kbcCommand = new Command('kbc')
         writeFileSync(outputPath, envelope);
 
         console.log('');
-        console.log(chalk.bold('─── Sankofa patch envelope produced ───'));
-        console.log(`  Source KBC       ${inputPath} (${kbcBytes.length} B)`);
-        console.log(`  Envelope         ${outputPath}`);
-        console.log(`  Envelope size    ${envelope.length} B`);
-        console.log(`  Envelope version v${ENVELOPE_VERSION} (unsigned)`);
+        console.log(chalk.bold('─── Patch packaged ───'));
+        console.log(`  Source patch     ${inputPath} (${kbcBytes.length} B)`);
+        console.log(`  Output           ${outputPath}`);
+        console.log(`  Output size      ${envelope.length} B`);
+        console.log(`  Format version   v${ENVELOPE_VERSION} (unsigned)`);
         console.log(`  Metadata         ${JSON.stringify(meta)}`);
         console.log('');
         console.log(
-          chalk.green('  ✅ Envelope ready. ') +
+          chalk.green('  ✅ Packaged patch ready. ') +
             chalk.dim(
               `Inspect any time: ${chalk.cyan(`sankofa kbc inspect ${outputPath}`)}`,
             ),
@@ -292,8 +281,8 @@ export const kbcCommand = new Command('kbc')
   )
   .addCommand(
     new Command('inspect')
-      .description('Parse + print a SANKOFA_KBC_ENVELOPE for debugging')
-      .argument('<file>', 'Path to envelope (.skdp)')
+      .description('Parse + print a packaged Sankofa patch for debugging')
+      .argument('<file>', 'Path to packaged patch (.skdp)')
       .option('--show-sha', 'Print full payload sha256 hex (default: short prefix)')
       .action(async (file: string, opts: any) => {
         const chalk = (await import('chalk')).default;
@@ -324,14 +313,14 @@ export const kbcCommand = new Command('kbc')
 
         console.log(chalk.bold(`─── ${inputPath} ───`));
         console.log(`  File size          ${fileSize} B`);
-        console.log(`  Envelope version   v${parsed.envelopeVersion}`);
+        console.log(`  Format version     v${parsed.envelopeVersion}`);
         console.log(`  Flags              0x${parsed.flags.toString(16).padStart(4, '0')}`);
-        console.log(`  KBC payload        ${parsed.kbcLength} B`);
+        console.log(`  Patch payload      ${parsed.kbcLength} B`);
         console.log(
           `  Payload sha-256    ${shaShown} ${
             parsed.payloadShaValid
               ? chalk.green('✓')
-              : chalk.red('✗ MISMATCH — TAMPERED OR CORRUPT')
+              : chalk.red('✗ MISMATCH — tampered or corrupt')
           }`,
         );
         console.log(`  Metadata size      ${parsed.metaLength} B`);
@@ -367,6 +356,6 @@ export const kbcCommand = new Command('kbc')
           );
           process.exit(1);
         }
-        console.log(chalk.green('  ✅ Envelope verified — safe to load.'));
+        console.log(chalk.green('  ✅ Patch verified — safe to load.'));
       }),
   );

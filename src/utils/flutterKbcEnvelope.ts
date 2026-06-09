@@ -143,7 +143,7 @@ export function wrapKbc(opts: WrapOptions): Buffer {
     );
   }
   if (sigAlg === 1 && !opts.signer) {
-    throw new Error('Envelope sig_alg=1 (Ed25519) requires opts.signer.');
+    throw new Error('Signed patch packaging requires a signer (key).');
   }
 
   const kbcPayload = Buffer.from(opts.kbcPayload);
@@ -265,7 +265,7 @@ export function parseKbcEnvelope(input: Uint8Array): ParsedEnvelope {
   try {
     metadata = JSON.parse(metaBytes.toString('utf-8'));
   } catch (err: any) {
-    throw new Error(`KBC envelope metadata JSON malformed: ${err.message}`);
+    throw new Error(`Patch metadata is malformed: ${err.message}`);
   }
 
   // Trailer.

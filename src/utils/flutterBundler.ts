@@ -244,7 +244,11 @@ export function buildFlutterAOT(
 
   const libappInExtract = join(extractDir, 'lib', 'arm64-v8a', 'libapp.so');
   if (!existsSync(libappInExtract)) {
-    throw new Error(`libapp.so not found in extracted APK at ${libappInExtract}`);
+    throw new Error(
+      `Flutter binary not found in the built APK.\n` +
+      `This usually means the Flutter build did not produce an AOT binary — ` +
+      `check the build output for errors.`,
+    );
   }
   const libflutterInExtract = join(extractDir, 'lib', 'arm64-v8a', 'libflutter.so');
   if (!existsSync(libflutterInExtract)) {
