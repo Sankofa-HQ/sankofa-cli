@@ -405,12 +405,16 @@ function sankofaFlutterDeployChecks(cwd: string): CheckResult[] {
       const manifestPath = join(cwd, 'android', 'app', 'src', 'main', 'AndroidManifest.xml');
       if (!existsSync(manifestPath)) return { status: 'skip', detail: 'no AndroidManifest.xml' };
       const text = readFileSync(manifestPath, 'utf-8');
-      if (text.includes('com.sankofa.deploy.app_id')) {
+      // Accept either the new short keys (`com.sankofa.appId` +
+      // `com.sankofa.endpoint`) written by `sankofa init`, or the
+      // legacy long key, so doctor doesn't false-flag projects from
+      // either era.
+      if (text.includes('com.sankofa.appId') || text.includes('com.sankofa.deploy.app_id')) {
         return { status: 'ok', detail: 'meta-data present' };
       }
       return {
         status: 'warn',
-        detail: 'no <meta-data android:name="com.sankofa.deploy.app_id" /> — engine will fall back to sankofa.yaml asset',
+        detail: 'no <meta-data android:name="com.sankofa.appId" /> — engine will fall back to sankofa.yaml asset',
       };
     }));
   }
@@ -419,12 +423,14 @@ function sankofaFlutterDeployChecks(cwd: string): CheckResult[] {
       const plistPath = join(cwd, 'ios', 'Runner', 'Info.plist');
       if (!existsSync(plistPath)) return { status: 'skip', detail: 'no ios/Runner/Info.plist' };
       const text = readFileSync(plistPath, 'utf-8');
-      if (text.includes('SankofaDeployAppId')) {
-        return { status: 'ok', detail: 'SankofaDeploy* keys present' };
+      // Accept either the short keys (`com.sankofa.appId` +
+      // `com.sankofa.endpoint`) or the legacy `SankofaDeploy*` form.
+      if (text.includes('com.sankofa.appId') || text.includes('SankofaDeployAppId')) {
+        return { status: 'ok', detail: 'Sankofa Info.plist keys present' };
       }
       return {
         status: 'warn',
-        detail: 'no SankofaDeployAppId in Info.plist — engine will fall back to sankofa.yaml asset',
+        detail: 'no com.sankofa.appId in Info.plist — engine will fall back to sankofa.yaml asset',
       };
     }));
   }

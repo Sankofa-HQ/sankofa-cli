@@ -1,6 +1,6 @@
 {
   "name": "sankofa-cli",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "Sankofa CLI — one command to scaffold, ship, and verify Sankofa across Flutter, React Native, Web, iOS, and Android. Includes Sankofa Deploy (OTA patches), keys, doctor, release, and patch flows.",
   "bin": {
     "sankofa": "./dist/index.js"

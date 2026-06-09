@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import {
   appendFileSync,
   existsSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   writeFileSync,
@@ -325,8 +326,11 @@ async function installDeployFlutter(project: ProjectInfo, endpoint: string, chal
   //    Wires sankofa.yaml into flutter.assets too. Idempotent.
   await tryAddSankofaFlutterToPubspec(pubspecPath, chalk);
 
-  // 5. Create sankofa.yaml with placeholder values if missing.
-  tryCreateSankofaYaml(project.root, '', endpoint, chalk);
+  // 5. Create sankofa.yaml with placeholder values if missing. We
+  //    populate `app_id` from the .sankofa.json projectId so the
+  //    customer only has to paste the api_key by hand.
+  const projectId = readProjectId(project.root) ?? '';
+  tryCreateSankofaYaml(project.root, projectId, '', endpoint, chalk);
 
   // 6. Inject the `registerLoader` + `preFlight` calls into lib/main.dart.
   tryWireFlutterMainDart(project.root, chalk);
@@ -341,7 +345,7 @@ async function installDeployFlutter(project: ProjectInfo, endpoint: string, chal
     console.log('');
     console.log(chalk.yellow('     ⚠ Could not auto-patch the Android side.'));
     console.log(chalk.dim('       MainActivity.kt should extend SankofaFlutterActivity.'));
-    console.log(chalk.dim('       AndroidManifest.xml needs com.sankofa.deploy.SankofaDeployApplication + INTERNET + meta-data.'));
+    console.log(chalk.dim('       AndroidManifest.xml needs INTERNET + Sankofa meta-data, and MainActivity.kt should extend SankofaFlutterActivity.'));
   }
 }
 
@@ -352,7 +356,7 @@ async function installDeployFlutter(project: ProjectInfo, endpoint: string, chal
  *
  * Failures are non-fatal — `sankofa engine install` can be re-run later.
  */
-async function ensureBundledFlutterForInit(project: ProjectInfo, chalk: any): Promise<void> {
+async function ensureBundledFlutterForInit(project: ProjectInfo, chalk: any): Promise<string> {
   const ora = (await import('ora')).default;
   const { installBundledFlutter, bundledFlutterInfo } = await import('../utils/flutterBundleCache.js');
 
@@ -368,10 +372,21 @@ async function ensureBundledFlutterForInit(project: ProjectInfo, chalk: any): Pr
   }
   engineVersion = engineVersion || '3.44.0+sankofa-1';
 
+  const writePin = () => {
+    try {
+      const pinDir = join(project.root, '.sankofa');
+      mkdirSync(pinDir, { recursive: true });
+      writeFileSync(join(pinDir, 'flutter-version'), engineVersion + '\n');
+    } catch {
+      /* non-fatal — engine resolution falls back to sankofa.yaml */
+    }
+  };
+
   const present = bundledFlutterInfo(engineVersion);
   if (present.exists) {
     console.log(chalk.dim(`     ✓ Bundled Flutter SDK present (${engineVersion})`));
-    return;
+    writePin();
+    return engineVersion;
   }
 
   const spinner = ora(`  Installing Sankofa bundled Flutter SDK (${engineVersion})…`).start();
@@ -382,10 +397,12 @@ async function ensureBundledFlutterForInit(project: ProjectInfo, chalk: any): Pr
       },
     });
     spinner.succeed(`  Bundled Flutter SDK ready (${engineVersion})`);
+    writePin();
   } catch (err: any) {
     spinner.warn(`  Bundled Flutter install skipped: ${err.message}`);
     console.log(chalk.dim('       Re-run `sankofa engine install` later.'));
   }
+  return engineVersion;
 }
 
 /**
@@ -542,6 +559,22 @@ async function tryAddSankofaFlutterToPubspec(pubspecPath: string, chalk: any): P
       }
     }
 
+    // ── 4. Resolve the flutter_lints version conflict ──
+    //
+    // sankofa_flutter → carrier_info ^3.0.3 (transitively pins
+    // `flutter_lints: ^4.0.0` as a regular dep — a bug in carrier_info
+    // upstream). Flutter 3.41.9's default `flutter create` template uses
+    // `flutter_lints: ^6.0.0`, which makes the pub resolver refuse to
+    // resolve. Downgrade the constraint to `^4.0.0` (it's dev-only —
+    // strictly a code-style linter, no runtime impact). Idempotent:
+    // anyone who has already moved off ^6 stays put.
+    const lintsRegex = /^([ \t]*)flutter_lints:\s*\^?6(?:\.[\d.]+)?\s*$/m;
+    if (lintsRegex.test(text)) {
+      text = text.replace(lintsRegex, '$1flutter_lints: ^4.0.0');
+      touched = true;
+      console.log(chalk.dim('     · Pinned flutter_lints → ^4.0.0 (resolves carrier_info conflict)'));
+    }
+
     if (touched) {
       writeFileSync(pubspecPath, text);
       console.log(chalk.dim('       Run `flutter pub get` to resolve.'));
@@ -558,13 +591,84 @@ async function tryAddSankofaFlutterToPubspec(pubspecPath: string, chalk: any): P
  * endpoint. Does nothing if the file already exists (host-managed
  * file, never clobber). Returns true when written.
  */
-function tryCreateSankofaYaml(projectRoot: string, apiKey: string, endpoint: string, chalk: any): boolean {
+/**
+ * Given the index of an opening `{` in `src`, return the index of
+ * its matching `}`. Ignores braces inside `// ...`, `/* ... *\/`,
+ * and `'...'`/`"..."`/`r"""..."""` string/comment regions. Returns
+ * -1 if no match.
+ */
+function findMatchingBrace(src: string, openIdx: number): number {
+  if (src[openIdx] !== '{') return -1;
+  let depth = 0;
+  let i = openIdx;
+  while (i < src.length) {
+    const ch = src[i];
+    const next = src[i + 1];
+    if (ch === '/' && next === '/') {
+      const nl = src.indexOf('\n', i + 2);
+      i = nl < 0 ? src.length : nl + 1;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      const end = src.indexOf('*/', i + 2);
+      i = end < 0 ? src.length : end + 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      let j = i + 1;
+      while (j < src.length) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === quote) { j += 1; break; }
+        j += 1;
+      }
+      i = j;
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+function readProjectId(projectRoot: string): string | undefined {
+  try {
+    const cfgPath = join(projectRoot, '.sankofa.json');
+    if (!existsSync(cfgPath)) return undefined;
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf-8'));
+    return typeof cfg.projectId === 'string' && cfg.projectId.length > 0
+      ? cfg.projectId
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryCreateSankofaYaml(
+  projectRoot: string,
+  appId: string,
+  apiKey: string,
+  endpoint: string,
+  chalk: any,
+): boolean {
   const yamlPath = join(projectRoot, 'sankofa.yaml');
   if (existsSync(yamlPath)) {
     console.log(chalk.dim('     ✓ sankofa.yaml already exists — not overwriting'));
     return false;
   }
   try {
+    const appIdLine = appId
+      ? `app_id: ${appId}\n`
+      : `app_id: <your-app-id; copy from app.sankofa.dev → Settings>\n`;
+    const apiKeyLine = apiKey
+      ? `api_key: ${apiKey}\n`
+      : `api_key: <paste sk_live_* key from app.sankofa.dev → Settings → API Keys>\n`;
+    const baseUrlLine =
+      endpoint && endpoint !== 'https://api.sankofa.dev' ? `base_url: ${endpoint}\n` : ``;
     const content =
       `# Sankofa project config — read at runtime from the asset bundle.\n` +
       `# Add this file to flutter.assets in pubspec.yaml (\`sankofa init\` did\n` +
@@ -572,9 +676,9 @@ function tryCreateSankofaYaml(projectRoot: string, apiKey: string, endpoint: str
       `# when you run \`sankofa engine install\` / \`sankofa keys generate\`.\n` +
       `# Customer code never edits this file by hand.\n` +
       `\n` +
-      `app_id: ${apiKey.startsWith('sk_') ? '<your-app-id; sankofa init prompts for this>' : apiKey}\n` +
-      `api_key: ${apiKey || '<paste sk_live_* key from app.sankofa.dev>'}\n` +
-      (endpoint && endpoint !== 'https://api.sankofa.dev' ? `base_url: ${endpoint}\n` : ``);
+      appIdLine +
+      apiKeyLine +
+      baseUrlLine;
     writeFileSync(yamlPath, content);
     console.log(chalk.green('     ✓ Created sankofa.yaml'));
     return true;
@@ -616,9 +720,18 @@ function tryWireFlutterMainDart(projectRoot: string, chalk: any): boolean {
     }
 
     // ── Add imports if missing ──
+    //
+    // `dynamic_modules` is referenced via `dependency_overrides:` only
+    // (pub.dev rejects packages that import `dart:_internal`, so it
+    // can't be a regular dep of `sankofa_flutter`). The
+    // `depend_on_referenced_packages` lint fires on overrides-only
+    // imports, so we suppress it on this single line.
     const importsToAdd: string[] = [];
     if (!/import\s+['"]package:dynamic_modules\/dynamic_modules\.dart['"]/.test(src)) {
-      importsToAdd.push(`import 'package:dynamic_modules/dynamic_modules.dart';`);
+      importsToAdd.push(
+        `// ignore: depend_on_referenced_packages\n` +
+          `import 'package:dynamic_modules/dynamic_modules.dart';`,
+      );
     }
     if (!/import\s+['"]package:sankofa_flutter\/sankofa_flutter\.dart['"]/.test(src)) {
       importsToAdd.push(`import 'package:sankofa_flutter/sankofa_flutter.dart';`);
@@ -703,11 +816,27 @@ function tryWireFlutterMainDart(projectRoot: string, chalk: any): boolean {
       const m2 = mainSig.exec(src);
       const blockStart2 = m2!.index + m2![0].length - 1;
       const insertAt = blockStart2 + 1; // right after `{`
-      const ensureLine = src.slice(blockStart2).includes('ensureInitialized()')
-        ? ''
-        : `${bodyIndent}WidgetsFlutterBinding.ensureInitialized();\n`;
+
+      // ensureInitialized() MUST be the very first statement inside
+      // main(); preFlight() touches platform channels (shared_prefs,
+      // path_provider, package_info) which would otherwise throw.
+      // If someone (the old wiring, customer code) already put it
+      // somewhere else inside the body, strip the stray copy first
+      // so we don't end up with duplicates in random positions.
+      const bodyEnd = findMatchingBrace(src, blockStart2);
+      if (bodyEnd > blockStart2) {
+        const bodyBefore = src.slice(insertAt, bodyEnd);
+        const stripped = bodyBefore.replace(
+          /^[ \t]*WidgetsFlutterBinding\.ensureInitialized\(\);\s*\n/gm,
+          '',
+        );
+        if (stripped !== bodyBefore) {
+          src = src.slice(0, insertAt) + stripped + src.slice(bodyEnd);
+        }
+      }
+
       const inject =
-        `\n${ensureLine}` +
+        `\n${bodyIndent}WidgetsFlutterBinding.ensureInitialized();\n` +
         `${bodyIndent}SankofaUpdater.registerLoader(loadModuleFromBytes);\n` +
         `${bodyIndent}await SankofaUpdater.preFlight();`;
       src = src.slice(0, insertAt) + inject + src.slice(insertAt);
@@ -745,18 +874,31 @@ function printManualMainSnippet(chalk: any): void {
  */
 async function ensureFlutterEngineForInit(project: ProjectInfo, chalk: any): Promise<void> {
   const ora = (await import('ora')).default;
-  let flutterVersion: string;
+
+  // Prefer the BUNDLED Sankofa Flutter version (e.g. `3.44.0+sankofa-1`)
+  // because that's the SDK + engine the customer will actually build
+  // against once `sankofa release` / `sankofa patch` runs. Falling back
+  // to the host's `flutter --version` is wrong — those engines have
+  // different SHAs and won't match the bundled runtime.
+  let flutterVersion: string | undefined;
   try {
-    const { detectFlutterEngineInfo } = await import('../utils/flutterBundler.js');
-    flutterVersion = detectFlutterEngineInfo(project.root).flutterVersion;
+    const { resolveBundledFlutter } = await import('../utils/flutterBundleCache.js');
+    flutterVersion = resolveBundledFlutter(project.root)?.sankofaEngineVersion;
   } catch {
-    console.log(chalk.yellow('     ⚠ `flutter` is not on PATH — skipping engine pre-fetch.'));
-    console.log(chalk.dim('       Install Flutter, then run `sankofa engine download` manually.'));
-    return;
+    /* fall through */
+  }
+  if (!flutterVersion) {
+    try {
+      const { detectFlutterEngineInfo } = await import('../utils/flutterBundler.js');
+      flutterVersion = detectFlutterEngineInfo(project.root).flutterVersion;
+    } catch {
+      console.log(chalk.dim('     · `flutter` not on PATH — skipping engine pre-fetch. Run `sankofa engine download` later.'));
+      return;
+    }
   }
 
   if (!flutterVersion || flutterVersion === 'unknown') {
-    console.log(chalk.yellow('     ⚠ Could not detect Flutter version — skipping engine pre-fetch.'));
+    console.log(chalk.dim('     · Could not detect a Flutter version yet — skipping engine pre-fetch.'));
     return;
   }
 
@@ -771,14 +913,14 @@ async function ensureFlutterEngineForInit(project: ProjectInfo, chalk: any): Pro
         spinner.text = `     ${msg}`;
       },
     });
-    const hits = results.filter((r) => r.cached).length;
-    const fresh = results.length - hits;
     if (results.length === 0) {
-      spinner.warn(
-        `     No Sankofa engine available yet for Flutter ${flutterVersion} — releases will refuse until one ships.`,
+      spinner.info(
+        `     No engine published yet for ${flutterVersion} — \`sankofa release\` will fetch on demand.`,
       );
       return;
     }
+    const hits = results.filter((r) => r.cached).length;
+    const fresh = results.length - hits;
     spinner.succeed(
       `     Engine cache ready — ${results.length} ABI${results.length === 1 ? '' : 's'} for Flutter ${flutterVersion}` +
         (fresh > 0 ? ` (${fresh} freshly downloaded)` : ' (cache hits)'),
@@ -791,8 +933,11 @@ async function ensureFlutterEngineForInit(project: ProjectInfo, chalk: any): Pro
       );
     }
   } catch (err: any) {
-    spinner.warn(`     Engine pre-fetch failed: ${err.message}`);
-    console.log(chalk.dim('       You can retry with: `sankofa engine download`'));
+    // Engine pre-fetch is a speed optimisation, not a correctness gate
+    // — `sankofa release` re-resolves with current data. Soften the
+    // tone so customers don't think the install itself failed.
+    const msg = (err && err.message ? String(err.message) : String(err)).split('\n')[0];
+    spinner.info(`     Skipped engine pre-fetch (${msg}). \`sankofa release\` will fetch on demand.`);
   }
 }
 
@@ -1079,7 +1224,12 @@ function patchFlutterNativeFiles(
     }
   }
 
-  patchFlutterMainDart(cwd, chalk);
+  // Note: lib/main.dart wiring is handled later in installDeployFlutter
+  // via tryWireFlutterMainDart (the canonical, SankofaUpdater-based path).
+  // The legacy `patchFlutterMainDart` was injecting a duplicate
+  // `Sankofa.instance.init(...)` ahead of `WidgetsFlutterBinding
+  // .ensureInitialized()`, which crashed at runtime because preFlight
+  // touches platform channels before binding init. That call is removed.
 
   return out;
 }
@@ -1101,18 +1251,34 @@ function patchFlutterAndroidManifest(androidApp: string, endpoint: string, chalk
     changed = true;
   }
 
-  if (!xml.includes('com.sankofa.deploy.SankofaDeployApplication')) {
-    xml = xml.replace(
-      /<application(\s)/,
-      `<application\n        android:name="com.sankofa.deploy.SankofaDeployApplication"$1`,
-    );
-    changed = true;
-  }
+  // NOTE: we used to inject `android:name="com.sankofa.deploy
+  // .SankofaDeployApplication"` here, but Flutter templates already
+  // emit `android:name="${applicationName}"`, and adding a second
+  // `android:name=` makes the Android manifest merger reject the
+  // entire file (com.android.manifmerger.ManifestMerger2$MergeFailureException).
+  // The SDK doesn't actually need a custom Application class for the
+  // default Deploy + Analytics flow — `SankofaFlutterActivity` (wired
+  // into MainActivity below) is the bootstrap point. Customers who
+  // want native ANR/Application-level crash hooks can extend
+  // `SankofaDeployApplication` manually; the cookbook documents that.
 
-  if (!xml.includes('com.sankofa.apiKey')) {
+  // Inject Sankofa app_id + endpoint meta-data. We deliberately do
+  // NOT write `com.sankofa.apiKey` here, because:
+  //   (a) we don't have the customer's api_key yet at init time
+  //       (they paste it into sankofa.yaml later), and
+  //   (b) writing `${SANKOFA_API_KEY}` as a placeholder makes the
+  //       Android manifest merger refuse the build when there's no
+  //       matching `manifestPlaceholders` entry in build.gradle.
+  // The SDK reads the api_key from `sankofa.yaml` at runtime; the
+  // manifest meta-data is the fast-path for app_id + endpoint only.
+  if (!xml.includes('com.sankofa.appId') && !xml.includes('com.sankofa.endpoint')) {
+    const appId = readProjectId(join(androidApp, '..', '..')) ?? '';
+    const appIdLine = appId
+      ? `    <meta-data android:name="com.sankofa.appId" android:value="${appId}" />\n`
+      : '';
     xml = xml.replace(
       /<\/application>/,
-      `    <meta-data android:name="com.sankofa.apiKey" android:value="\${SANKOFA_API_KEY}" />\n    <meta-data android:name="com.sankofa.endpoint" android:value="${endpoint}" />\n    </application>`,
+      `${appIdLine}    <meta-data android:name="com.sankofa.endpoint" android:value="${endpoint}" />\n    </application>`,
     );
     changed = true;
   }
@@ -1194,10 +1360,15 @@ function patchFlutterIosInfoPlist(iosRunner: string, endpoint: string, chalk: an
   const hasKey = (key: string) => xml.includes(`<key>${key}</key>`);
   const insertBefore = '</dict>\n</plist>';
 
-  if (!hasKey('com.sankofa.apiKey')) {
+  // Mirror the Android side: write `com.sankofa.appId` + `endpoint`
+  // (known values), skip the api_key (lives in sankofa.yaml). The
+  // SDK falls back to sankofa.yaml at runtime if either is missing.
+  const projectRoot = join(iosRunner, '..', '..');
+  const appId = readProjectId(projectRoot) ?? '';
+  if (appId && !hasKey('com.sankofa.appId')) {
     xml = xml.replace(
       insertBefore,
-      `\t<key>com.sankofa.apiKey</key>\n\t<string>$(SANKOFA_API_KEY)</string>\n${insertBefore}`,
+      `\t<key>com.sankofa.appId</key>\n\t<string>${appId}</string>\n${insertBefore}`,
     );
     changed = true;
   }
@@ -1217,39 +1388,8 @@ function patchFlutterIosInfoPlist(iosRunner: string, endpoint: string, chalk: an
   }
 }
 
-function patchFlutterMainDart(cwd: string, chalk: any) {
-  const mainDart = join(cwd, 'lib', 'main.dart');
-  if (!existsSync(mainDart)) {
-    console.log(chalk.dim(`     · No lib/main.dart found — skipping Dart wiring`));
-    return;
-  }
-  let src = readFileSync(mainDart, 'utf-8');
-  // Migration-friendly detection: match either the legacy Phase 7
-  // `SankofaDeploy.init(...)` call OR the unified `Sankofa.instance.init(`
-  // call so re-running `init` on a project that's already on the new
-  // SDK doesn't re-patch.
-  if (src.includes('SankofaDeploy.init') || src.includes('Sankofa.instance.init(')) {
-    console.log(chalk.dim(`     · lib/main.dart already wires up the Sankofa SDK`));
-    return;
-  }
-  const importLine = "import 'package:sankofa_flutter/sankofa_flutter.dart';";
-  if (!src.includes(importLine)) {
-    src = importLine + '\n' + src;
-  }
-  // Unified SDK init: single Sankofa.instance.init call with module
-  // enable flags. Matches the React-Native SDK's
-  // `Sankofa.initialize(apiKey, { enableDeploy: true })` shape.
-  src = src.replace(
-    /void main\(\)\s*(async\s*)?\{/,
-    `Future<void> main() async {\n  WidgetsFlutterBinding.ensureInitialized();\n  await Sankofa.instance.init(\n    apiKey: const String.fromEnvironment('SANKOFA_API_KEY'),\n    enableDeploy: true,\n  );`,
-  );
-  // Add notifyAppReady right after runApp(...). The new namespaced
-  // accessor returns null when Deploy isn't enabled, so the `?.` guard
-  // protects hosts that flip enableDeploy off later.
-  src = src.replace(
-    /(runApp\([^;]+;)/,
-    `$1\n  await Sankofa.instance.deploy?.notifyAppReady();`,
-  );
-  writeFileSync(mainDart, src);
-  console.log(chalk.green(`     ✓ Patched ${mainDart}`));
-}
+// patchFlutterMainDart was the legacy SankofaDeploy-style wiring; it
+// was retired because it injected `Sankofa.instance.init(...)` ahead of
+// `WidgetsFlutterBinding.ensureInitialized()`, which crashes on any
+// project that also runs the new SankofaUpdater path (the universal one
+// in 0.2.x). The canonical wiring is `tryWireFlutterMainDart` above.

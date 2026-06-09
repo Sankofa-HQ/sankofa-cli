@@ -1,6 +1,22 @@
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
 import { join } from 'path';
 import type { Stack, ProjectInfo } from './stack.js';
+
+function findMainActivity(androidApp: string): string | null {
+  const kotlinRoot = join(androidApp, 'src', 'main', 'kotlin');
+  if (!existsSync(kotlinRoot)) return null;
+  const stack: string[] = [kotlinRoot];
+  while (stack.length) {
+    const dir = stack.pop()!;
+    for (const entry of readdirSync(dir)) {
+      const full = join(dir, entry);
+      const s = statSync(full);
+      if (s.isDirectory()) stack.push(full);
+      else if (entry === 'MainActivity.kt') return full;
+    }
+  }
+  return null;
+}
 
 export type ProductId = 'deploy' | 'switch' | 'config' | 'catch';
 
@@ -151,15 +167,25 @@ function detectDeployFlutter(project: ProjectInfo): { installed: boolean; detail
   const hasAndroid = readText(join(androidApp, 'src', 'main', 'AndroidManifest.xml')) !== null;
   const hasIos = readText(join(iosRunner, 'AppDelegate.swift')) !== null;
 
+  // Android wiring lives in MainActivity.kt, not the manifest — current
+  // `sankofa init` rewrites the activity to extend SankofaFlutterActivity.
+  // (The legacy hook was `SankofaDeployApplication` in the manifest;
+  // accept either so doctor doesn't flag old + new layouts.)
+  const mainActivity = hasAndroid ? findMainActivity(androidApp) : null;
+  const manifestText = hasAndroid
+    ? readText(join(androidApp, 'src', 'main', 'AndroidManifest.xml')) || ''
+    : '';
+  const activityText = mainActivity ? readText(mainActivity) || '' : '';
   const androidWired = hasAndroid
-    ? (readText(join(androidApp, 'src', 'main', 'AndroidManifest.xml')) || '').includes('SankofaDeployApplication')
+    ? activityText.includes('SankofaFlutterActivity') ||
+      manifestText.includes('SankofaDeployApplication')
     : null;
   const iosWired = hasIos
     ? (readText(join(iosRunner, 'AppDelegate.swift')) || '').includes('SankofaFlutterAppDelegate')
     : null;
 
   const wiredParts: string[] = [];
-  if (androidWired === true) wiredParts.push('AndroidManifest');
+  if (androidWired === true) wiredParts.push('MainActivity');
   if (iosWired === true) wiredParts.push('AppDelegate');
 
   const unwiredParts: string[] = [];

@@ -871,8 +871,19 @@ checkCommand
     console.log(chalk.dim('  ─────────────────────────────────────'));
     console.log('');
 
+    if (ctx.platform === 'flutter') {
+      // Flutter Deploy uses a different native wiring path (sankofa.yaml
+      // asset + AndroidManifest meta-data / Info.plist keys + Sankofa
+      // Flutter Activity / AppDelegate). `sankofa doctor` already runs
+      // the full check suite for Flutter — point users there rather
+      // than duplicate it here.
+      console.log(chalk.dim('  Flutter Deploy is verified via the project-wide checks.'));
+      console.log(chalk.cyan('  Run:  sankofa doctor'));
+      console.log('');
+      return;
+    }
     if (ctx.platform !== 'react-native') {
-      console.log(chalk.yellow('  Sankofa Deploy is currently available for React Native only.'));
+      console.log(chalk.yellow('  Sankofa Deploy is currently available for React Native + Flutter.'));
       console.log(chalk.dim(`  Detected platform: ${PLATFORM_LABELS[ctx.platform]}`));
       console.log('');
       return;
