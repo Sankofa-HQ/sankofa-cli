@@ -24,3 +24,6 @@ npm-debug.log*
 
 # TypeScript cache
 *.tsbuildinfo
+
+# Local npm-pack tarballs (the publish flow re-packs from CI/local; never commit them)
+*.tgz
