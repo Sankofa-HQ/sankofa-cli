@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } fr
 import { createHash } from 'crypto';
 import { join, resolve } from 'path';
 import { resolveBundledFlutter } from './flutterBundleCache.js';
+import { SANKOFA_STORAGE_BASE_URL } from './engineVersion.js';
 
 export interface FlutterEngineInfo {
   flutterVersion: string;
@@ -29,6 +30,15 @@ export function resolveFlutterBinary(projectRoot?: string): string {
   if (projectRoot) {
     const bundled = resolveBundledFlutter(projectRoot);
     if (bundled?.exists) {
+      // The bundled fork's engine.version pins a Sankofa engine rev whose
+      // artifacts exist only on Sankofa's CDN. Setting the env var here —
+      // at the moment the bundled SDK is chosen — propagates it to every
+      // child this process spawns (flutter, gradle, xcodebuild) WITHOUT
+      // leaking it into invocations of the customer's own upstream
+      // flutter, whose engine revs only exist on Google's storage.
+      if (!process.env.FLUTTER_STORAGE_BASE_URL) {
+        process.env.FLUTTER_STORAGE_BASE_URL = SANKOFA_STORAGE_BASE_URL;
+      }
       return bundled.bin;
     }
   }

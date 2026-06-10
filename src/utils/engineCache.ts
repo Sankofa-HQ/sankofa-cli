@@ -72,7 +72,11 @@ function targetDirForEngine(e: KnownEngine): string {
 }
 
 function artifactNameForEngine(e: KnownEngine): string {
-  return e.target === 'ios' ? 'Flutter.framework.zip' : 'libflutter.so';
+  // Both targets cache the RAW engine binary — the exact bytes the
+  // registry's sha256 covers — so every cache hit and download is
+  // SHA-verifiable. (iOS used to cache a Flutter.framework.zip whose
+  // hash could never match the registered inner-Mach-O SHA.)
+  return e.target === 'ios' ? 'Flutter' : 'libflutter.so';
 }
 
 export interface EngineCacheEntry {
@@ -101,21 +105,13 @@ export function locateEngineInCache(engine: KnownEngine): EngineCacheEntry {
 
   let valid = false;
   if (existsSync(path)) {
-    // For iOS Flutter.framework.zip we DON'T re-hash the zip on every
-    // cache hit — the SHAs in our registry are for the contained
-    // `Flutter` Mach-O, not the zip. The `.meta.json` records the
-    // last-verified SHA so cache hits are O(1).
-    if (engine.target === 'ios') {
-      valid = existsSync(metaPath);
-    } else {
-      // Android cache hits re-hash. ~150 MB stream-hashes in <1s on
-      // modern SSDs; worth the safety against bit-rot / partial
-      // downloads.
-      try {
-        valid = sha256OfFile(path) === engine.sha256.toLowerCase();
-      } catch {
-        valid = false;
-      }
+    // Cache hits re-hash the raw binary (both targets cache the exact
+    // bytes the registry SHA covers). ~150 MB stream-hashes in <1s on
+    // modern SSDs; worth the safety against bit-rot / partial downloads.
+    try {
+      valid = sha256OfFile(path) === engine.sha256.toLowerCase();
+    } catch {
+      valid = false;
     }
   }
   return { engine, path, metaPath, valid };

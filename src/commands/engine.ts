@@ -20,8 +20,12 @@ import {
   installBundledFlutter,
   bundledFlutterInfo,
 } from '../utils/flutterBundleCache.js';
-import { statSync } from 'fs';
-import { resolve as pathResolve } from 'path';
+import {
+  DEFAULT_ENGINE_VERSION,
+  resolveLatestEngineVersion,
+} from '../utils/engineVersion.js';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'fs';
+import { dirname, join, resolve as pathResolve } from 'path';
 
 /**
  * `sankofa engine` — manage the local cache of Sankofa-built Flutter
@@ -217,10 +221,15 @@ engineCommand
     const chalk = (await import('chalk')).default;
     const ora = (await import('ora')).default;
 
-    // Resolve version: arg > env > default.
-    const resolved = version
-      || process.env.SANKOFA_ENGINE_VERSION
-      || '3.44.0+sankofa-1';
+    // Resolve version: arg > env > latest published on the CDN.
+    let resolved = version || process.env.SANKOFA_ENGINE_VERSION;
+    if (!resolved) {
+      const latest = await resolveLatestEngineVersion();
+      resolved = latest.version;
+      if (latest.source === 'fallback') {
+        console.log(chalk.dim(`  (CDN unreachable — using built-in default ${resolved})`));
+      }
+    }
 
     console.log('');
     console.log(chalk.bold(`  Installing Sankofa engine ${resolved}`));
@@ -311,6 +320,188 @@ engineCommand
     console.log(chalk.dim(`    Engine cache:     ${engineCacheRoot()}`));
     console.log('');
   });
+
+// ── sankofa engine upgrade ─────────────────────────────────────────
+//
+// THE one-command engine bump. Run inside a project:
+//
+//   sankofa engine upgrade
+//
+// 1. Asks the CDN for the newest published engine version (latest.json,
+//    written by every engine release).
+// 2. Installs its bundled Flutter SDK + engine binaries (skips anything
+//    already cached).
+// 3. Re-pins the project: `engine_version:` in sankofa.yaml and the
+//    `.sankofa/flutter-version` file.
+//
+// Subsequent `sankofa release` / `sankofa patch` / `sankofa preview`
+// pick up the new engine automatically. Outside a project, steps 1–2
+// still run (machine-level upgrade); the re-pin is skipped.
+engineCommand
+  .command('upgrade')
+  .description('Upgrade to the newest published Sankofa engine (installs + re-pins the project)')
+  .option('--version <version>', 'Target a specific engine version instead of latest')
+  .option('--check', 'Only report what would change; do not install or re-pin')
+  .option('--force', 'Re-clone / re-download even if already present')
+  .action(async (opts) => {
+    const chalk = (await import('chalk')).default;
+    const ora = (await import('ora')).default;
+
+    console.log('');
+    console.log(chalk.bold('  Sankofa engine upgrade'));
+    console.log('');
+
+    // 1) What's the target?
+    let target: string = opts.version;
+    if (!target) {
+      const spinner = ora('  Resolving latest published engine…').start();
+      const latest = await resolveLatestEngineVersion();
+      target = latest.version;
+      if (latest.source === 'cdn') {
+        spinner.succeed(`  Latest published engine: ${chalk.bold(target)}`);
+      } else {
+        spinner.warn(`  CDN unreachable — falling back to built-in ${chalk.bold(target)}`);
+      }
+    }
+
+    // 2) Where are we now? (project pin, if inside a project)
+    const projectRoot = findProjectRootForPin(process.cwd());
+    const currentPin = projectRoot ? readEnginePin(projectRoot) : undefined;
+    if (projectRoot) {
+      console.log(
+        `  Project: ${chalk.dim(projectRoot)}` +
+          (currentPin ? `  (pinned: ${currentPin})` : '  (no engine pin yet)'),
+      );
+    } else {
+      console.log(chalk.dim('  Not inside a Sankofa project — machine-level upgrade only.'));
+    }
+    console.log('');
+
+    const bundlePresent = bundledFlutterInfo(target).exists;
+    if (currentPin === target && bundlePresent && !opts.force) {
+      console.log(chalk.green(`  ✓ Already on ${target} — nothing to do.`));
+      console.log('');
+      return;
+    }
+
+    if (opts.check) {
+      if (currentPin !== target && projectRoot) {
+        console.log(chalk.yellow(`  Would re-pin ${currentPin ?? '(unset)'} → ${target}`));
+      }
+      if (!bundlePresent) {
+        console.log(chalk.yellow(`  Would install bundled Flutter + engine binaries for ${target}`));
+      }
+      console.log('');
+      console.log(chalk.dim('  Re-run without --check to apply.'));
+      console.log('');
+      return;
+    }
+
+    // 3) Install bundle + engines (delegates to the same machinery as
+    //    `engine install`).
+    const installSpinner = ora(`  Installing bundled Flutter SDK ${target}…`).start();
+    try {
+      const info = installBundledFlutter(target, {
+        reuseIfPresent: !opts.force,
+        onProgress: (msg) => {
+          installSpinner.text = `  ${msg}`;
+        },
+      });
+      installSpinner.succeed(`  Bundled flutter ready at ${chalk.dim(info.root)}`);
+    } catch (err: any) {
+      installSpinner.fail(`  Bundled flutter install failed: ${err.message}`);
+      process.exit(1);
+    }
+
+    try {
+      const knownEngines = await fetchKnownEngines({ sankofaEngineVersion: target });
+      for (const engine of knownEngines) {
+        const label = `${engine.target} ${engine.abi} (${formatBytesHuman(engine.size_bytes)})`;
+        if (!opts.force && tryEngineCacheHit(engine)) {
+          console.log(`  ${chalk.green('✓')} ${label} — cached`);
+          continue;
+        }
+        const spinner = ora(`  ${label} — downloading…`).start();
+        try {
+          await downloadEngineIntoCache(engine, {
+            onProgress: (received, total) => {
+              const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+              spinner.text = `  ${label} — ${pct}%`;
+            },
+          });
+          spinner.succeed(`  ${label} — downloaded`);
+        } catch (err: any) {
+          // Engine-binary cache misses don't block the upgrade: the
+          // bundled SDK pulls the same engine through the build itself.
+          spinner.warn(`  ${label} — ${err.message} (will be fetched at build time)`);
+        }
+      }
+    } catch (err: any) {
+      console.log(chalk.yellow(`  ⚠ Engine registry unreachable (${err.message}) — binaries will be fetched at build time.`));
+    }
+
+    // 4) Re-pin the project.
+    if (projectRoot) {
+      writeEnginePin(projectRoot, target);
+      console.log('');
+      console.log(`  ${chalk.green('✓')} Project re-pinned to ${chalk.bold(target)}`);
+      console.log(chalk.dim(`    sankofa.yaml engine_version + .sankofa/flutter-version updated`));
+    }
+
+    console.log('');
+    console.log(chalk.green(`  ✓ Engine upgrade to ${target} complete.`));
+    if (projectRoot) {
+      console.log(chalk.dim('    Next release/patch builds with the new engine automatically:'));
+      console.log(chalk.cyan('      sankofa release android   # or: sankofa release ios'));
+    }
+    console.log('');
+  });
+
+/** Walk up from `start` to the nearest directory holding a sankofa.yaml. */
+function findProjectRootForPin(start: string): string | null {
+  let dir = pathResolve(start);
+  for (let i = 0; i < 12; i++) {
+    if (existsSync(join(dir, 'sankofa.yaml'))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+/** Current engine pin: .sankofa/flutter-version beats sankofa.yaml. */
+function readEnginePin(projectRoot: string): string | undefined {
+  const pinFile = join(projectRoot, '.sankofa', 'flutter-version');
+  if (existsSync(pinFile)) {
+    try {
+      const v = readFileSync(pinFile, 'utf-8').trim();
+      if (v) return v;
+    } catch { /* fall through */ }
+  }
+  const yamlPath = join(projectRoot, 'sankofa.yaml');
+  if (existsSync(yamlPath)) {
+    try {
+      const m = readFileSync(yamlPath, 'utf-8').match(/^\s*engine_version:\s*['"]?([\w.+-]+)['"]?\s*$/m);
+      if (m) return m[1];
+    } catch { /* fall through */ }
+  }
+  return undefined;
+}
+
+/** Write the pin to BOTH places `resolveBundledFlutter` reads. */
+function writeEnginePin(projectRoot: string, version: string): void {
+  const yamlPath = join(projectRoot, 'sankofa.yaml');
+  if (existsSync(yamlPath)) {
+    const text = readFileSync(yamlPath, 'utf-8');
+    const updated = /^\s*engine_version:/m.test(text)
+      ? text.replace(/^(\s*engine_version:\s*).*$/m, `$1${version}`)
+      : `${text.replace(/\n*$/, '\n')}engine_version: ${version}\n`;
+    writeFileSync(yamlPath, updated);
+  }
+  const pinDir = join(projectRoot, '.sankofa');
+  mkdirSync(pinDir, { recursive: true });
+  writeFileSync(join(pinDir, 'flutter-version'), `${version}\n`);
+}
 
 // ── sankofa engine verify ──────────────────────────────────────────
 engineCommand

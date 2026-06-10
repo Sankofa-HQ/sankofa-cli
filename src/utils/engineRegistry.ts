@@ -121,11 +121,51 @@ export async function findEngineBySha(sha256: string): Promise<KnownEngine | nul
  * Caller composes against the CLI's configured endpoint when relative.
  */
 export function resolveEngineDownloadURL(engine: KnownEngine): string {
+  // Prefer the public CDN when the row carries its build provenance —
+  // artifacts are published under the engine fork's git rev at upload
+  // time, so the URL is fully derivable client-side. This also dodges
+  // two failure modes of the server-signed URL: a misconfigured signing
+  // bucket and the 15-minute expiry racing a slow download.
+  const cdn = cdnEngineDownloadURL(engine);
+  if (cdn) return cdn;
   if (/^https?:\/\//i.test(engine.download_url)) {
     return engine.download_url;
   }
   const { endpoint } = resolveAuth();
   return `${endpoint.replace(/\/$/, '')}${engine.download_url}`;
+}
+
+/**
+ * Compose the download.sankofa.dev URL for an engine binary from its
+ * `source_commit`. Returns null when the rev is missing/malformed (legacy
+ * rows) — callers fall back to the server-provided download_url.
+ *
+ * Key layout must mirror what `upload-to-b2.sh` publishes:
+ *   android  flutter_infra_release/flutter/<rev>/android-<slug>-<mode>/libflutter.so
+ *   ios      flutter_infra_release/flutter/<rev>/<ios-dir>/Flutter.framework/Flutter
+ */
+export function cdnEngineDownloadURL(engine: KnownEngine): string | null {
+  const rev = engine.source_commit;
+  if (!rev || !/^[0-9a-f]{40}$/i.test(rev)) return null;
+  const base = `https://download.sankofa.dev/flutter_infra_release/flutter/${rev}`;
+  if (engine.target === 'android') {
+    const slug =
+      engine.abi === 'arm64-v8a' ? 'arm64' :
+      engine.abi === 'armeabi-v7a' ? 'arm' :
+      engine.abi === 'x86_64' ? 'x64' :
+      engine.abi;
+    return `${base}/android-${slug}-${engine.runtime_mode}/libflutter.so`;
+  }
+  if (engine.target === 'ios') {
+    const dir =
+      engine.abi === 'device-arm64' ? 'ios-release' :
+      engine.abi === 'sim-arm64' ? 'ios-debug-sim-arm64' :
+      engine.abi === 'sim-x64' ? 'ios-debug-sim-x64' :
+      null;
+    if (!dir) return null;
+    return `${base}/${dir}/Flutter.framework/Flutter`;
+  }
+  return null;
 }
 
 /** Clear the cache. Used by tests + the `sankofa engine refresh` subcommand. */

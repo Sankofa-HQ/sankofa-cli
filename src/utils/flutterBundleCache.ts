@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, statSync } 
 import { homedir } from 'os';
 import { join } from 'path';
 import { execSync } from 'child_process';
+import { branchForEngineVersion, SANKOFA_STORAGE_BASE_URL } from './engineVersion.js';
 
 /**
  * # Bundled Flutter SDK cache
@@ -38,7 +39,6 @@ export interface BundledFlutterInfo {
 }
 
 const SANKOFA_FLUTTER_REPO_URL = 'https://github.com/Sankofa-HQ/sankofa-flutter.git';
-const DEFAULT_BRANCH = 'phase1/sankofa-codepush-engine-integration';
 
 function sankofaHome(): string {
   return process.env.SANKOFA_HOME || join(homedir(), '.sankofa');
@@ -121,6 +121,12 @@ function warmDartSdkCache(root: string, onProgress?: (msg: string) => void): voi
         // We don't want analytics popups + we don't want this to update the
         // user's normal flutter cache (FLUTTER_ROOT scopes the invocation).
         FLUTTER_ROOT: root,
+        // The fork's engine.version pins a SANKOFA engine rev; its dart-sdk
+        // + precache artifacts exist only on Sankofa's CDN, never on
+        // Google's. Without this the bootstrap 404s against
+        // storage.googleapis.com.
+        FLUTTER_STORAGE_BASE_URL:
+          process.env.FLUTTER_STORAGE_BASE_URL || SANKOFA_STORAGE_BASE_URL,
       },
     });
   } catch (err: any) {
@@ -215,7 +221,8 @@ export function installBundledFlutter(
   }
 
   const repoUrl = opts.repoUrl || SANKOFA_FLUTTER_REPO_URL;
-  const ref = opts.ref || DEFAULT_BRANCH;
+  // Per-stable branches: 3.44.1+sankofa-1 → phase1/sankofa-3.44.1.
+  const ref = opts.ref || branchForEngineVersion(sankofaEngineVersion);
   opts.onProgress?.(`Cloning ${repoUrl} (${ref}) into ${root}`);
 
   try {

@@ -352,7 +352,7 @@ async function installDeployFlutter(project: ProjectInfo, endpoint: string, chal
 /**
  * Install the Sankofa-forked Flutter SDK into ~/.sankofa/flutter/<version>/
  * if not already present. Reads the engine version from the project's
- * sankofa.yaml (or defaults to 3.44.0+sankofa-1).
+ * sankofa.yaml (or defaults to 3.44.1+sankofa-1).
  *
  * Failures are non-fatal — `sankofa engine install` can be re-run later.
  */
@@ -370,7 +370,10 @@ async function ensureBundledFlutterForInit(project: ProjectInfo, chalk: any): Pr
       if (m) engineVersion = m[1];
     }
   }
-  engineVersion = engineVersion || '3.44.0+sankofa-1';
+  if (!engineVersion) {
+    const { resolveLatestEngineVersion } = await import('../utils/engineVersion.js');
+    engineVersion = (await resolveLatestEngineVersion()).version;
+  }
 
   const writePin = () => {
     try {
