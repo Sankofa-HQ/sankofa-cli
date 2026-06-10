@@ -59,6 +59,10 @@ export interface EngineManifest {
   engine_rev: string;
   uploaded_at_unix?: number;
   targets?: string[];
+  /** CDN URL of the customer-distributable SDK tarball (the repo is private). */
+  sdk_url?: string;
+  /** SHA-256 of sdk.tar.gz — verified before unpacking. */
+  sdk_sha256?: string;
 }
 
 /**

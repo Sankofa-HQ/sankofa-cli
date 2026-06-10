@@ -1,8 +1,12 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, statSync } from 'fs';
-import { homedir } from 'os';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, statSync, unlinkSync } from 'fs';
+import { createHash } from 'crypto';
+import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { execSync } from 'child_process';
-import { branchForEngineVersion, SANKOFA_STORAGE_BASE_URL } from './engineVersion.js';
+import {
+  branchForEngineVersion,
+  SANKOFA_STORAGE_BASE_URL,
+} from './engineVersion.js';
 
 /**
  * # Bundled Flutter SDK cache
@@ -220,18 +224,36 @@ export function installBundledFlutter(
     return bundledFlutterInfo(sankofaEngineVersion);
   }
 
+  // Primary path: download the SDK tarball published by every engine
+  // release (the sankofa-flutter repo is private — customers can't clone
+  // it). Falls back to git clone for pre-tarball versions and for
+  // Sankofa-internal machines with repo access.
+  let installedVia = '';
+  try {
+    installedVia = installFromTarball(sankofaEngineVersion, root, opts.onProgress);
+  } catch (err: any) {
+    opts.onProgress?.(`SDK tarball unavailable (${err.message}) — falling back to git clone`);
+  }
+
   const repoUrl = opts.repoUrl || SANKOFA_FLUTTER_REPO_URL;
   // Per-stable branches: 3.44.1+sankofa-1 → phase1/sankofa-3.44.1.
   const ref = opts.ref || branchForEngineVersion(sankofaEngineVersion);
-  opts.onProgress?.(`Cloning ${repoUrl} (${ref}) into ${root}`);
 
-  try {
-    execSync(
-      `git clone --depth 1 --branch ${shellQuote(ref)} ${shellQuote(repoUrl)} ${shellQuote(root)}`,
-      { stdio: 'inherit' },
-    );
-  } catch (err: any) {
-    throw new Error(`git clone failed for ${repoUrl} (${ref}): ${err.message}`);
+  if (!installedVia) {
+    opts.onProgress?.(`Cloning ${repoUrl} (${ref}) into ${root}`);
+    try {
+      execSync(
+        `git clone --depth 1 --branch ${shellQuote(ref)} ${shellQuote(repoUrl)} ${shellQuote(root)}`,
+        { stdio: 'inherit' },
+      );
+      installedVia = `git:${ref}`;
+    } catch (err: any) {
+      throw new Error(
+        `Could not install the Sankofa Flutter SDK ${sankofaEngineVersion}: ` +
+          `the CDN tarball was unavailable and git clone failed (${err.message}). ` +
+          `Check network access to ${SANKOFA_STORAGE_BASE_URL}.`,
+      );
+    }
   }
 
   // Write a tiny manifest so subsequent commands can confirm provenance
@@ -242,8 +264,7 @@ export function installBundledFlutter(
     JSON.stringify(
       {
         sankofa_engine_version: sankofaEngineVersion,
-        repo_url: repoUrl,
-        ref,
+        installed_via: installedVia,
         installed_at_unix: Math.floor(Date.now() / 1000),
       },
       null,
@@ -304,6 +325,67 @@ export function resolveBundledFlutter(
   if (!version) return null;
   const info = bundledFlutterInfo(version);
   return info.exists ? info : null;
+}
+
+/**
+ * Download + verify + unpack the SDK tarball for `version` into `root`.
+ * Returns a provenance string on success; throws when the manifest has
+ * no sdk_url (pre-tarball release) or any download/verify step fails.
+ *
+ * Synchronous on purpose: installBundledFlutter is sync and is called
+ * from sync contexts (init, engine install). curl handles the transfer;
+ * the SHA check streams the file once via Node's crypto.
+ */
+function installFromTarball(
+  version: string,
+  root: string,
+  onProgress?: (msg: string) => void,
+): string {
+  const manifestUrl = `${SANKOFA_STORAGE_BASE_URL}/engines/sankofa/by-version/${encodeURIComponent(version)}.json`;
+  let manifest: { sdk_url?: string; sdk_sha256?: string };
+  try {
+    const raw = execSync(`curl -fsSL --max-time 30 ${shellQuote(manifestUrl)}`, {
+      encoding: 'utf-8',
+    });
+    manifest = JSON.parse(raw);
+  } catch (err: any) {
+    throw new Error(`manifest fetch failed for ${version}`);
+  }
+  if (!manifest.sdk_url || !manifest.sdk_sha256) {
+    throw new Error(`no sdk tarball published for ${version}`);
+  }
+
+  const tarPath = join(tmpdir(), `sankofa-sdk-${version.replace(/[^\w.-]/g, '_')}.tar.gz`);
+  onProgress?.(`Downloading SDK tarball for ${version}…`);
+  execSync(
+    `curl -fSL --retry 3 --retry-all-errors --max-time 900 -o ${shellQuote(tarPath)} ${shellQuote(manifest.sdk_url)}`,
+    { stdio: ['ignore', 'ignore', 'inherit'] },
+  );
+
+  onProgress?.('Verifying SDK tarball (sha256)…');
+  const actual = execSync(`shasum -a 256 ${shellQuote(tarPath)}`, { encoding: 'utf-8' })
+    .split(' ')[0]
+    .trim();
+  if (actual !== manifest.sdk_sha256.toLowerCase()) {
+    try { unlinkSync(tarPath); } catch { /* ignore */ }
+    throw new Error(
+      `SDK tarball SHA mismatch (expected ${manifest.sdk_sha256.slice(0, 12)}…, got ${actual.slice(0, 12)}…)`,
+    );
+  }
+
+  onProgress?.('Unpacking SDK…');
+  mkdirSync(root, { recursive: true });
+  try {
+    execSync(`tar -xzf ${shellQuote(tarPath)} -C ${shellQuote(root)}`, { stdio: 'inherit' });
+  } catch (err: any) {
+    // A half-unpacked SDK is worse than none — wipe so the next attempt
+    // (or the git fallback) starts clean.
+    rmSync(root, { recursive: true, force: true });
+    throw new Error(`tarball unpack failed: ${err.message}`);
+  } finally {
+    try { unlinkSync(tarPath); } catch { /* ignore */ }
+  }
+  return `tarball:${manifest.sdk_url}`;
 }
 
 function shellQuote(s: string): string {

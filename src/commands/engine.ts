@@ -235,11 +235,12 @@ engineCommand
     console.log(chalk.bold(`  Installing Sankofa engine ${resolved}`));
     console.log('');
 
-    // Step 1: bundled flutter SDK.
-    const present = bundledFlutterInfo(resolved);
-    if (present.exists && !opts.force) {
-      console.log(`  ${chalk.green('✓')} Bundled flutter already present at ${chalk.dim(present.root)}`);
-    } else {
+    // Step 1: bundled flutter SDK. Always goes through
+    // installBundledFlutter — even when the clone already exists — so a
+    // half-bootstrapped bundle (clone present, dart-sdk download
+    // interrupted) gets its warm-up finished instead of being reported
+    // as ready.
+    {
       const spinner = ora('  Installing bundled flutter SDK…').start();
       try {
         const info = installBundledFlutter(resolved, {
