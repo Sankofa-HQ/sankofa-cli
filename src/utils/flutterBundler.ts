@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from 'fs';
 import { createHash } from 'crypto';
 import { join, resolve } from 'path';
 import { resolveBundledFlutter } from './flutterBundleCache.js';
@@ -308,7 +308,6 @@ function sha256OfFile(path: string): string {
   // We've already established the file exists. `readFileSync` reads the
   // whole file into memory, which we want to avoid for libflutter.so.
   // Node's `fs.openSync` + chunked reads keep the working set bounded.
-  const { openSync, readSync, closeSync } = require('fs') as typeof import('fs');
   const fd = openSync(path, 'r');
   try {
     const buf = Buffer.alloc(64 * 1024);
