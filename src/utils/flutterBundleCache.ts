@@ -246,6 +246,15 @@ export function installBundledFlutter(
         `git clone --depth 1 --branch ${shellQuote(ref)} ${shellQuote(repoUrl)} ${shellQuote(root)}`,
         { stdio: 'inherit' },
       );
+      // A depth-1 clone has no tags, so flutter_tools reports version
+      // "0.0.0-unknown" and every pub SDK constraint fails. Tag the tip
+      // locally with the Flutter version (mirrors what the tarball ships).
+      const fv = sankofaEngineVersion.split('+')[0];
+      if (/^\d+\.\d+\.\d+$/.test(fv)) {
+        try {
+          execSync(`git -C ${shellQuote(root)} tag -f ${shellQuote(fv)}`, { stdio: 'ignore' });
+        } catch { /* cosmetic — version banner only */ }
+      }
       installedVia = `git:${ref}`;
     } catch (err: any) {
       throw new Error(
@@ -341,7 +350,8 @@ function installFromTarball(
   root: string,
   onProgress?: (msg: string) => void,
 ): string {
-  const manifestUrl = `${SANKOFA_STORAGE_BASE_URL}/engines/sankofa/by-version/${encodeURIComponent(version)}.json`;
+  // ?cb= forces edge revalidation — manifests are mutable pointers.
+  const manifestUrl = `${SANKOFA_STORAGE_BASE_URL}/engines/sankofa/by-version/${encodeURIComponent(version)}.json?cb=${Date.now()}`;
   let manifest: { sdk_url?: string; sdk_sha256?: string };
   try {
     const raw = execSync(`curl -fsSL --max-time 30 ${shellQuote(manifestUrl)}`, {

@@ -70,7 +70,10 @@ export interface EngineManifest {
  * callers decide whether that's fatal (install) or soft (version probe).
  */
 export async function fetchEngineManifest(engineVersion: string): Promise<EngineManifest> {
-  const url = `${SANKOFA_STORAGE_BASE_URL}/engines/sankofa/by-version/${encodeURIComponent(engineVersion)}.json`;
+  // Manifests are MUTABLE pointers — the cache-busting query forces the
+  // CDN edge to revalidate instead of serving a stale (up to 24 h) copy.
+  // Artifacts themselves stay long-cached; their keys are immutable.
+  const url = `${SANKOFA_STORAGE_BASE_URL}/engines/sankofa/by-version/${encodeURIComponent(engineVersion)}.json?cb=${Date.now()}`;
   const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
   if (!res.ok) {
     throw new Error(`engine manifest ${engineVersion} not on CDN (HTTP ${res.status})`);
@@ -89,7 +92,7 @@ export async function resolveLatestEngineVersion(): Promise<{
   manifest?: EngineManifest;
 }> {
   try {
-    const res = await fetch(`${SANKOFA_STORAGE_BASE_URL}/engines/sankofa/latest.json`, {
+    const res = await fetch(`${SANKOFA_STORAGE_BASE_URL}/engines/sankofa/latest.json?cb=${Date.now()}`, {
       signal: AbortSignal.timeout(10_000),
     });
     if (res.ok) {
