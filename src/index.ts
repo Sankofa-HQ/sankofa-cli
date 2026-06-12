@@ -24,6 +24,7 @@ import { catchCommand } from './commands/catch.js';
 import { demoCommand } from './commands/demo.js';
 import { kbcCommand } from './commands/kbc.js';
 import { keysCommand } from './commands/keys.js';
+import { maybePrintUpdateNotices } from './utils/updateCheck.js';
 
 const program = new Command();
 
@@ -68,3 +69,14 @@ program.addCommand(kbcCommand, { hidden: true });
 program.addCommand(keysCommand);
 
 program.parse();
+
+// Update notices (CLI version + project engine pin) — printed after the
+// command's own output, throttled to one network round-trip per 24h via
+// ~/.sankofa/update-check.json, and silent on every failure path. Skipped
+// for plumbing surfaces where unexpected stderr is unwelcome (kbc/CI).
+process.on('exit', () => {
+  const cmd = process.argv[2] || '';
+  if (['kbc', '--version', '-V', '--help', '-h'].includes(cmd)) return;
+  if (process.env.SANKOFA_NO_UPDATE_CHECK === '1' || process.env.CI) return;
+  maybePrintUpdateNotices('0.1.4', process.cwd());
+});
