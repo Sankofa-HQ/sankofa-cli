@@ -345,6 +345,51 @@ export function resolveBundledFlutter(
  * from sync contexts (init, engine install). curl handles the transfer;
  * the SHA check streams the file once via Node's crypto.
  */
+// HTTP downloader portability: macOS always ships curl, but minimal Linux
+// may not. Prefer curl, fall back to wget, and give a clear error if neither
+// exists (rather than the misleading "CDN unavailable / git clone failed").
+let _downloader: 'curl' | 'wget' | null | undefined;
+function hasCmd(c: string): boolean {
+  try {
+    execSync(process.platform === 'win32' ? `where ${c}` : `command -v ${c}`, { stdio: 'ignore' });
+    return true;
+  } catch { return false; }
+}
+function pickDownloader(): 'curl' | 'wget' {
+  if (_downloader === undefined) {
+    _downloader = hasCmd('curl') ? 'curl' : hasCmd('wget') ? 'wget' : null;
+  }
+  if (!_downloader) {
+    throw new Error(
+      'Neither curl nor wget is available. Install one (e.g. `sudo apt install curl`) — Flutter also requires curl on Linux.',
+    );
+  }
+  return _downloader;
+}
+function httpGetText(url: string, maxSeconds = 30): string {
+  return pickDownloader() === 'curl'
+    ? execSync(`curl -fsSL --max-time ${maxSeconds} ${shellQuote(url)}`, { encoding: 'utf-8' })
+    : execSync(`wget -qO- --timeout=${maxSeconds} ${shellQuote(url)}`, { encoding: 'utf-8' });
+}
+function httpGetToFile(url: string, dest: string, maxSeconds = 900): void {
+  if (pickDownloader() === 'curl') {
+    execSync(
+      `curl -fSL --retry 3 --retry-all-errors --max-time ${maxSeconds} -o ${shellQuote(dest)} ${shellQuote(url)}`,
+      { stdio: ['ignore', 'ignore', 'inherit'] },
+    );
+  } else {
+    execSync(
+      `wget -q --tries=3 --timeout=${maxSeconds} -O ${shellQuote(dest)} ${shellQuote(url)}`,
+      { stdio: ['ignore', 'ignore', 'inherit'] },
+    );
+  }
+}
+// SHA-256 in pure Node (createHash) — no dependency on `shasum`, which is
+// absent on many Linux distros (they ship `sha256sum` instead).
+function sha256OfFile(p: string): string {
+  return createHash('sha256').update(readFileSync(p)).digest('hex');
+}
+
 function installFromTarball(
   version: string,
   root: string,
@@ -354,12 +399,9 @@ function installFromTarball(
   const manifestUrl = `${SANKOFA_STORAGE_BASE_URL}/engines/sankofa/by-version/${encodeURIComponent(version)}.json?cb=${Date.now()}`;
   let manifest: { sdk_url?: string; sdk_sha256?: string };
   try {
-    const raw = execSync(`curl -fsSL --max-time 30 ${shellQuote(manifestUrl)}`, {
-      encoding: 'utf-8',
-    });
-    manifest = JSON.parse(raw);
+    manifest = JSON.parse(httpGetText(manifestUrl, 30));
   } catch (err: any) {
-    throw new Error(`manifest fetch failed for ${version}`);
+    throw new Error(`manifest fetch failed for ${version}: ${err.message}`);
   }
   if (!manifest.sdk_url || !manifest.sdk_sha256) {
     throw new Error(`no sdk tarball published for ${version}`);
@@ -367,15 +409,10 @@ function installFromTarball(
 
   const tarPath = join(tmpdir(), `sankofa-sdk-${version.replace(/[^\w.-]/g, '_')}.tar.gz`);
   onProgress?.(`Downloading SDK tarball for ${version}…`);
-  execSync(
-    `curl -fSL --retry 3 --retry-all-errors --max-time 900 -o ${shellQuote(tarPath)} ${shellQuote(manifest.sdk_url)}`,
-    { stdio: ['ignore', 'ignore', 'inherit'] },
-  );
+  httpGetToFile(manifest.sdk_url, tarPath, 900);
 
   onProgress?.('Verifying SDK tarball (sha256)…');
-  const actual = execSync(`shasum -a 256 ${shellQuote(tarPath)}`, { encoding: 'utf-8' })
-    .split(' ')[0]
-    .trim();
+  const actual = sha256OfFile(tarPath);
   if (actual !== manifest.sdk_sha256.toLowerCase()) {
     try { unlinkSync(tarPath); } catch { /* ignore */ }
     throw new Error(
