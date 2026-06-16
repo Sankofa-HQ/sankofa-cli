@@ -54,7 +54,7 @@ export function bundledFlutterRoot(sankofaEngineVersion: string): string {
 
 export function bundledFlutterInfo(sankofaEngineVersion: string): BundledFlutterInfo {
   const root = bundledFlutterRoot(sankofaEngineVersion);
-  const bin = join(root, 'bin', 'flutter');
+  const bin = join(root, 'bin', process.platform === 'win32' ? 'flutter.bat' : 'flutter');
   let exists = false;
   try {
     exists = statSync(bin).isFile();
@@ -88,7 +88,7 @@ export interface InstallBundledFlutterOptions {
  * whether a warm-up is needed.
  */
 function isDartSdkUsable(root: string): boolean {
-  const dart = join(root, 'bin', 'cache', 'dart-sdk', 'bin', 'dart');
+  const dart = join(root, 'bin', 'cache', 'dart-sdk', 'bin', process.platform === 'win32' ? 'dart.exe' : 'dart');
   try {
     return statSync(dart).isFile();
   } catch {
@@ -115,7 +115,7 @@ function warmDartSdkCache(root: string, onProgress?: (msg: string) => void): voi
     return;
   }
   onProgress?.('Warming Dart SDK cache (first-time bootstrap, ~30 s)…');
-  const bin = join(root, 'bin', 'flutter');
+  const bin = join(root, 'bin', process.platform === 'win32' ? 'flutter.bat' : 'flutter');
   try {
     execSync(`${shellQuote(bin)} --version`, {
       stdio: 'inherit',

@@ -157,8 +157,8 @@ export async function resolveFlutterPlatform(
         name: 'picked',
         message: 'Target platform:',
         choices: [
-          { name: 'Android (libapp.so binary-diff)', value: 'android' },
-          { name: 'iOS (Path C — KBC interpreter)', value: 'ios' },
+          { name: 'Android (β.3 — KBC interpreter)', value: 'android' },
+          { name: 'iOS (β.3 — KBC interpreter)', value: 'ios' },
         ],
       },
     ]);
@@ -200,6 +200,14 @@ export function buildFlutterAOT(
      * silently — Flutter does this fast on a warm cache.
      */
     format?: FlutterBuildFormat;
+    /**
+     * Extra `--dart-define=KEY=VALUE` entries to thread into the Flutter
+     * build. Used today to bake `SANKOFA_SKIP_ENGINE_CHECK=1` into the
+     * host binary while the Sankofa engine fork's Dart version string is
+     * still unstamped (`Platform.version` lacks `+sankofa-N`). Once the
+     * fork stamps `tools/VERSION`, this bypass is no longer needed.
+     */
+    dartDefines?: string[];
   } = { outputDir: 'build' },
 ): BuildAndExtractResult {
   const cwd = resolve(projectRoot);
@@ -210,10 +218,15 @@ export function buildFlutterAOT(
   const appVersion = detectFlutterAppVersion(cwd);
   const engine = detectFlutterEngineInfo(cwd);
 
+  // Optional --dart-define passthrough (e.g. SANKOFA_SKIP_ENGINE_CHECK=1).
+  const defineFlags = (opts.dartDefines ?? [])
+    .map((d) => ` --dart-define=${d}`)
+    .join('');
+
   // Always build the APK (cheap when AAB build is also queued — Flutter
   // shares the build graph). We need it to extract libapp.so +
   // AndroidManifest + flutter_assets for Diff Guard.
-  const apkCmd = flutterCmd(cwd, 'build apk --release --target-platform android-arm64');
+  const apkCmd = flutterCmd(cwd, `build apk --release --target-platform android-arm64${defineFlags}`);
   if (opts.verbose) console.log(`  $ ${apkCmd}`);
   execSync(apkCmd, { cwd, stdio: opts.verbose ? 'inherit' : 'pipe' });
 
@@ -221,7 +234,7 @@ export function buildFlutterAOT(
   // artifact for Play Console.
   let aabPath: string | null = null;
   if (format === 'aab') {
-    const aabCmd = flutterCmd(cwd, 'build appbundle --release --target-platform android-arm64');
+    const aabCmd = flutterCmd(cwd, `build appbundle --release --target-platform android-arm64${defineFlags}`);
     if (opts.verbose) console.log(`  $ ${aabCmd}`);
     execSync(aabCmd, { cwd, stdio: opts.verbose ? 'inherit' : 'pipe' });
     aabPath = findAab(cwd);

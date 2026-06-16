@@ -66,6 +66,12 @@ export const releaseCommand = new Command('release')
   .option('--dry-run', 'Build + capture the local safety-check baseline, but do NOT contact the server or upload')
   .option('--apk', 'Android: produce an APK (sideload-installable). Default is --appbundle. (RN + Flutter)')
   .option('--appbundle', 'Android: produce an AAB (Play Store). This is the default. (RN + Flutter)')
+  .option(
+    '--dart-define <KEY=VALUE>',
+    'Flutter: extra dart-define baked into the build (repeatable). Use SANKOFA_SKIP_ENGINE_CHECK=1 if your Sankofa engine fork is unstamped (Platform.version lacks +sankofa-N).',
+    (val: string, acc: string[]) => { acc.push(val); return acc; },
+    [] as string[],
+  )
   .action(async (platformArg: string | undefined, opts) => {
     const chalk = (await import('chalk')).default;
 
@@ -540,6 +546,7 @@ export async function flutterRelease(
       keepApk: true,
       verbose: false,
       format,
+      dartDefines: opts.dartDefine || [],
     });
     buildSpinner.succeed(
       `Built ${format.toUpperCase()}${format === 'aab' ? ' + APK' : ''} + extracted libapp.so (${formatBytes(statSync(built.libappPath).size)})`,

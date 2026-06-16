@@ -275,14 +275,26 @@ $(sankofa engine path)/flutter/bin/flutter clean
 $(sankofa engine path)/flutter/bin/flutter run -d <device-id> --release
 ```
 
-Then on a second terminal, make a UI change in `lib/main.dart` and:
+Then on a second terminal, edit the **patch entry point** `lib/sankofa_patch.dart`
+(NOT `lib/main.dart` — the KBC patch compiles that one file; the host decodes its
+returned value). Keep it Tier-A safe (constant-pool literals only — see the β.3
+architecture doc). Then:
 
 ```sh
-sankofa patch android      # or `sankofa patch ios`
+sankofa patch android --release <baselineLabel>   # or `sankofa patch ios`
 ```
+
+This is **one cross-platform pipeline**: both platforms compile
+`lib/sankofa_patch.dart` → KBC → a signed `.skdp` envelope (no Gradle/Xcode
+rebuild, ~1s). See
+[Android KBC unification](../../flutter-deploy/sankofa-flutter-deploy/docs/codepush-android-kbc-unification.md).
 
 Relaunch the app on the device — the new UI should appear without
 rebuilding the binary.
+
+> **Version match:** the device only gets offered the patch when its installed
+> `app_version` equals the baseline's `target_binary_version`. Install the build
+> the baseline came from (Step earlier) before patching.
 
 ---
 

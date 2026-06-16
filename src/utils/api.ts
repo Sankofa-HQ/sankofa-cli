@@ -240,21 +240,26 @@ export async function uploadRelease(
   // (connection resets mid-upload). openAsBlob lazy-streams the file.
   //
   // Runtime-specific multipart payload:
-  //   react-native           → ota.zip      (application/zip),         bundle_format=zip
-  //   flutter-code / android → libapp.so    (application/octet-stream), bundle_format=so
-  //   flutter-code / ios     → patch.skdp   (application/octet-stream), bundle_format=skdp
-  //                            (SANKOFA_KBC_ENVELOPE, β.4 spec — the
-  //                            server validates magic+sha+version before
-  //                            persisting; see ee/deploy/kbc_envelope.go)
+  //   react-native           → ota.zip      (application/zip),          bundle_format=zip
+  //   flutter-code (ios+android) → patch.skdp (application/octet-stream), bundle_format=skdp
+  //                            (SANKOFA_KBC_ENVELOPE, β.4 spec)
+  //
+  // β.3 ships ONE cross-platform OTA pipeline: KBC bytecode wrapped in a
+  // `.skdp` envelope, applied in the engine's interpreter on BOTH iOS and
+  // Android. KBC is platform-independent, so the same envelope serves both.
+  // The legacy Android `libapp.so` binary-diff path is retired.
+  //
+  // Server handling (ee/deploy/handlers.go:760): for platform=ios it
+  // validates the envelope (magic+sha+sig) and stores it as `patch.skdp`;
+  // for platform=android it stores the uploaded bytes verbatim under a
+  // `libapp.so` object key (a cosmetic filename — the device downloads the
+  // stored bytes and parses them as an envelope regardless, re-verifying
+  // sha + Ed25519 on-device in kbc_loader.dart). So uploading `.skdp` bytes
+  // for android flows through correctly without a server change.
   const isFlutterCode = metadata.runtime === 'flutter-code';
-  const isIos = (platform || '').toLowerCase() === 'ios';
   const bundleContentType = isFlutterCode ? 'application/octet-stream' : 'application/zip';
-  const bundleFilename = isFlutterCode
-    ? (isIos ? 'patch.skdp' : 'libapp.so')
-    : 'ota.zip';
-  const bundleFormat = isFlutterCode
-    ? (isIos ? 'skdp' : 'so')
-    : 'zip';
+  const bundleFilename = isFlutterCode ? 'patch.skdp' : 'ota.zip';
+  const bundleFormat = isFlutterCode ? 'skdp' : 'zip';
   const bundleBlob = await openAsBlob(bundlePath, { type: bundleContentType });
   form.append('bundle', bundleBlob, bundleFilename);
   form.append('bundle_format', bundleFormat);

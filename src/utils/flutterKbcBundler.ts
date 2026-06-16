@@ -125,7 +125,7 @@ export function buildKbcPatch(opts: KbcBuildOptions): KbcBuildResult {
   // to a project — falls back to PATH for standalone CLI invocations.
   const flutterDartSdk =
     opts.flutterDartSdk ?? resolveFlutterDartSdk(opts.entryFile ? dirname(resolve(opts.entryFile)) : undefined);
-  const dartaotruntime = join(flutterDartSdk, 'bin', 'dartaotruntime');
+  const dartaotruntime = join(flutterDartSdk, 'bin', process.platform === 'win32' ? 'dartaotruntime.exe' : 'dartaotruntime');
   const snapshot = join(
     flutterDartSdk,
     'bin',
