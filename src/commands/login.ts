@@ -1,8 +1,58 @@
 import { Command } from 'commander';
 import { createServer } from 'http';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { hostname, userInfo } from 'os';
+import { join } from 'path';
 import { saveGlobalConfig, saveProjectConfig } from '../utils/config.js';
 import { createDeployToken } from '../utils/api.js';
+
+/**
+ * After a successful login, link the project in the current directory to the
+ * selected project — so `sankofa check` / `doctor` / `release` resolve it
+ * without a manual `--project-id`. Backfills WITHOUT writing the deploy token
+ * (that stays in ~/.sankofa/credentials.json, never in the project file):
+ *   - `.sankofa.json` (created by `sankofa init`): fill empty projectId /
+ *     endpoint / environment, preserve everything else (e.g. `products`).
+ *   - `sankofa.yaml` (Flutter Deploy): fill the `app_id` placeholder
+ *     (app_id == projectId). `api_key` stays manual — it's the runtime SDK key
+ *     pasted from the dashboard, not the deploy token login mints.
+ */
+function linkProjectFiles(
+  projectId: string,
+  endpoint: string,
+  environment: 'live' | 'test',
+  chalk: any,
+): void {
+  try {
+    const p = join(process.cwd(), '.sankofa.json');
+    if (existsSync(p)) {
+      const cfg = JSON.parse(readFileSync(p, 'utf-8')) as Record<string, unknown>;
+      let changed = false;
+      if (!cfg.projectId) { cfg.projectId = projectId; changed = true; }
+      if (!cfg.endpoint) { cfg.endpoint = endpoint; changed = true; }
+      if (!cfg.environment) { cfg.environment = environment; changed = true; }
+      if (changed) {
+        writeFileSync(p, JSON.stringify(cfg, null, 2) + '\n');
+        console.log(chalk.dim(`  Linked .sankofa.json → ${projectId}`));
+      }
+    }
+  } catch { /* non-fatal */ }
+
+  try {
+    const y = join(process.cwd(), 'sankofa.yaml');
+    if (existsSync(y)) {
+      const s = readFileSync(y, 'utf-8');
+      const appIdRe = /^app_id:[ \t]*(.*)$/m;
+      const m = appIdRe.exec(s);
+      const val = m ? m[1].trim() : '';
+      const isPlaceholder = !val || val.startsWith('<') || /your-app-id|proj_xxx/i.test(val);
+      if (m && isPlaceholder) {
+        writeFileSync(y, s.replace(appIdRe, `app_id: ${projectId}`));
+        console.log(chalk.dim('  Set app_id in sankofa.yaml (paste your api_key to finish)'));
+      }
+    }
+  } catch { /* non-fatal */ }
+}
 
 /**
  * Normalize an endpoint the user typed: add a scheme when missing, strip any
@@ -288,6 +338,11 @@ export const loginCommand = new Command('login')
         saveGlobalConfig(config);
         console.log(chalk.dim('  Saved to ~/.sankofa/credentials.json'));
       }
+
+      // Link the project in this directory (if it was `sankofa init`'d) so
+      // check/doctor/release resolve it — without leaking the token into a
+      // potentially-committed file.
+      linkProjectFiles(config.projectId, config.endpoint, config.environment, chalk);
 
       console.log('');
       console.log(chalk.green.bold('  Ready to deploy!'));

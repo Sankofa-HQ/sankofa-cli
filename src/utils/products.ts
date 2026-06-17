@@ -33,7 +33,7 @@ export const PRODUCTS: Record<ProductId, ProductInfo> = {
     id: 'deploy',
     name: 'Sankofa Deploy',
     flag: '--deploy',
-    description: 'Over-the-air updates for JS bundles and Flutter libapp.so',
+    description: 'Over-the-air code updates for Flutter and React Native',
     supportedStacks: ['react-native', 'flutter'],
   },
   switch: {

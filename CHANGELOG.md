@@ -3,6 +3,26 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.6 — Flutter init/login onboarding fixes
+
+### Fixed
+- **`sankofa init` no longer corrupts a project's `pubspec.yaml`.** When a project
+  already had a `dependency_overrides:` block, init appended a *second* one →
+  invalid YAML (`Duplicate mapping key`) that broke all Flutter tooling. It now
+  **merges** the entry into the existing block (idempotent).
+- **Flavored apps (no `lib/main.dart`)** — init used to silently "skip" the
+  startup wiring with a misleading ✓. It now detects the real startup file
+  (e.g. `lib/main_common.dart`) and prints a clear **ACTION REQUIRED** warning
+  with the exact lines to add and where, since patches won't apply without it.
+- **`sankofa login` now links the project.** It backfills the local
+  `.sankofa.json` `projectId` (previously left empty after login → `check`
+  warned) and the `sankofa.yaml` `app_id` — without writing the deploy token
+  into the project file. `api_key` is still pasted from the dashboard (it's the
+  runtime SDK key, not the deploy token).
+
+### Changed
+- Product picker description no longer exposes internal/implementation details.
+
 ## 0.1.5 — release-branch rename
 
 ### Changed

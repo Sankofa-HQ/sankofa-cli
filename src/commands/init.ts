@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from 'fs';
 import { EOL } from 'os';
-import { join } from 'path';
+import { join, relative } from 'path';
 import { loadGlobalConfig } from '../utils/config.js';
 import {
   resolveProjectRoot,
@@ -519,18 +519,36 @@ async function tryAddSankofaFlutterToPubspec(pubspecPath: string, chalk: any): P
       console.log(chalk.dim('     ✓ sankofa_flutter already in pubspec.yaml'));
     }
 
-    // ── 2. Add the dependency_overrides stanza pointing at the
-    //       vendored trampoline. Customer SEES this block but doesn't
-    //       touch it — managed by `sankofa init`.
-    if (!/dependency_overrides:[\s\S]*?dynamic_modules:/.test(text)) {
+    // ── 2. Point a `dependency_overrides` entry at the vendored package.
+    //       CRITICAL: a project may ALREADY have a `dependency_overrides:`
+    //       block. YAML forbids duplicate top-level keys, so we must MERGE
+    //       our entry into the existing block — never append a second one
+    //       (that produces `Duplicate mapping key` and breaks all Flutter
+    //       tooling). Three cases: already-wired (skip), block exists
+    //       (merge), no block (append).
+    const overridesHeaderRe = /^dependency_overrides:[ \t]*\n/m;
+    if (/^[ \t]+path:[ \t]*\.sankofa\/dynamic_modules\b/m.test(text)) {
+      console.log(chalk.dim('     ✓ dependency_overrides already points at .sankofa/dynamic_modules'));
+    } else if (overridesHeaderRe.test(text)) {
+      // Merge: insert our entry as the first child of the existing block.
+      text = text.replace(
+        overridesHeaderRe,
+        (header) =>
+          header +
+          `  # Sankofa-managed — do not edit by hand. Re-run \`sankofa init\` to regenerate.\n` +
+          `  dynamic_modules:\n` +
+          `    path: .sankofa/dynamic_modules\n`,
+      );
+      touched = true;
+      console.log(chalk.green('     ✓ Merged dynamic_modules into existing dependency_overrides'));
+    } else {
+      // No existing block — append a fresh one at the end of the file.
       const block =
         `\n# Sankofa-managed — do not edit by hand. Re-run \`sankofa init\` if\n` +
         `# you need to regenerate the vendored package.\n` +
         `dependency_overrides:\n` +
         `  dynamic_modules:\n` +
         `    path: .sankofa/dynamic_modules\n`;
-      // Append to the END of the file (idempotent — the regex above
-      // already short-circuited if the block exists).
       if (!text.endsWith('\n')) text += '\n';
       text += block;
       touched = true;
@@ -709,7 +727,13 @@ function tryCreateSankofaYaml(
 function tryWireFlutterMainDart(projectRoot: string, chalk: any): boolean {
   const mainPath = join(projectRoot, 'lib', 'main.dart');
   if (!existsSync(mainPath)) {
-    console.log(chalk.dim('     ✓ lib/main.dart not found — skipping (apply the snippet from the cookbook manually)'));
+    // No standard lib/main.dart — common in flavored apps (main_common.dart +
+    // main_<flavor>.dart). Auto-editing an arbitrary custom bootstrap is risky,
+    // so DON'T silently skip: detect the real startup file and tell the user
+    // exactly what to add. (This is REQUIRED — Deploy can't apply patches
+    // without the wiring.)
+    const entry = findFlutterStartupFile(projectRoot);
+    printManualMainSnippet(chalk, entry ? relative(projectRoot, entry) : null);
     return false;
   }
   try {
@@ -761,7 +785,7 @@ function tryWireFlutterMainDart(projectRoot: string, chalk: any): boolean {
     const m = mainSig.exec(src);
     if (!m) {
       console.log(chalk.yellow('     ⚠ Could not find `main()` in lib/main.dart — wire it manually:'));
-      printManualMainSnippet(chalk);
+      printManualMainSnippet(chalk, 'lib/main.dart');
       writeFileSync(mainPath, src); // still save the import additions
       return importsToAdd.length > 0;
     }
@@ -776,7 +800,7 @@ function tryWireFlutterMainDart(projectRoot: string, chalk: any): boolean {
       const arrowMatch = src.slice(m.index).match(/^[^=>]*=>\s*([^;]+);/);
       if (!arrowMatch) {
         console.log(chalk.yellow('     ⚠ Unusual arrow `main()` — wire it manually:'));
-        printManualMainSnippet(chalk);
+        printManualMainSnippet(chalk, 'lib/main.dart');
         writeFileSync(mainPath, src);
         return importsToAdd.length > 0;
       }
@@ -849,22 +873,71 @@ function tryWireFlutterMainDart(projectRoot: string, chalk: any): boolean {
     return true;
   } catch (err: any) {
     console.log(chalk.yellow(`     ⚠ Could not auto-edit lib/main.dart: ${err.message}`));
-    printManualMainSnippet(chalk);
+    printManualMainSnippet(chalk, 'lib/main.dart');
     return false;
   }
 }
 
-function printManualMainSnippet(chalk: any): void {
-  console.log(chalk.dim('       Paste at the top of lib/main.dart\'s `main()`:\n'));
-  console.log(chalk.cyan(`         import 'package:dynamic_modules/dynamic_modules.dart';
+function printManualMainSnippet(chalk: any, entryFile?: string | null): void {
+  const where = entryFile
+    ? `${entryFile} (your app's startup — it calls runApp)`
+    : `your app's startup function (the one that calls runApp)`;
+  console.log(chalk.yellow('     ⚠ ACTION REQUIRED — could not auto-wire your app startup.'));
+  console.log(
+    chalk.yellow(`       Sankofa Deploy patches will NOT apply until you add the wiring to ${where}.`),
+  );
+  console.log(
+    chalk.dim('       Add the imports at the top of the file, then the two calls right after'),
+  );
+  console.log(chalk.dim('       WidgetsFlutterBinding.ensureInitialized() and before runApp():\n'));
+  console.log(chalk.cyan(`         // ignore: depend_on_referenced_packages
+         import 'package:dynamic_modules/dynamic_modules.dart';
          import 'package:sankofa_flutter/sankofa_flutter.dart';
 
-         void main() async {
-           WidgetsFlutterBinding.ensureInitialized();
-           SankofaUpdater.registerLoader(loadModuleFromBytes);
-           await SankofaUpdater.preFlight();
-           runApp(const MyApp());
-         }`));
+         // inside your async startup function, before runApp():
+         WidgetsFlutterBinding.ensureInitialized();
+         SankofaUpdater.registerLoader(loadModuleFromBytes);
+         await SankofaUpdater.preFlight();`));
+}
+
+/**
+ * Locate the Flutter app's startup file when there's no standard
+ * `lib/main.dart`. Flavored apps put the shared bootstrap in
+ * `main_common.dart` (a `mainCommon()` that calls `runApp`), with thin
+ * `main_<flavor>.dart` entrypoints. Returns the most likely bootstrap file
+ * (one that calls `runApp` — preferring one that also bootstraps the
+ * binding), or null if none is found.
+ */
+function findFlutterStartupFile(projectRoot: string): string | null {
+  const libDir = join(projectRoot, 'lib');
+  if (!existsSync(libDir)) return null;
+  const dartFiles: string[] = [];
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 2 || !existsSync(dir)) return;
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p, depth + 1);
+      else if (e.isFile() && e.name.endsWith('.dart')) dartFiles.push(p);
+    }
+  };
+  try {
+    walk(libDir, 0);
+  } catch {
+    /* permission / IO — fall through to whatever we collected */
+  }
+  let fallback: string | null = null;
+  for (const p of dartFiles) {
+    let src = '';
+    try {
+      src = readFileSync(p, 'utf-8');
+    } catch {
+      continue;
+    }
+    if (!/runApp\s*\(/.test(src)) continue;
+    if (/WidgetsFlutterBinding\.ensureInitialized\s*\(/.test(src)) return p; // best match
+    fallback ??= p;
+  }
+  return fallback;
 }
 
 /**
