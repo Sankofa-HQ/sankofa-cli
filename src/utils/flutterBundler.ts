@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync } from 'fs';
 import { createHash } from 'crypto';
 import { join, resolve } from 'path';
 import { resolveBundledFlutter } from './flutterBundleCache.js';
@@ -253,11 +253,15 @@ export function buildFlutterAOT(
   //  - assets/flutter_assets/*      — Diff Guard baseline
   const extractDir = join(outputDir, `apk-extract-${Date.now()}`);
   mkdirSync(extractDir, { recursive: true });
+  // Extract the APK contents. Unix has `unzip`; Windows ships `tar` (bsdtar /
+  // libarchive), which reads zip archives — so on Windows we extract the whole
+  // APK with tar (the extra entries are harmless in this throwaway temp dir).
+  // GNU tar (Linux) can't read zip, so Unix keeps `unzip`.
+  const extractCmd = process.platform === 'win32'
+    ? `tar -xf "${apk}" -C "${extractDir}"`
+    : `unzip -o -q "${apk}" "lib/arm64-v8a/libapp.so" "lib/arm64-v8a/libflutter.so" "AndroidManifest.xml" "assets/flutter_assets/*" -d "${extractDir}"`;
   try {
-    execSync(
-      `unzip -o -q "${apk}" "lib/arm64-v8a/libapp.so" "lib/arm64-v8a/libflutter.so" "AndroidManifest.xml" "assets/flutter_assets/*" -d "${extractDir}"`,
-      { stdio: opts.verbose ? 'inherit' : 'pipe' },
-    );
+    execSync(extractCmd, { stdio: opts.verbose ? 'inherit' : 'pipe' });
   } catch (err: any) {
     throw new Error(
       `Failed to extract libapp.so / libflutter.so from ${apk}: ${err.message}\n` +
@@ -291,9 +295,12 @@ export function buildFlutterAOT(
   const finalLibapp = join(outputDir, `libapp.${engine.sankofaEngineVersion}.so`);
   const finalLibflutter = join(outputDir, `libflutter.${engine.sankofaEngineVersion}.so`);
   // Move libapp.so + libflutter.so to their final names; keep the rest
-  // of the extracted tree around for Diff Guard.
-  execSync(`mv "${libappInExtract}" "${finalLibapp}"`);
-  execSync(`mv "${libflutterInExtract}" "${finalLibflutter}"`);
+  // of the extracted tree around for Diff Guard. (Node fs.renameSync —
+  // cross-platform; the previous `mv` shell-out failed on Windows.)
+  if (existsSync(finalLibapp)) rmSync(finalLibapp, { force: true });
+  if (existsSync(finalLibflutter)) rmSync(finalLibflutter, { force: true });
+  renameSync(libappInExtract, finalLibapp);
+  renameSync(libflutterInExtract, finalLibflutter);
   // Drop the now-empty lib/arm64-v8a/ but keep AndroidManifest.xml +
   // assets/flutter_assets/.
   rmSync(join(extractDir, 'lib'), { recursive: true, force: true });

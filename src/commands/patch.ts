@@ -18,7 +18,7 @@ import { resolveProjectRoot, type ProjectInfo } from '../utils/stack.js';
 import { escapeRegExp, parseRollout } from '../utils/validation.js';
 import { detectFlutterEngineInfo, resolveFlutterPlatform } from '../utils/flutterBundler.js';
 import { readBaselineManifest } from '../utils/baseline.js';
-import { buildKbcPatch } from '../utils/flutterKbcBundler.js';
+import { buildKbcPatch, resolveFlutterDartSdk } from '../utils/flutterKbcBundler.js';
 import { wrapKbc, type KbcEnvelopeMetadata } from '../utils/flutterKbcEnvelope.js';
 import { loadSigningKey, signEd25519 } from './keys.js';
 
@@ -518,6 +518,10 @@ async function flutterKbcPatch(
       entryFile,
       outputPath: kbcPath,
       validateYaml: dynamicInterface,
+      // Resolve the dart-sdk from the PROJECT root (where sankofa.yaml lives).
+      // buildKbcPatch otherwise derives it from dirname(entryFile)=lib/, which
+      // misses sankofa.yaml → falls back to PATH flutter (absent on Windows).
+      flutterDartSdk: resolveFlutterDartSdk(projectRoot),
     });
     buildSpinner.succeed(`Patch compiled (${buildResult.sizeBytes} B).`);
   } catch (err: any) {

@@ -461,9 +461,12 @@ export function extractEmbeddedOTA(
     }
     mkdirSync(unzipDir, { recursive: true });
     try {
-      execSync(`unzip -o -q ${shellQuote(artifactPath)} -d ${shellQuote(unzipDir)}`, {
-        stdio: 'inherit',
-      });
+      // Unix: `unzip`. Windows: `tar` (bsdtar reads zips; GNU tar on Linux can't,
+      // so Unix keeps unzip).
+      const cmd = process.platform === 'win32'
+        ? `tar -xf ${shellQuote(artifactPath)} -C ${shellQuote(unzipDir)}`
+        : `unzip -o -q ${shellQuote(artifactPath)} -d ${shellQuote(unzipDir)}`;
+      execSync(cmd, { stdio: 'inherit' });
       const bundleInApk = join(unzipDir, 'assets', 'index.android.bundle');
       if (!existsSync(bundleInApk)) return false;
       copyFileSync(bundleInApk, join(stageDir, 'bundle.jsbundle'));

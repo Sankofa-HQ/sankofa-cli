@@ -86,10 +86,14 @@ export function resolveFlutterDartSdk(projectRoot?: string): string {
     }
   }
 
-  // 2) Customer's flutter on PATH.
+  // 2) Customer's flutter on PATH. (`where` on Windows finds flutter.bat;
+  // `which` on Unix. `where` can print multiple matches — take the first.)
   let flutterBin: string;
   try {
-    flutterBin = execFileSync('which', ['flutter'], { encoding: 'utf-8' }).trim();
+    const finder = process.platform === 'win32'
+      ? execFileSync('where', ['flutter'], { encoding: 'utf-8' })
+      : execFileSync('which', ['flutter'], { encoding: 'utf-8' });
+    flutterBin = finder.trim().split(/\r?\n/)[0].trim();
   } catch {
     throw new Error('flutter not found on PATH — install Flutter SDK or run `sankofa doctor`.');
   }
