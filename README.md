@@ -10,7 +10,7 @@ The command-line tool for [Sankofa](https://sankofa.dev) — **OTA updates** for
 
 **Sankofa Deploy** — Ship code changes to your already-released app without cutting a new native build.
 
-- **Flutter** — Dart kernel bytecode patches running inside the Sankofa-forked Flutter engine. App Store + Play Store compliant (Apple PLA § 3.3.2 + Google Play DNA interpreted-VM carve-out). No JIT entitlement.
+- **Flutter** — ship Dart code updates to your already-released app over the air. App Store + Play Store compliant.
 - **React Native / Expo** — JS bundle patches with phased rollouts, auto-rollback, and a kill switch.
 
 **Analytics + Catch + Switch + Config + Pulse + Replay** — Event tracking, session replays, heatmaps, crash reporting, feature flags, and remote config. Works on Flutter, React Native, Web (npm + CDN), iOS (Swift), and Android (Kotlin).
@@ -42,7 +42,7 @@ The command-line tool for [Sankofa](https://sankofa.dev) — **OTA updates** for
     - [`submit`](#submit)
     - [`releases` / `patches`](#releases--patches)
     - [`rules` / `schedule` / `defaults`](#rules--schedule--defaults)
-    - [`keys`](#keys) · [`engine`](#engine) · [`kbc`](#kbc) *(Flutter)*
+    - [`keys`](#keys) · [`engine`](#engine) *(Flutter)*
     - [`update` / `upgrade`](#update--upgrade)
 8. [The release pipeline](#the-release-pipeline)
 9. [Asset handling (fonts, images, videos…)](#asset-handling-fonts-images-videos)
@@ -76,12 +76,12 @@ The command-line tool for [Sankofa](https://sankofa.dev) — **OTA updates** for
 
 ### Deploy (Flutter + React Native)
 
-The same `release` / `patch` / `deploy` / `preview` / `status` commands cover both Flutter and React Native — the CLI detects the stack from your `pubspec.yaml` / `package.json` and runs the right pipeline. Flutter ships Dart kernel bytecode (KBC) patches; React Native ships JS bundles.
+The same `release` / `patch` / `deploy` / `preview` / `status` commands cover both Flutter and React Native — the CLI detects the stack from your `pubspec.yaml` / `package.json` and runs the right pipeline for each.
 
 | Command | Purpose |
 |---|---|
 | `sankofa release` | Build native + stage OTA archive + publish base release + produce signed store binary (`.ipa` / `.aab` / `.apk`). |
-| `sankofa patch` | Ship a code-only OTA patch — Dart bytecode (Flutter) or JS bundle (React Native) — against an existing base release. iOS Flutter uses the Sankofa engine's bytecode interpreter (no JIT entitlement required). |
+| `sankofa patch` | Ship a code-only OTA patch against an existing base release — no native rebuild. App Store + Play Store compliant on both iOS and Android. |
 | `sankofa deploy` | Smart wrapper that picks `release` (first time) or `patch` (subsequent) automatically. |
 | `sankofa preview` | Download + install + launch a release on a simulator/emulator. Streams runtime logs. |
 | `sankofa status` | Read-only summary of all releases for the current project. |
@@ -91,17 +91,16 @@ The same `release` / `patch` / `deploy` / `preview` / `status` commands cover bo
 | `sankofa dist` | Build ONLY the signed store binary. No Sankofa release is published. |
 | `sankofa submit` | Upload the signed binary to App Store Connect (iOS) or Play Console (Android). |
 
-### Flutter Deploy: keys + engine + KBC
+### Flutter Deploy: keys + runtime
 
-Flutter-only — these become relevant after `sankofa init --deploy`. The setup writes `.sankofa/flutter-version` (engine pin) and `sankofa.yaml` (project keys); the commands below read them automatically.
+Flutter-only — these become relevant after `sankofa init --deploy`. The setup writes `sankofa.yaml` (project keys) and a local runtime pin; the commands below read them automatically.
 
 | Command | Purpose |
 |---|---|
-| `sankofa keys generate` | Create an Ed25519 keypair for signing patches in this project. |
-| `sankofa keys show` / `path` / `register` | Print the public key, print the on-disk private-key path (back this up), POST the public key to the server. |
-| `sankofa engine list` / `download` / `install` | Manage the cached Sankofa-fork Flutter engine binaries. `install [version]` brings down the bundled SDK + every engine ABI in one shot. |
-| `sankofa engine verify` / `path` | Re-hash every cached engine against the registry; print the cache root. |
-| `sankofa kbc build` / `wrap` / `inspect` | Low-level Dart kernel bytecode tools. Most customers never run these — `sankofa release` and `sankofa patch` orchestrate them. |
+| `sankofa keys generate` | Create a signing keypair for this project's patches. |
+| `sankofa keys show` / `path` / `register` | Print the public key, print the on-disk private-key path (back this up), register the public key with the server. |
+| `sankofa engine list` / `download` / `install` | Manage the Sankofa Flutter runtime. `install [version]` brings down the bundled SDK + runtime in one shot. |
+| `sankofa engine verify` / `path` | Re-verify the cached runtime against the registry; print the cache root. |
 
 ### Keeping the stack fresh
 
@@ -120,7 +119,7 @@ Every command that hits the server short-circuits with a clean "you are not logg
 
 | Platform | Detection | SDK Package | `init --deploy` does | Deploy support |
 |---|---|---|---|---|
-| **Flutter** | `pubspec.yaml` exists | `sankofa_flutter` (pub.dev) | Adds `sankofa_flutter` + `dependency_overrides:` for `dynamic_modules`, creates `sankofa.yaml` with `app_id` pre-filled, vendors the binding into `.sankofa/`, wires `lib/main.dart` with `SankofaUpdater.registerLoader` + `preFlight`, adds Sankofa meta-data to `AndroidManifest.xml` + `Info.plist`, rewrites `MainActivity.kt` + `AppDelegate.swift` to extend the Sankofa base classes. | ✅ Dart bytecode patches via Sankofa-forked engine interpreter (iOS + Android). |
+| **Flutter** | `pubspec.yaml` exists | `sankofa_flutter` (pub.dev) | Adds the Sankofa Flutter SDK, creates `sankofa.yaml` with `app_id` pre-filled, and wires your app entry point + the Android/iOS native files automatically. | ✅ OTA code updates (iOS + Android). |
 | **React Native (Expo)** | `expo` in package.json | `sankofa-react-native` | Adds config plugin to app.json | ✅ JS bundle patches. |
 | **React Native (bare)** | `react-native` in package.json | `sankofa-react-native` | Patches `MainApplication.kt` + `AppDelegate.swift` | ✅ JS bundle patches. |
 | **Web (npm)** | `react`/`next`/`vue`/`vite` in package.json | `@sankofa/browser` | Creates config, shows import setup | Analytics only. |
@@ -158,7 +157,7 @@ Requirements:
 ## Concepts
 
 - **Base release** — a release tied to a specific native binary version (e.g. `1.2.0`). Created with `sankofa release`. This is the store build the OTA patches apply on top of.
-- **Patch release** — a **code-only** update against an existing base release, with **no native rebuild**: **Dart kernel bytecode (KBC)** on Flutter (run by the Sankofa-forked engine's interpreter — no JIT), a **JavaScript bundle** on React Native. Created with `sankofa patch`.
+- **Patch release** — a **code-only** update against an existing base release, with **no native rebuild** — Dart code on Flutter, a JavaScript bundle on React Native. Created with `sankofa patch`. App Store + Play Store compliant on both.
 - **Rollout** — percentage of devices that receive a given release. Deterministic per device — increasing the percentage only adds new devices, never removes existing ones.
 - **Mandatory update** — forces the app to download and apply immediately instead of waiting for next launch.
 - **Kill switch** — instantly disables a release for all devices. Takes effect on next app launch.
@@ -189,21 +188,20 @@ flutter run                            # baseline build, on iPhone or Android de
 sankofa release android
 sankofa release ios
 
-# 7. After a code change, ship a Dart-only OTA patch:
+# 7. After a code change, ship a code-only OTA patch:
 sankofa patch android
-sankofa patch ios                      # iOS Path C — bytecode interpreter, no JIT entitlement
+sankofa patch ios                      # App Store compliant
 ```
 
-What `sankofa init --deploy` writes (all idempotent — safe to re-run):
+`sankofa init --deploy` wires everything for you (all idempotent — safe to re-run):
 
-- `pubspec.yaml`: `sankofa_flutter: ^0.2.1` + a `dependency_overrides:` block pointing at `.sankofa/dynamic_modules` (the VM-binding helper is vendored locally — no GitHub URL in your file).
+- `pubspec.yaml`: adds the Sankofa Flutter SDK.
 - `sankofa.yaml`: project keys, with `app_id` pre-filled from your login session.
-- `.sankofa/`: vendored `dynamic_modules` trampoline + `flutter-version` pin (auto-added to `.gitignore`).
-- `lib/main.dart`: imports `dynamic_modules` + `sankofa_flutter`, injects `WidgetsFlutterBinding.ensureInitialized()` + `SankofaUpdater.registerLoader(loadModuleFromBytes)` + `await SankofaUpdater.preFlight()` into `main()`.
-- `android/app/src/main/AndroidManifest.xml`: `INTERNET` permission + Sankofa `<meta-data>` keys.
-- `android/.../MainActivity.kt`: extends `SankofaFlutterActivity`.
-- `ios/Runner/AppDelegate.swift`: extends `SankofaFlutterAppDelegate`.
-- `ios/Runner/Info.plist`: Sankofa `com.sankofa.appId` + `com.sankofa.endpoint` keys.
+- `.gitignore`: adds the local Sankofa working files.
+- `lib/main.dart`: initializes Sankofa in your `main()`.
+- Android (`AndroidManifest.xml`, `MainActivity.kt`) + iOS (`AppDelegate.swift`, `Info.plist`): the native wiring + your `app_id` / endpoint.
+
+You write your patch code in `lib/sankofa_patch.dart`; `sankofa patch` ships it.
 
 ### React Native (Analytics + Deploy)
 
@@ -462,7 +460,7 @@ The CLI errors out (by design — OTA is immutable once published) and prints th
 
 ### `patch`
 
-Ship a **code-only** update against an existing base release — no native rebuild. **Flutter** compiles `lib/sankofa_patch.dart` to Dart kernel bytecode (`.skdp`, signed) run by the forked engine's interpreter (iOS + Android, no JIT); **React Native** bundles JS + assets.
+Ship a **code-only** update against an existing base release — no native rebuild. **Flutter** ships a signed code patch built from `lib/sankofa_patch.dart`; **React Native** bundles JS + assets. Both apply on the next launch and are App Store + Play Store compliant.
 
 ```bash
 sankofa patch android                                  # Flutter or RN — auto-detected
@@ -479,7 +477,7 @@ sankofa patch ios --release v1.2.0                     # target a specific base 
 - `--entry-file <file>`, `--output-dir <dir>`, `--description <desc>`, `--mandatory`, `--rollout <percent>`, `--publish`, `--env <env>`, `--project <path>` — same semantics as `release`.
 - `--release <label>` — target base release (otherwise you're prompted to pick).
 
-`patch` prompts you to pick the base release it targets (unless `--release`). Labels are auto-generated as `<base>-patch.<n>` where `<n>` is the next integer. **Flutter patches are Tier-A** (constant-pool literals / Dart logic in the patch entry-point) — adding a brand-new asset or native dependency needs a new `sankofa release`.
+`patch` prompts you to pick the base release it targets (unless `--release`). Labels are auto-generated as `<base>-patch.<n>` where `<n>` is the next integer. A Flutter patch ships Dart logic changes from your patch entry-point — adding a brand-new asset or native dependency needs a new `sankofa release`.
 
 ### `preview`
 
@@ -603,7 +601,7 @@ Fine-grained targeting and automated rollouts (all Deploy projects).
 
 ### `keys`
 
-*Flutter only.* Ed25519 signing keys for patches — run once per project after `sankofa init --deploy`.
+*Flutter only.* Signing keys for your patches — run once per project after `sankofa init --deploy`.
 
 ```bash
 sankofa keys generate     # create the project keypair
@@ -616,31 +614,21 @@ The private key never leaves your machine; the server stores only the public key
 
 ### `engine`
 
-*Flutter only.* Manage the cached Sankofa-fork Flutter engine + bundled SDK.
+*Flutter only.* Manage the Sankofa Flutter runtime + bundled SDK.
 
 ```bash
-sankofa engine install [version]    # bundled SDK + every engine ABI in one shot
-sankofa engine list                 # cached engines + everything in the registry
-sankofa engine download             # fetch engine binaries into the cache
-sankofa engine upgrade              # move to the newest published engine + re-pin the project
-sankofa engine verify               # re-hash every cached engine against the registry
+sankofa engine install [version]    # bundled SDK + runtime in one shot
+sankofa engine list                 # what's installed + what's available
+sankofa engine download             # fetch the runtime into the cache
+sankofa engine upgrade              # move to the newest published runtime + re-pin the project
+sankofa engine verify               # re-verify the cached runtime against the registry
 sankofa engine path                 # print the cache root
-```
-
-### `kbc`
-
-*Flutter only, advanced.* Low-level Dart-bytecode tooling. **Most users never run these** — `sankofa release` / `sankofa patch` orchestrate them.
-
-```bash
-sankofa kbc build <entry.dart>      # compile a Dart entry-point to a Sankofa patch
-sankofa kbc wrap <patch>            # package a compiled patch into a signed-capable upload artifact
-sankofa kbc inspect <artifact>      # parse + print a packaged patch (debugging)
 ```
 
 ### `update` / `upgrade`
 
 ```bash
-sankofa update                      # refresh everything: CLI + bundled Flutter + engine cache + project SDK
+sankofa update                      # refresh everything: CLI + bundled Flutter + runtime + project SDK
 sankofa update --check              # report what's stale; change nothing
 sankofa update --only engine        # restrict to one surface: cli | flutter | engine | sdk
 sankofa upgrade                     # just update the CLI itself from npm
@@ -665,14 +653,14 @@ Every `sankofa release <platform>` handles the full pipeline automatically:
 ## Asset handling (fonts, images, videos…)
 
 - **React Native** — Sankofa Deploy ships assets **alongside the JS bundle**. Fonts, images, and any other resources referenced by your code survive OTA patches automatically. No extra configuration.
-- **Flutter** — patches are **Tier-A** (Dart bytecode for the patch entry-point). Existing bundled assets keep working, but a patch does **not** add brand-new asset files to the app bundle — shipping a new font/image requires a fresh `sankofa release`. Keep asset changes in store releases; ship logic/copy/layout changes as patches.
+- **Flutter** — a patch ships Dart logic changes from your patch entry-point. Existing bundled assets keep working, but a patch does **not** add brand-new asset files to the app bundle — shipping a new font/image requires a fresh `sankofa release`. Keep asset changes in store releases; ship logic/copy/layout changes as patches.
 
 ---
 
 ## Rollout, rollback, and crash reporting
 
 - **Rollout** — phased rollouts let you ship to a small percentage of users first, then increase gradually. The rollout is deterministic — increasing the percentage only adds devices, never removes ones that already received the update. (`sankofa releases rollout` / `sankofa schedule`.)
-- **Auto-rollback** *(Flutter + RN)* — if the app crashes repeatedly inside the confirm window after an OTA update, the SDK automatically reverts to the previous working bundle/patch (`last_good`), and the bad patch is tombstoned so it isn't re-applied.
+- **Auto-rollback** *(Flutter + RN)* — if the app crashes repeatedly right after an OTA update, the SDK automatically reverts to the previous working version, and the bad update won't be re-applied.
 - **Kill switch** — instantly disable a release for all users from the dashboard or CLI (`sankofa releases kill`). Takes effect on next launch.
 - **Crash monitoring** — the dashboard tracks crash rates per release. Staged rollout schedules can auto-pause or auto-halt when crash rates exceed configured thresholds.
 - **Error reporting** *(React Native)* — call `deploy.reportError(err, { fatal: true })` from your ErrorBoundary for accurate crash-rate tracking. On Flutter, crash/launch signals flow through the Sankofa SDK automatically.
@@ -742,11 +730,11 @@ Run `sankofa login`. If you're sure you have a token, check `echo $SANKOFA_DEPLO
 **`sankofa doctor` reports missing pubspec deps / `sankofa.yaml` / MainActivity wiring**  
 Re-run `sankofa init --deploy` — it's idempotent and re-adds only what's missing, then `flutter pub get`.
 
-**`sankofa patch` fails with an engine/version mismatch**  
-The CLI derives the engine version from your project pin (`sankofa.yaml` / `.sankofa/flutter-version`), so this is rare. If it happens, confirm the pin matches the base release's engine, or pass `--engine-version 3.44.1+sankofa-1` explicitly. (On a fresh fork clone where `flutter --version` reports `0.0.0-unknown`, the pin fallback handles it automatically as of CLI 0.1.4+.)
+**`sankofa patch` fails with a runtime/version mismatch**  
+The CLI resolves the runtime version from your project automatically, so this is rare. If it happens, run `sankofa doctor`, and re-run `sankofa init --deploy` if your project config drifted.
 
 **Patch published but the UI didn't change after relaunch**  
-Patches apply on the *next* cold launch after they're staged — relaunch twice. If it still doesn't apply, run `sankofa doctor` and check the reason: version mismatch (the device's app version must equal the base release's target), rollout %, kill switch, or a tombstoned (`Bad`) patch from a prior auto-rollback (ship a new patch number to clear it).
+Patches apply on the *next* cold launch after they're staged — relaunch twice. If it still doesn't apply, run `sankofa doctor` and check the reason: version mismatch (the device's app version must equal the base release's target), rollout %, kill switch, or a patch that was auto-rolled-back (ship a new patch to clear it).
 
 **Host platform** — Flutter `release`/`patch` for Android work on macOS, Linux, and Windows. iOS *releases* still require macOS (Xcode).
 
