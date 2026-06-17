@@ -2,8 +2,8 @@ import { execSync } from 'child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync } from 'fs';
 import { createHash } from 'crypto';
 import { join, resolve } from 'path';
-import { resolveBundledFlutter } from './flutterBundleCache.js';
-import { SANKOFA_STORAGE_BASE_URL } from './engineVersion.js';
+import { resolveBundledFlutter, resolvePinnedEngineVersion } from './flutterBundleCache.js';
+import { SANKOFA_STORAGE_BASE_URL, flutterVersionOf } from './engineVersion.js';
 
 export interface FlutterEngineInfo {
   flutterVersion: string;
@@ -74,12 +74,34 @@ export function detectFlutterEngineInfo(projectRoot?: string): FlutterEngineInfo
       execSync(flutterCmd(projectRoot, '--version'), { encoding: 'utf-8' }),
     );
   }
-  const flutterVersion = String(parsed.flutterVersion || parsed.version || 'unknown');
+  let flutterVersion = String(parsed.flutterVersion || parsed.version || 'unknown');
   const channel = String(parsed.channel || 'unknown');
   const engineRevision = String(parsed.engineRevision || parsed.engineSha || 'unknown');
 
+  // `flutter --version` is unreliable on a fork clone: the framework derives
+  // its version from `git describe --match '*.*.*'`, which the per-stable
+  // `v…+sankofa-N` identity tag hijacks → an unparseable string → flutter
+  // reports `0.0.0-unknown`. When that happens, fall back to the project's
+  // authoritative engine pin (sankofa.yaml / .sankofa/flutter-version), which
+  // is exactly `<flutter-version>+sankofa-N`. This removes the need to pass
+  // `--engine-version` on hosts whose `flutter --version` is broken. When
+  // `flutter --version` IS valid, behaviour is unchanged.
+  const versionUnusable =
+    flutterVersion === 'unknown' || flutterVersion.startsWith('0.0.0');
+  const pinned = projectRoot ? resolvePinnedEngineVersion(projectRoot) : null;
+  if (versionUnusable && pinned) {
+    flutterVersion = flutterVersionOf(pinned) ?? flutterVersion;
+  }
+
   const override = process.env.SANKOFA_ENGINE_VERSION;
-  const sankofaEngineVersion = override || `${flutterVersion}+sankofa-1`;
+  let sankofaEngineVersion: string;
+  if (override) {
+    sankofaEngineVersion = override;
+  } else if (versionUnusable && pinned) {
+    sankofaEngineVersion = pinned;
+  } else {
+    sankofaEngineVersion = `${flutterVersion}+sankofa-1`;
+  }
 
   return { flutterVersion, channel, engineRevision, sankofaEngineVersion };
 }

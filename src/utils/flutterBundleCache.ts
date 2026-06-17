@@ -1,7 +1,7 @@
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, statSync, unlinkSync } from 'fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync, statSync, unlinkSync } from 'fs';
 import { createHash } from 'crypto';
 import { homedir, tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { execSync } from 'child_process';
 import {
   branchForEngineVersion,
@@ -212,11 +212,14 @@ export function installBundledFlutter(
       throw new Error(`SANKOFA_FLUTTER_LOCAL points at missing path: ${localPath}`);
     }
     // Symlink so updates in the local checkout reflect immediately.
+    // Cross-platform: on Windows a 'junction' links directories without admin
+    // rights (and needs an absolute target); on POSIX a 'dir' symlink.
     try {
       if (existsSync(root)) {
-        execSync(`rm -rf ${shellQuote(root)}`);
+        rmSync(root, { recursive: true, force: true });
       }
-      execSync(`ln -s ${shellQuote(localPath)} ${shellQuote(root)}`);
+      const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+      symlinkSync(resolve(localPath), root, linkType);
       opts.onProgress?.(`Linked bundled flutter -> ${localPath}`);
     } catch (err: any) {
       throw new Error(`Failed to link bundled flutter from ${localPath}: ${err.message}`);
@@ -301,10 +304,20 @@ export function installBundledFlutter(
  *   3. <projectRoot>/.sankofa/flutter-version (one-line file written by sankofa init)
  *   4. <projectRoot>/sankofa.yaml's `engine_version` key
  */
-export function resolveBundledFlutter(
+/**
+ * Resolve the project's pinned Sankofa engine version string (the
+ * `<flutter-version>+sankofa-<N>` form, e.g. `3.44.1+sankofa-1`) WITHOUT
+ * requiring the bundled SDK to be installed. Same resolution order as
+ * resolveBundledFlutter. Returns null when nothing pins a version.
+ *
+ * This is the authoritative project pin — preferred over a flaky
+ * `flutter --version` parse (which returns `0.0.0-unknown` on a fork clone
+ * whose `git describe` is hijacked by the `v…+sankofa-N` tag).
+ */
+export function resolvePinnedEngineVersion(
   projectRoot: string,
   explicitVersion?: string,
-): BundledFlutterInfo | null {
+): string | null {
   let version = explicitVersion || process.env.SANKOFA_FLUTTER_BUNDLED_VERSION;
 
   if (!version) {
@@ -331,6 +344,14 @@ export function resolveBundledFlutter(
     }
   }
 
+  return version || null;
+}
+
+export function resolveBundledFlutter(
+  projectRoot: string,
+  explicitVersion?: string,
+): BundledFlutterInfo | null {
+  const version = resolvePinnedEngineVersion(projectRoot, explicitVersion);
   if (!version) return null;
   const info = bundledFlutterInfo(version);
   return info.exists ? info : null;

@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
 import { basename, dirname, join, resolve } from 'path';
 import { createHash } from 'crypto';
 import { resolveBuildEnv, logBuildEnv, type TargetPlatform } from './buildEnv.js';
@@ -442,7 +442,8 @@ export function extractEmbeddedOTA(
       if (existsSync(embeddedAssets)) {
         const dest = join(stageDir, 'assets');
         if (existsSync(dest)) rmSync(dest, { recursive: true, force: true });
-        execSync(`cp -R ${shellQuote(embeddedAssets)} ${shellQuote(dest)}`, { stdio: 'inherit' });
+        // dest was just removed → cpSync makes it a copy of embeddedAssets (== `cp -R src dest`).
+        cpSync(embeddedAssets, dest, { recursive: true });
       }
       return true;
     } finally {
@@ -1053,8 +1054,9 @@ function seedIOSPreviewStage(device: string, appId: string, stageDir: string, la
     rmSync(seededDir, { recursive: true, force: true });
   }
   mkdirSync(seededDir, { recursive: true });
-  // Copy the entire stage dir contents (bundle + assets/) into the seeded dir.
-  execSync(`cp -R ${shellQuote(stageDir)}/. ${shellQuote(seededDir)}/`, { stdio: 'inherit' });
+  // Copy the entire stage dir contents (bundle + assets/) into the seeded dir
+  // (cpSync recursive into the freshly-created dir == `cp -R stageDir/. seededDir/`).
+  cpSync(stageDir, seededDir, { recursive: true });
 
   const seededBundlePath = join(seededDir, 'bundle.jsbundle');
   if (!existsSync(seededBundlePath)) {

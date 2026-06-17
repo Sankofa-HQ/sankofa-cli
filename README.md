@@ -136,10 +136,10 @@ npm install -g sankofa-cli
 Requirements:
 
 - **Node.js ≥ 18** (uses global `fetch`).
-- **macOS + Xcode** for iOS builds (`xcodebuild`, `xcrun simctl`, `xcrun altool`, `/usr/libexec/PlistBuddy`, `ditto`).
+- **macOS + Xcode** for iOS builds (`xcodebuild`, `xcrun simctl`, `xcrun altool`, `/usr/libexec/PlistBuddy`, `ditto`). iOS *releases* require macOS; Android release+patch work on **macOS, Linux, and Windows** (host-build support is cross-platform — see the host-OS matrix).
 - **Android SDK / Gradle / Java 17** for Android builds (`./gradlew`, `adb`, `aapt`).
 - **CocoaPods** for iOS (`pod` or `bundle exec pod`).
-- **`zip` / `unzip`** (standard on macOS + Linux).
+- **`unzip`** on macOS/Linux for archive extraction; on **Windows** the CLI uses the bundled `tar` (bsdtar) instead — no extra install.
 - **Expo project**: the CLI runs `npx expo prebuild --platform <platform>` before every build to keep `Info.plist` / `build.gradle` in sync with `app.json`. Bare RN projects work too; prebuild is a no-op there.
 
 ---

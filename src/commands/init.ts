@@ -1,10 +1,12 @@
 import { Command } from 'commander';
 import {
   appendFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   writeFileSync,
 } from 'fs';
 import { EOL } from 'os';
@@ -450,10 +452,9 @@ async function ensureVendoredDynamicModules(projectRoot: string, chalk: any): Pr
     const spinner = ora('  Vendoring dynamic_modules into .sankofa/…').start();
     try {
       const tmpDir = join(projectRoot, '.sankofa', '_clone-tmp');
-      // Clean any stale tmp.
-      try {
-        execSync(`rm -rf ${shellQuote(tmpDir)}`);
-      } catch {/* noop */}
+      // Clean any stale tmp. (rmSync force:true is a no-op when absent and is
+      // cross-platform — no `rm -rf` shellout that breaks on Windows.)
+      rmSync(tmpDir, { recursive: true, force: true });
       // Clone a shallow copy of just main into the tmp dir.
       execSync(
         `git clone --depth 1 --branch ${shellQuote(refSpec)} --filter=blob:none --sparse ${shellQuote(repoUrl)} ${shellQuote(tmpDir)}`,
@@ -463,13 +464,11 @@ async function ensureVendoredDynamicModules(projectRoot: string, chalk: any): Pr
       execSync(`git -C ${shellQuote(tmpDir)} sparse-checkout set ${shellQuote(pathInRepo)}`, {
         stdio: 'ignore',
       });
-      // Move the extracted subtree into place.
-      try {
-        execSync(`rm -rf ${shellQuote(target)}`);
-      } catch {/* noop */}
-      execSync(`mkdir -p ${shellQuote(target)}`);
-      execSync(`cp -R ${shellQuote(join(tmpDir, pathInRepo))}/. ${shellQuote(target)}/`);
-      execSync(`rm -rf ${shellQuote(tmpDir)}`);
+      // Move the extracted subtree into place (cpSync recursive == `cp -R src/. dest/`).
+      rmSync(target, { recursive: true, force: true });
+      mkdirSync(target, { recursive: true });
+      cpSync(join(tmpDir, pathInRepo), target, { recursive: true });
+      rmSync(tmpDir, { recursive: true, force: true });
       spinner.succeed('  Vendored dynamic_modules → .sankofa/dynamic_modules/');
     } catch (err: any) {
       spinner.fail(`  Could not vendor dynamic_modules: ${err.message}`);

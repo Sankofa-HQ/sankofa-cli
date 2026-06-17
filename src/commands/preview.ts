@@ -225,9 +225,12 @@ export const previewCommand = new Command('preview')
         rmSync(extractedStageDir, { recursive: true, force: true });
       }
       mkdirSync(extractedStageDir, { recursive: true });
-      execSync(`unzip -o -q ${shellQuoteLocal(archivePath)} -d ${shellQuoteLocal(extractedStageDir)}`, {
-        stdio: 'inherit',
-      });
+      // Extract the OTA zip. Windows' bundled tar (bsdtar) reads zips and takes
+      // `-C <dir>`; GNU tar on Linux can't read zips, so keep `unzip` off-win32.
+      const extractCmd = process.platform === 'win32'
+        ? `tar -xf ${shellQuoteLocal(archivePath)} -C ${shellQuoteLocal(extractedStageDir)}`
+        : `unzip -o -q ${shellQuoteLocal(archivePath)} -d ${shellQuoteLocal(extractedStageDir)}`;
+      execSync(extractCmd, { stdio: 'inherit' });
       if (!existsSync(activeBundlePath)) {
         throw new Error(`archive did not contain bundle.jsbundle`);
       }
