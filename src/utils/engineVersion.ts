@@ -5,9 +5,9 @@
  * form `<flutter-version>+sankofa-<N>` (e.g. `3.44.1+sankofa-1`) and lives
  * in three places that MUST stay consistent:
  *
- *   1. A git branch `phase1/sankofa-<flutter-version>` (+ an immutable tag
+ *   1. A git branch `release/sankofa-<flutter-version>` (+ an immutable tag
  *      `v<engine-version>`) in Sankofa-HQ/sankofa-flutter — the bundled SDK
- *      the CLI clones.
+ *      the CLI clones. (Legacy `phase1/sankofa-<…>` aliases kept one cycle.)
  *   2. CDN artifacts under
  *      `download.sankofa.dev/flutter_infra_release/flutter/<engine-rev>/…`
  *      where `<engine-rev>` is the fork commit recorded in the manifest.
@@ -36,13 +36,14 @@ export function flutterVersionOf(engineVersion: string): string | null {
 /**
  * Git ref in Sankofa-HQ/sankofa-flutter for a given engine version.
  *
- * Per-stable convention (locked 2026-06-09): every Flutter stable gets a
- * permanent `phase1/sankofa-<flutter-version>` branch. The pre-convention
- * 3.44.0 release lives on the legacy long-lived branch.
+ * Per-stable convention: every Flutter stable gets a permanent
+ * `release/sankofa-<flutter-version>` branch (renamed from the legacy
+ * `phase1/sankofa-<…>` scheme 2026-06-17). The legacy branches are kept as
+ * aliases for one release cycle — see legacyBranchForEngineVersion().
  */
 export function branchForEngineVersion(engineVersion: string): string {
   if (engineVersion.startsWith('3.44.0+')) {
-    return 'phase1/sankofa-codepush-engine-integration';
+    return 'release/sankofa-3.44.0';
   }
   const fv = flutterVersionOf(engineVersion);
   if (!fv) {
@@ -51,7 +52,21 @@ export function branchForEngineVersion(engineVersion: string): string {
         `expected the form <flutter-version>+sankofa-<N> (e.g. 3.44.1+sankofa-1).`,
     );
   }
-  return `phase1/sankofa-${fv}`;
+  return `release/sankofa-${fv}`;
+}
+
+/**
+ * Legacy pre-2026-06-17 branch name (`phase1/sankofa-<…>`). The release/*
+ * rename keeps these on the remote for one cycle, so this is the clone
+ * fallback when the release/* branch can't be found. Returns null when the
+ * version is malformed (the primary path already threw, so callers skip).
+ */
+export function legacyBranchForEngineVersion(engineVersion: string): string | null {
+  if (engineVersion.startsWith('3.44.0+')) {
+    return 'phase1/sankofa-codepush-engine-integration';
+  }
+  const fv = flutterVersionOf(engineVersion);
+  return fv ? `phase1/sankofa-${fv}` : null;
 }
 
 export interface EngineManifest {

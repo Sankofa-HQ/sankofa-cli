@@ -5,6 +5,7 @@ import { join, resolve } from 'path';
 import { execSync } from 'child_process';
 import {
   branchForEngineVersion,
+  legacyBranchForEngineVersion,
   SANKOFA_STORAGE_BASE_URL,
 } from './engineVersion.js';
 
@@ -239,30 +240,42 @@ export function installBundledFlutter(
   }
 
   const repoUrl = opts.repoUrl || SANKOFA_FLUTTER_REPO_URL;
-  // Per-stable branches: 3.44.1+sankofa-1 → phase1/sankofa-3.44.1.
-  const ref = opts.ref || branchForEngineVersion(sankofaEngineVersion);
+  // Per-stable branch: 3.44.1+sankofa-1 → release/sankofa-3.44.1. The legacy
+  // phase1/sankofa-<…> name is kept on the remote for one cycle as a fallback.
+  const primaryRef = opts.ref || branchForEngineVersion(sankofaEngineVersion);
+  const legacyRef = opts.ref ? null : legacyBranchForEngineVersion(sankofaEngineVersion);
 
   if (!installedVia) {
-    opts.onProgress?.(`Cloning ${repoUrl} (${ref}) into ${root}`);
-    try {
-      execSync(
-        `git clone --depth 1 --branch ${shellQuote(ref)} ${shellQuote(repoUrl)} ${shellQuote(root)}`,
-        { stdio: 'inherit' },
-      );
+    const fv = sankofaEngineVersion.split('+')[0];
+    const tryClone = (ref: string): boolean => {
+      opts.onProgress?.(`Cloning ${repoUrl} (${ref}) into ${root}`);
+      try {
+        execSync(
+          `git clone --depth 1 --branch ${shellQuote(ref)} ${shellQuote(repoUrl)} ${shellQuote(root)}`,
+          { stdio: 'inherit' },
+        );
+      } catch {
+        // Wipe any partial clone so the fallback ref starts from a clean dir.
+        try { rmSync(root, { recursive: true, force: true }); } catch { /* noop */ }
+        return false;
+      }
       // A depth-1 clone has no tags, so flutter_tools reports version
       // "0.0.0-unknown" and every pub SDK constraint fails. Tag the tip
       // locally with the Flutter version (mirrors what the tarball ships).
-      const fv = sankofaEngineVersion.split('+')[0];
       if (/^\d+\.\d+\.\d+$/.test(fv)) {
         try {
           execSync(`git -C ${shellQuote(root)} tag -f ${shellQuote(fv)}`, { stdio: 'ignore' });
         } catch { /* cosmetic — version banner only */ }
       }
       installedVia = `git:${ref}`;
-    } catch (err: any) {
+      return true;
+    };
+
+    if (!tryClone(primaryRef) && !(legacyRef && tryClone(legacyRef))) {
       throw new Error(
         `Could not install the Sankofa Flutter SDK ${sankofaEngineVersion}: ` +
-          `the CDN tarball was unavailable and git clone failed (${err.message}). ` +
+          `the CDN tarball was unavailable and git clone failed for "${primaryRef}"` +
+          (legacyRef ? ` (and legacy "${legacyRef}")` : '') + '. ' +
           `Check network access to ${SANKOFA_STORAGE_BASE_URL}.`,
       );
     }

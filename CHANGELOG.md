@@ -3,7 +3,16 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
-## 0.1.4 — unreleased (cross-platform hosts + unified KBC)
+## 0.1.5 — release-branch rename
+
+### Changed
+- Bundled-SDK install now clones `release/sankofa-<version>` (renamed from the
+  legacy `phase1/sankofa-<…>` scheme). The legacy branch is kept on the remote
+  for one cycle and used as an automatic clone fallback, so older installs and
+  transitional states keep working. No behaviour change to the primary CDN
+  tarball install path.
+
+## 0.1.4 — cross-platform hosts + unified KBC
 
 ### Added
 - **Unified Flutter KBC patching** — `sankofa patch` ships a signed `.skdp`
