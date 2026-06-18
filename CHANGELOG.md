@@ -3,6 +3,20 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.9 — cleaner, correct `.gitignore` from `init`
+
+### Fixed
+- **`sankofa init` now writes one tidy `.gitignore` block.** Previously it
+  emitted (a) a redundant pile of `build/*` lines all already covered by
+  `build/`, and (b) a *separate*, stray `.sankofa/` rule outside the managed
+  block that ignored the **whole** `.sankofa/` dir — including the vendored
+  `dynamic_modules/` that your `pubspec.yaml` path-override needs, so fresh
+  clones and CI broke on `flutter pub get`.
+- Now it ignores only what's truly disposable — `.sankofa.json`, `build/`, and
+  the transient `.sankofa/build/` + `.sankofa/baseline/` — and **commits**
+  `.sankofa/dynamic_modules/` + `.sankofa/flutter-version`, so a fresh clone /
+  CI builds without re-running `init`. All in a single consolidated block.
+
 ## 0.1.8 — `preview` targets the right device automatically
 
 ### Fixed
