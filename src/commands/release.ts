@@ -35,7 +35,7 @@ import {
 import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompts.js';
 import { resolveProjectRoot, type ProjectInfo } from '../utils/stack.js';
 import { parseRollout } from '../utils/validation.js';
-import { buildFlutterAOT, buildFlutterIPA, buildFlutterIOSSimulatorApp, resolveFlutterPlatform, type BuildIpaResult } from '../utils/flutterBundler.js';
+import { buildFlutterAOT, buildFlutterIPA, detectFlutterAppVersion, detectFlutterEngineInfo, resolveFlutterPlatform, type BuildIpaResult } from '../utils/flutterBundler.js';
 import { captureFlutterBaseline, type BaselineManifest } from '../utils/baseline.js';
 import { buildKbcPatch, resolveFlutterDartSdk } from '../utils/flutterKbcBundler.js';
 import { wrapKbc, type KbcEnvelopeMetadata } from '../utils/flutterKbcEnvelope.js';
@@ -862,7 +862,43 @@ async function flutterReleaseIOS(
   const ora = (await import('ora')).default;
   const inquirer = (await import('inquirer')).default;
 
-  // 1. Build the signed .ipa (store artifact). Streams xcodebuild output.
+  const appVersion = detectFlutterAppVersion(project.root);
+  const engineInfo = detectFlutterEngineInfo(project.root);
+  const engineVersion = opts.engineVersion || engineInfo.sankofaEngineVersion;
+  const label = `v${appVersion}`;
+
+  // 1. FAIL FAST — validate the Deploy Token + refuse a duplicate baseline
+  //    BEFORE the multi-minute build (the version comes from pubspec, so no
+  //    build is needed yet). A bad/expired token or an existing baseline now
+  //    costs ~2s, not a wasted ~5-minute build. Skipped on --dry-run.
+  if (!opts.dryRun) {
+    const checkSpinner = ora('Checking auth + existing baseline…').start();
+    try {
+      const releases = await listReleases(environment, 'ios');
+      const conflict = releases.find((r: any) =>
+        (r.runtime === 'flutter-code' || r.runtime === 'flutter_code') &&
+        r.target_binary_version === appVersion &&
+        r.engine_version === engineVersion,
+      );
+      if (conflict) {
+        checkSpinner.fail(
+          `A baseline already exists for ${chalk.bold(appVersion)} + ${chalk.bold(engineVersion)}: ${chalk.dim(conflict.label)}.`,
+        );
+        console.log('');
+        console.log(chalk.dim('  Use one of:'));
+        console.log(chalk.dim(`    • Hot-patch:                      ${chalk.cyan('sankofa patch ios')}`));
+        console.log(chalk.dim(`    • Bump pubspec version and rerun  ${chalk.cyan('sankofa release ios')}`));
+        process.exit(1);
+      }
+      checkSpinner.succeed('Auth OK · no existing baseline — safe to build + register');
+    } catch (err: any) {
+      checkSpinner.fail(`Auth / release check failed: ${err.message}`);
+      console.log(chalk.dim('     If this says "Invalid token", run `sankofa login` to refresh your Deploy Token.'));
+      process.exit(1);
+    }
+  }
+
+  // 2. Build the signed .ipa (store artifact). Streams xcodebuild output.
   console.log('');
   console.log(
     chalk.dim(`  Building Flutter iOS .ipa${opts.flavor ? ` [${opts.flavor}]` : ''} (release)…`),
@@ -886,10 +922,6 @@ async function flutterReleaseIOS(
     process.exit(1);
   }
 
-  const appVersion = built.appVersion;
-  const engineVersion = opts.engineVersion || built.engine.sankofaEngineVersion;
-  const label = `v${appVersion}`;
-
   console.log('');
   if (built.ipaPath) {
     console.log(chalk.green(`  ✓ Built .ipa (${formatBytes(statSync(built.ipaPath).size)})`));
@@ -897,36 +929,6 @@ async function flutterReleaseIOS(
     console.log(
       chalk.yellow('  ⚠ No .ipa produced (likely --no-codesign). The .xcarchive is ready to sign in Xcode.'),
     );
-  }
-
-  // 2. Refuse if an iOS flutter-code baseline already exists for this
-  //    version + engine (mirrors the Android conflict check). Skipped on
-  //    --dry-run (we never touch the server in that mode).
-  if (!opts.dryRun) {
-    const checkSpinner = ora('Checking for existing baseline release...').start();
-    try {
-      const releases = await listReleases(environment, 'ios');
-      const conflict = releases.find((r: any) =>
-        (r.runtime === 'flutter-code' || r.runtime === 'flutter_code') &&
-        r.target_binary_version === appVersion &&
-        r.engine_version === engineVersion,
-      );
-      if (conflict) {
-        checkSpinner.fail(
-          `A baseline already exists for ${chalk.bold(appVersion)} + ${chalk.bold(engineVersion)}: ${chalk.dim(conflict.label)}.`,
-        );
-        console.log('');
-        console.log(chalk.dim('  Use one of:'));
-        console.log(chalk.dim(`    • Hot-patch:                      ${chalk.cyan('sankofa patch ios')}`));
-        console.log(chalk.dim(`    • Bump pubspec version and rerun  ${chalk.cyan('sankofa release ios')}`));
-        printIosArtifact(chalk, built);
-        process.exit(1);
-      }
-      checkSpinner.succeed('No existing baseline — safe to create');
-    } catch (err: any) {
-      checkSpinner.fail(`Could not check existing releases: ${err.message}`);
-      process.exit(1);
-    }
   }
 
   // 3. Build the baseline KBC envelope (synthesized v0 identity module).
@@ -1015,32 +1017,21 @@ async function flutterReleaseIOS(
     return;
   }
 
-  // 5b. Optional preview artifact — build an iOS SIMULATOR app and attach it
-  //     so `sankofa preview --label <v>` can run this build on a simulator
-  //     from the server. (Server contract: iOS preview artifact is sim-only.)
-  let previewArtifact: { native_artifact_path?: string; native_artifact_kind?: string } = {};
+  // iOS `--preview-artifact` intentionally does NOT trigger a second build.
+  // It would be a separate iOS *simulator* build (several minutes) that doubled
+  // release time for little gain — you test on a device, and the sim artifact
+  // is simulator-only by server contract. `release` stays SINGLE-build, like a
+  // normal store release (matching Shorebird). For local QA use
+  // `sankofa preview ios --flavor … -t …`.
+  const previewArtifact: { native_artifact_path?: string; native_artifact_kind?: string } = {};
   if (opts.previewArtifact) {
     console.log('');
-    console.log(chalk.dim('  Building iOS simulator preview app (flutter build ios --simulator)…'));
-    try {
-      const sim = buildFlutterIOSSimulatorApp(project.root, {
-        flavor: opts.flavor,
-        target: opts.target,
-        dartDefines: opts.dartDefine || [],
-        outputDir: resolve(project.root, '.sankofa/build'),
-        verbose: true,
-      });
-      previewArtifact = {
-        native_artifact_path: sim.appZipPath,
-        native_artifact_kind: 'ios-simulator-app-zip',
-      };
-      console.log(chalk.dim(`  · Attaching simulator preview app for \`sankofa preview --label ${label}\``));
-    } catch (err: any) {
-      console.log(chalk.yellow(`  ⚠ Simulator preview app build failed — continuing without it: ${err.message}`));
-    }
+    console.log(chalk.yellow('  ⚠ --preview-artifact is a no-op on iOS — it would need a second full'));
+    console.log(chalk.dim('     (simulator) build. Skipped to keep `release` single-build. For local'));
+    console.log(chalk.dim('     QA run `sankofa preview ios --flavor … -t …`.'));
   }
 
-  // 6. Upload the baseline envelope (+ optional preview artifact).
+  // 6. Upload the baseline envelope.
   const uploadSpinner = ora('Uploading baseline to Sankofa…').start();
   try {
     const release = await uploadRelease(envelopePath, {

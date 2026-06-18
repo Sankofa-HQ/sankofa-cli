@@ -3,6 +3,27 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.10 — `release ios`: single build, fail-fast auth, no presign trap
+
+### Fixed
+- **No more double build.** `sankofa release ios --preview-artifact` used to run a
+  *second* full build (an iOS simulator app, several minutes) on top of the
+  `.ipa`. That's gone — iOS `release` is now single-build like a normal store
+  release. `--preview-artifact` is a no-op on iOS (the sim artifact is
+  simulator-only and low-value when you test on device); for local QA use
+  `sankofa preview ios …`.
+- **Fail fast on auth / duplicate baseline.** `release ios` now validates the
+  Deploy Token + checks for an existing baseline **before** the build, so a bad
+  token or a duplicate version fails in ~2 seconds instead of after a multi-
+  minute build.
+- **Deploy Token no longer trips on presign.** Uploading a native/preview
+  artifact first calls a presign endpoint; if that endpoint rejects the Deploy
+  Token (401/403 — it's gated for dashboard JWTs on some servers), the CLI now
+  **falls back to the inline upload** (which accepts Deploy Tokens) instead of
+  aborting the whole release with a misleading "Invalid token". This is what
+  caused `release ios --preview-artifact` to fail at the very end with
+  "Unauthorized: Invalid token" despite a valid token.
+
 ## 0.1.9 — cleaner, correct `.gitignore` from `init`
 
 ### Fixed

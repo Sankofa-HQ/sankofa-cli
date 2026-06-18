@@ -63,7 +63,15 @@ async function presignNativeArtifact(
   };
   if (dispatcher) init.dispatcher = dispatcher;
   const res = await fetch(url, init);
-  if (res.status === 404) return null; // server predates presigned uploads
+  // Fall back to the inline multipart upload (which goes through POST
+  // /releases — the deploy-token-accepting path) when presign is unavailable
+  // OR rejects this credential:
+  //   404 → server predates presigned uploads
+  //   401/403 → presign endpoint is gated by dashboard-JWT-only auth and
+  //     rejects Deploy Tokens. Throwing here would abort the whole release
+  //     with a misleading "Invalid token"; instead fall back so a valid
+  //     Deploy Token still publishes via the inline path.
+  if (res.status === 404 || res.status === 401 || res.status === 403) return null;
   if (!res.ok) throw await readAPIError(res, `Presign failed (${res.status})`);
   return (await res.json()) as PresignedUpload;
 }
