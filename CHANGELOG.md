@@ -3,6 +3,15 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.7 — correct `--version` reporting
+
+### Fixed
+- **`sankofa --version` reported a stale, hardcoded version** (`0.1.4`) no matter
+  what was actually installed, and the update notice told current users to
+  "upgrade". The version is now read from the package's own `package.json` at
+  runtime — single source of truth, so it can never drift again. (0.1.6's
+  features were genuinely installed; only the reported version string was wrong.)
+
 ## 0.1.6 — Flutter flavors, iOS release, server preview
 
 ### Added

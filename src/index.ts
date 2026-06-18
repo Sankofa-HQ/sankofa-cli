@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { loginCommand } from './commands/login.js';
 import { logoutCommand } from './commands/logout.js';
 import { switchCommand } from './commands/switch.js';
@@ -26,12 +29,25 @@ import { kbcCommand } from './commands/kbc.js';
 import { keysCommand } from './commands/keys.js';
 import { maybePrintUpdateNotices } from './utils/updateCheck.js';
 
+// Single source of truth for the CLI version: the package's own package.json,
+// read at runtime. Never hardcode the version here — a literal silently goes
+// stale every release (it reported 0.1.4 long after 0.1.6 shipped). dist/index.js
+// sits one dir below package.json; in dev (tsx src/index.ts) the same `..` holds.
+const VERSION: string = (() => {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    return JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf-8')).version;
+  } catch {
+    return '0.0.0';
+  }
+})();
+
 const program = new Command();
 
 program
   .name('sankofa')
   .description('Sankofa CLI — one command to scaffold, ship, and verify Sankofa across Flutter, React Native, Web, iOS, and Android')
-  .version('0.1.4');
+  .version(VERSION);
 
 program.addCommand(initCommand);
 program.addCommand(engineCommand);
@@ -78,5 +94,5 @@ process.on('exit', () => {
   const cmd = process.argv[2] || '';
   if (['kbc', '--version', '-V', '--help', '-h'].includes(cmd)) return;
   if (process.env.SANKOFA_NO_UPDATE_CHECK === '1' || process.env.CI) return;
-  maybePrintUpdateNotices('0.1.4', process.cwd());
+  maybePrintUpdateNotices(VERSION, process.cwd());
 });
