@@ -14,11 +14,15 @@ bumps may include breaking changes).
   startup wiring with a misleading ✓. It now detects the real startup file
   (e.g. `lib/main_common.dart`) and prints a clear **ACTION REQUIRED** warning
   with the exact lines to add and where, since patches won't apply without it.
-- **`sankofa login` now links the project.** It backfills the local
-  `.sankofa.json` `projectId` (previously left empty after login → `check`
-  warned) and the `sankofa.yaml` `app_id` — without writing the deploy token
-  into the project file. `api_key` is still pasted from the dashboard (it's the
-  runtime SDK key, not the deploy token).
+- **`sankofa login` now fully configures the project — no IDs/keys to type.**
+  It backfills `.sankofa.json` `projectId` (previously left empty → `check`
+  warned) and fills `sankofa.yaml` with BOTH `app_id` **and** `api_key`, pulled
+  from the project you select at login (the server already returns the runtime
+  publishable key). The deploy token is never written into the project file.
+- **`sankofa init` + `sankofa login` are now order-independent.** Whichever you
+  run first, the other completes the setup — no more "re-run init after login".
+  `init` reuses the login-captured key to fill `sankofa.yaml`, and prints a
+  clear next step when you haven't logged in yet.
 
 ### Changed
 - Product picker description no longer exposes internal/implementation details.

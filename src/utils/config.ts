@@ -11,6 +11,13 @@ export interface GlobalConfig {
   projectId?: string;
   environment?: 'live' | 'test';
   /**
+   * The selected project's RUNTIME api key (`sk_live_*` / `sk_test_*`) — the
+   * client-embedded publishable key that goes in `sankofa.yaml` for the SDK.
+   * Distinct from `token` (the deploy token) and `sessionJwt`. Captured at
+   * login so `sankofa init` can fill `sankofa.yaml` without a manual paste.
+   */
+  runtimeApiKey?: string;
+  /**
    * Long-lived session JWT from the browser login, persisted so `sankofa
    * switch` can list projects and mint a new Deploy Token without forcing
    * another browser round-trip. Cleared by `sankofa logout` (any scope that
@@ -27,6 +34,8 @@ export interface ProjectConfig {
   apiKey?: string;
   endpoint?: string;
   environment?: 'live' | 'test';
+  /** Runtime publishable key for sankofa.yaml — see GlobalConfig.runtimeApiKey. */
+  runtimeApiKey?: string;
   /**
    * Product IDs the user explicitly installed via `sankofa init`. Doctor
    * uses this as ground truth — without it we can't reliably distinguish

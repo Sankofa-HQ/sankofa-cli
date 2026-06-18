@@ -328,20 +328,32 @@ async function installDeployFlutter(project: ProjectInfo, endpoint: string, chal
   //    Wires sankofa.yaml into flutter.assets too. Idempotent.
   await tryAddSankofaFlutterToPubspec(pubspecPath, chalk);
 
-  // 5. Create sankofa.yaml with placeholder values if missing. We
-  //    populate `app_id` from the .sankofa.json projectId so the
-  //    customer only has to paste the api_key by hand.
+  // 5. Create sankofa.yaml. If the user is logged in, fill BOTH app_id
+  //    (== projectId) and api_key from the login session captured at
+  //    `sankofa login` — nothing to paste by hand. Otherwise: placeholders
+  //    + a clear "run login to finish" next step (login backfills them).
   const projectId = readProjectId(project.root) ?? '';
-  tryCreateSankofaYaml(project.root, projectId, '', endpoint, chalk);
+  const globalCfg = loadGlobalConfig();
+  const apiKey =
+    globalCfg.runtimeApiKey && globalCfg.projectId === projectId
+      ? globalCfg.runtimeApiKey
+      : '';
+  tryCreateSankofaYaml(project.root, projectId, apiKey, endpoint, chalk);
 
-  // 6. Inject the `registerLoader` + `preFlight` calls into lib/main.dart.
+  // 6. Inject the startup wiring into the app's entrypoint.
   tryWireFlutterMainDart(project.root, chalk);
 
   console.log('');
   console.log(chalk.green('     ✓ Sankofa Deploy wired into the project.'));
-  console.log(chalk.dim('       Open `sankofa.yaml` and replace the placeholders with your'));
-  console.log(chalk.dim('       project\'s api_key + app_id (see app.sankofa.dev → Settings → API Keys).'));
-  console.log(chalk.dim('       Then run `flutter pub get && flutter run`.'));
+  if (!projectId) {
+    console.log(chalk.yellow('       Next: run `sankofa login` to finish — it fills your project'));
+    console.log(chalk.yellow('       keys into sankofa.yaml automatically (no need to re-run init).'));
+  } else if (!apiKey) {
+    console.log(chalk.dim('       Open `sankofa.yaml` and paste your api_key'));
+    console.log(chalk.dim('       (app.sankofa.dev → Settings → API Keys), then `flutter pub get`.'));
+  } else {
+    console.log(chalk.dim('       sankofa.yaml is fully configured — run `flutter pub get && flutter run`.'));
+  }
 
   if (!result.androidPatched && existsSync(join(project.root, 'android'))) {
     console.log('');

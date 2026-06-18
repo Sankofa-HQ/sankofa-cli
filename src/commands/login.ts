@@ -13,14 +13,17 @@ import { createDeployToken } from '../utils/api.js';
  * (that stays in ~/.sankofa/credentials.json, never in the project file):
  *   - `.sankofa.json` (created by `sankofa init`): fill empty projectId /
  *     endpoint / environment, preserve everything else (e.g. `products`).
- *   - `sankofa.yaml` (Flutter Deploy): fill the `app_id` placeholder
- *     (app_id == projectId). `api_key` stays manual — it's the runtime SDK key
- *     pasted from the dashboard, not the deploy token login mints.
+ *   - `sankofa.yaml` (Flutter Deploy): fill the `app_id` (== projectId) AND the
+ *     `api_key` placeholders. The server hands the CLI the project's runtime
+ *     publishable key (`sk_live_*` / `sk_test_*`) at login, so there's nothing
+ *     to paste by hand. (That key is a client-embedded key — it ships in the
+ *     app bundle by design, like a Firebase/Stripe publishable key.)
  */
 function linkProjectFiles(
   projectId: string,
   endpoint: string,
   environment: 'live' | 'test',
+  runtimeApiKey: string | undefined,
   chalk: any,
 ): void {
   try {
@@ -41,14 +44,29 @@ function linkProjectFiles(
   try {
     const y = join(process.cwd(), 'sankofa.yaml');
     if (existsSync(y)) {
-      const s = readFileSync(y, 'utf-8');
+      let s = readFileSync(y, 'utf-8');
+      let changed = false;
+      const isPlaceholder = (v: string) =>
+        !v || v.startsWith('<') || /your-app-id|proj_xxx|paste|sk_live_\*|sk_test_\*/i.test(v);
+
       const appIdRe = /^app_id:[ \t]*(.*)$/m;
-      const m = appIdRe.exec(s);
-      const val = m ? m[1].trim() : '';
-      const isPlaceholder = !val || val.startsWith('<') || /your-app-id|proj_xxx/i.test(val);
-      if (m && isPlaceholder) {
-        writeFileSync(y, s.replace(appIdRe, `app_id: ${projectId}`));
-        console.log(chalk.dim('  Set app_id in sankofa.yaml (paste your api_key to finish)'));
+      const am = appIdRe.exec(s);
+      if (am && isPlaceholder(am[1].trim())) {
+        s = s.replace(appIdRe, `app_id: ${projectId}`);
+        changed = true;
+      }
+
+      const apiKeyRe = /^api_key:[ \t]*(.*)$/m;
+      const km = apiKeyRe.exec(s);
+      if (runtimeApiKey && km && isPlaceholder(km[1].trim())) {
+        s = s.replace(apiKeyRe, `api_key: ${runtimeApiKey}`);
+        changed = true;
+      }
+
+      if (changed) {
+        writeFileSync(y, s);
+        const both = runtimeApiKey ? 'app_id + api_key' : 'app_id';
+        console.log(chalk.dim(`  Filled sankofa.yaml (${both})`));
       }
     }
   } catch { /* non-fatal */ }
@@ -322,12 +340,23 @@ export const loginCommand = new Command('login')
       // Save deploy credentials with project ID and the session JWT so
       // `sankofa switch` can pick a different project without forcing
       // another browser round-trip.
+      const environment =
+        selectedProject.environment === 'test' ? ('test' as const) : ('live' as const);
+      // The server returns the project's runtime publishable key in the
+      // projects payload (api_key / test_api_key). Capture it so init/login
+      // can fill sankofa.yaml with zero manual paste.
+      const runtimeApiKey: string | undefined =
+        environment === 'test'
+          ? selectedProject.test_api_key || selectedProject.api_key
+          : selectedProject.api_key;
+
       const config = {
         token: tokenResponse.token,
         authType: 'deploy_token' as const,
         endpoint,
         projectId: selectedProject.id,
-        environment: selectedProject.environment === 'test' ? 'test' as const : 'live' as const,
+        environment,
+        runtimeApiKey,
         sessionJwt: receivedToken,
       };
 
@@ -340,9 +369,9 @@ export const loginCommand = new Command('login')
       }
 
       // Link the project in this directory (if it was `sankofa init`'d) so
-      // check/doctor/release resolve it — without leaking the token into a
-      // potentially-committed file.
-      linkProjectFiles(config.projectId, config.endpoint, config.environment, chalk);
+      // check/doctor/release resolve it — without leaking the deploy token into
+      // a potentially-committed file. Fills sankofa.yaml app_id + api_key.
+      linkProjectFiles(config.projectId, config.endpoint, config.environment, runtimeApiKey, chalk);
 
       console.log('');
       console.log(chalk.green.bold('  Ready to deploy!'));
