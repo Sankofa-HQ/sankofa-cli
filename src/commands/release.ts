@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import fs from 'node:fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { statSync } from 'fs';
 import {
   buildDistributionArtifact,
@@ -21,7 +21,7 @@ import {
 import os from 'node:os';
 import path from 'node:path';
 import { listReleases, uploadRelease } from '../utils/api.js';
-import { requireAuth } from '../utils/config.js';
+import { requireAuth, findProjectConfig } from '../utils/config.js';
 import {
   uploadCatchSymbol,
   uploadSymbolsDirectory,
@@ -35,8 +35,11 @@ import {
 import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompts.js';
 import { resolveProjectRoot, type ProjectInfo } from '../utils/stack.js';
 import { parseRollout } from '../utils/validation.js';
-import { buildFlutterAOT, resolveFlutterPlatform } from '../utils/flutterBundler.js';
+import { buildFlutterAOT, buildFlutterIPA, buildFlutterIOSSimulatorApp, resolveFlutterPlatform, type BuildIpaResult } from '../utils/flutterBundler.js';
 import { captureFlutterBaseline, type BaselineManifest } from '../utils/baseline.js';
+import { buildKbcPatch, resolveFlutterDartSdk } from '../utils/flutterKbcBundler.js';
+import { wrapKbc, type KbcEnvelopeMetadata } from '../utils/flutterKbcEnvelope.js';
+import { loadSigningKey, signEd25519 } from './keys.js';
 
 export const releaseCommand = new Command('release')
   .description('Create a Sankofa Deploy release by bundling JavaScript and uploading a preview-installable native artifact')
@@ -66,6 +69,10 @@ export const releaseCommand = new Command('release')
   .option('--dry-run', 'Build + capture the local safety-check baseline, but do NOT contact the server or upload')
   .option('--apk', 'Android: produce an APK (sideload-installable). Default is --appbundle. (RN + Flutter)')
   .option('--appbundle', 'Android: produce an AAB (Play Store). This is the default. (RN + Flutter)')
+  .option('--flavor <name>', 'Flutter: product flavor to build (e.g. staging, production)')
+  .option('-t, --target <file>', 'Flutter: app entry-point file (e.g. lib/main_staging.dart) — required for flavored apps without lib/main.dart')
+  .option('--no-codesign', 'Flutter iOS: build the .xcarchive without code-signing (sign + export later in Xcode)')
+  .option('--preview-artifact', 'Flutter: also build + upload an installable preview artifact (Android APK / iOS simulator .app) so `sankofa preview --label <v>` can run this release from the server')
   .option(
     '--dart-define <KEY=VALUE>',
     'Flutter: extra dart-define baked into the build (repeatable). Use SANKOFA_SKIP_ENGINE_CHECK=1 if your Sankofa engine fork is unstamped (Platform.version lacks +sankofa-N).',
@@ -514,8 +521,9 @@ export async function flutterRelease(
   const ora = (await import('ora')).default;
   const inquirer = (await import('inquirer')).default;
 
-  // Platform — explicit positional required for parity with RN. iOS is
-  // Phase 6 and refused up-front so users don't waste a build cycle.
+  // Platform — explicit positional required for parity with RN. Both iOS and
+  // Android are first-class: Android ships a libapp.so baseline + KBC patches;
+  // iOS ships a signed .ipa (store artifact) + a KBC baseline envelope.
   const platform = await resolveFlutterPlatform(platformArg);
 
   let environment;
@@ -528,6 +536,23 @@ export async function flutterRelease(
     process.exit(1);
   }
 
+  // Flavored apps (gradle product flavors + per-flavor entrypoint) need
+  // both --flavor and --target, or the build fails / picks the wrong main().
+  // Surface a Sankofa-branded hint before flutter's raw error when an app
+  // has no lib/main.dart and the user passed neither.
+  if (!opts.target && !fs.existsSync(join(project.root, 'lib', 'main.dart'))) {
+    console.log('');
+    console.log(chalk.yellow('  ⚠  No lib/main.dart found and no --target given.'));
+    console.log(chalk.dim('     Flavored apps use a per-flavor entrypoint. Pass both, e.g.:'));
+    console.log(chalk.cyan(`       sankofa release ${platform} --flavor staging -t lib/main_staging.dart`));
+    console.log('');
+  }
+
+  // iOS takes the .ipa + KBC-baseline path; Android continues below.
+  if (platform === 'ios') {
+    return flutterReleaseIOS(project, opts, environment as string, rollout as number);
+  }
+
   if (opts.apk && opts.appbundle) {
     console.error(chalk.red('  ✖ --apk and --appbundle are mutually exclusive.'));
     process.exit(1);
@@ -536,8 +561,9 @@ export async function flutterRelease(
   // 1. Build the AAB (Play Store deployable) + APK (for libapp.so extraction)
   //    + extract libapp.so + AndroidManifest + flutter_assets.
   const format: 'aab' | 'apk' = opts.apk ? 'apk' : 'aab';
+  const variantNote = opts.flavor ? ` [${opts.flavor}]` : '';
   const buildSpinner = ora(
-    `Building Flutter ${format.toUpperCase()} + APK (release, arm64-v8a)...`,
+    `Building Flutter ${format.toUpperCase()}${variantNote} + APK (release, arm64-v8a)...`,
   ).start();
   let built;
   try {
@@ -547,6 +573,8 @@ export async function flutterRelease(
       verbose: false,
       format,
       dartDefines: opts.dartDefine || [],
+      flavor: opts.flavor,
+      target: opts.target,
     });
     buildSpinner.succeed(
       `Built ${format.toUpperCase()}${format === 'aab' ? ' + APK' : ''} + extracted libapp.so (${formatBytes(statSync(built.libappPath).size)})`,
@@ -735,6 +763,17 @@ export async function flutterRelease(
     return;
   }
 
+  // Optional preview artifact: upload the release APK so `sankofa preview
+  // --label <v>` can install + run this build on a device from the server.
+  // The APK is already on disk (keepApk), so this is free for Android.
+  const previewArtifact =
+    opts.previewArtifact && built.apkPath
+      ? { native_artifact_path: built.apkPath, native_artifact_kind: 'android-apk' }
+      : {};
+  if (opts.previewArtifact && built.apkPath) {
+    console.log(chalk.dim(`  · Attaching preview artifact (APK) for \`sankofa preview --label ${label}\``));
+  }
+
   // No base release yet — this IS the base.
   const uploadSpinner = ora('Uploading release to Sankofa…').start();
   try {
@@ -748,6 +787,7 @@ export async function flutterRelease(
       environment,
       runtime: 'flutter-code',
       engine_version: engineVersion,
+      ...previewArtifact,
     });
     uploadSpinner.succeed('Release uploaded.');
 
@@ -792,5 +832,272 @@ export async function flutterRelease(
   } catch (err: any) {
     uploadSpinner.fail(`Upload failed: ${err.message}`);
     process.exit(1);
+  }
+}
+
+// ── Flutter iOS release ─────────────────────────────────────────────────────────
+
+/**
+ * `sankofa release ios` (Flutter). Two outputs, mirroring the Android path:
+ *
+ *   1. A signed `.ipa` via `flutter build ipa` — the developer's App Store
+ *      artifact. Sankofa does NOT store it; devices never download it. This
+ *      is also where `--flavor` / `--target` matter for flavored apps.
+ *   2. An iOS OTA **baseline** registered on the server. Because iOS OTA runs
+ *      through the bytecode interpreter (no native libapp.so swap), the
+ *      baseline's bundle must be a signed KBC envelope — the server validates
+ *      it as one. We synthesize a tiny v0 identity module for the anchor; the
+ *      real code ships later via `sankofa patch ios` as `<label>-patch.N`.
+ *
+ * No engine rebuild, no hosted artifacts: the `.ipa` is built locally on the
+ * developer's Mac and the baseline envelope is generated on the fly.
+ */
+async function flutterReleaseIOS(
+  project: ProjectInfo,
+  opts: any,
+  environment: string,
+  rollout: number,
+) {
+  const chalk = (await import('chalk')).default;
+  const ora = (await import('ora')).default;
+  const inquirer = (await import('inquirer')).default;
+
+  // 1. Build the signed .ipa (store artifact). Streams xcodebuild output.
+  console.log('');
+  console.log(
+    chalk.dim(`  Building Flutter iOS .ipa${opts.flavor ? ` [${opts.flavor}]` : ''} (release)…`),
+  );
+  let built: BuildIpaResult;
+  try {
+    built = buildFlutterIPA(project.root, {
+      flavor: opts.flavor,
+      target: opts.target,
+      dartDefines: opts.dartDefine || [],
+      codesign: opts.codesign !== false,
+      exportOptionsPlist: opts.iosExportOptions,
+      verbose: true,
+    });
+  } catch (err: any) {
+    console.error(chalk.red(`\n  ✖ Flutter iOS build failed: ${err.message}`));
+    console.log(
+      chalk.dim('     If signing isn’t configured, pass --no-codesign to produce just the'),
+    );
+    console.log(chalk.dim('     .xcarchive and sign + export later in Xcode.'));
+    process.exit(1);
+  }
+
+  const appVersion = built.appVersion;
+  const engineVersion = opts.engineVersion || built.engine.sankofaEngineVersion;
+  const label = `v${appVersion}`;
+
+  console.log('');
+  if (built.ipaPath) {
+    console.log(chalk.green(`  ✓ Built .ipa (${formatBytes(statSync(built.ipaPath).size)})`));
+  } else if (built.xcarchivePath) {
+    console.log(
+      chalk.yellow('  ⚠ No .ipa produced (likely --no-codesign). The .xcarchive is ready to sign in Xcode.'),
+    );
+  }
+
+  // 2. Refuse if an iOS flutter-code baseline already exists for this
+  //    version + engine (mirrors the Android conflict check). Skipped on
+  //    --dry-run (we never touch the server in that mode).
+  if (!opts.dryRun) {
+    const checkSpinner = ora('Checking for existing baseline release...').start();
+    try {
+      const releases = await listReleases(environment, 'ios');
+      const conflict = releases.find((r: any) =>
+        (r.runtime === 'flutter-code' || r.runtime === 'flutter_code') &&
+        r.target_binary_version === appVersion &&
+        r.engine_version === engineVersion,
+      );
+      if (conflict) {
+        checkSpinner.fail(
+          `A baseline already exists for ${chalk.bold(appVersion)} + ${chalk.bold(engineVersion)}: ${chalk.dim(conflict.label)}.`,
+        );
+        console.log('');
+        console.log(chalk.dim('  Use one of:'));
+        console.log(chalk.dim(`    • Hot-patch:                      ${chalk.cyan('sankofa patch ios')}`));
+        console.log(chalk.dim(`    • Bump pubspec version and rerun  ${chalk.cyan('sankofa release ios')}`));
+        printIosArtifact(chalk, built);
+        process.exit(1);
+      }
+      checkSpinner.succeed('No existing baseline — safe to create');
+    } catch (err: any) {
+      checkSpinner.fail(`Could not check existing releases: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
+  // 3. Build the baseline KBC envelope (synthesized v0 identity module).
+  //    Devices never download it — it's the anchor patches attach to.
+  const buildDir = resolve(project.root, '.sankofa/build');
+  fs.mkdirSync(buildDir, { recursive: true });
+  const baselineEntry = join(buildDir, 'baseline_entry.dart');
+  fs.writeFileSync(
+    baselineEntry,
+    `// Auto-generated by \`sankofa release ios\` — the iOS OTA baseline anchor.\n` +
+      `// Devices never download this; real code ships via \`sankofa patch ios\`.\n` +
+      `@pragma('dyn-module:entry-point')\n` +
+      `Object? main() => 'sankofa-baseline-${appVersion}';\n`,
+  );
+  const kbcPath = join(buildDir, 'baseline.kbc');
+  const envelopePath = join(buildDir, 'baseline.skdp');
+
+  const pkgSpinner = ora('Registering iOS baseline (KBC envelope)…').start();
+  let envelopeBytes: Buffer;
+  try {
+    buildKbcPatch({
+      entryFile: baselineEntry,
+      outputPath: kbcPath,
+      flutterDartSdk: resolveFlutterDartSdk(project.root),
+    });
+    const meta: KbcEnvelopeMetadata = {
+      label,
+      description: opts.description || `Flutter iOS baseline ${label}`,
+      engineCommit: opts.engineCommit,
+      dartVersion: opts.dartVersion,
+      targetBinaryVersion: appVersion,
+      rollout,
+      mandatory: !!opts.mandatory,
+      createdAt: new Date().toISOString(),
+    };
+    const projectCfg = findProjectConfig();
+    const signingKey = projectCfg?.projectId ? loadSigningKey(projectCfg.projectId) : null;
+    envelopeBytes = wrapKbc({
+      kbcPayload: fs.readFileSync(kbcPath),
+      metadata: meta,
+      sigAlg: signingKey ? 1 : 0,
+      signer: signingKey
+        ? (bytes) => signEd25519(signingKey.privateKeyPem, bytes)
+        : undefined,
+    });
+    fs.writeFileSync(envelopePath, envelopeBytes);
+    pkgSpinner.succeed(
+      `Baseline envelope packaged${signingKey ? ' (signed)' : ' (unsigned)'} (${envelopeBytes.length} B).`,
+    );
+  } catch (err: any) {
+    pkgSpinner.fail(`Baseline packaging failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  console.log(chalk.dim(`  Label:           ${label}`));
+  console.log(chalk.dim(`  Engine version:  ${engineVersion}`));
+  console.log(chalk.dim(`  Target binary:   ${appVersion}`));
+
+  // 4. --dry-run: stop before any server contact.
+  if (opts.dryRun) {
+    console.log('');
+    console.log(chalk.green.bold('  ✓ Dry-run complete (nothing uploaded)'));
+    printIosArtifact(chalk, built);
+    console.log('');
+    console.log(chalk.dim('     Re-run without --dry-run to register the baseline.'));
+    console.log('');
+    return;
+  }
+
+  // 5. Confirm.
+  let shouldPublish = opts.publish;
+  if (!shouldPublish) {
+    const { confirm } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'confirm',
+        message: `Register ${chalk.bold(label)} as the iOS Flutter baseline for ${chalk.bold(appVersion)}?`,
+        default: true,
+      },
+    ]);
+    shouldPublish = confirm;
+  }
+  if (!shouldPublish) {
+    console.log(chalk.dim('Release cancelled. Your .ipa is still on disk.'));
+    printIosArtifact(chalk, built);
+    return;
+  }
+
+  // 5b. Optional preview artifact — build an iOS SIMULATOR app and attach it
+  //     so `sankofa preview --label <v>` can run this build on a simulator
+  //     from the server. (Server contract: iOS preview artifact is sim-only.)
+  let previewArtifact: { native_artifact_path?: string; native_artifact_kind?: string } = {};
+  if (opts.previewArtifact) {
+    console.log('');
+    console.log(chalk.dim('  Building iOS simulator preview app (flutter build ios --simulator)…'));
+    try {
+      const sim = buildFlutterIOSSimulatorApp(project.root, {
+        flavor: opts.flavor,
+        target: opts.target,
+        dartDefines: opts.dartDefine || [],
+        outputDir: resolve(project.root, '.sankofa/build'),
+        verbose: true,
+      });
+      previewArtifact = {
+        native_artifact_path: sim.appZipPath,
+        native_artifact_kind: 'ios-simulator-app-zip',
+      };
+      console.log(chalk.dim(`  · Attaching simulator preview app for \`sankofa preview --label ${label}\``));
+    } catch (err: any) {
+      console.log(chalk.yellow(`  ⚠ Simulator preview app build failed — continuing without it: ${err.message}`));
+    }
+  }
+
+  // 6. Upload the baseline envelope (+ optional preview artifact).
+  const uploadSpinner = ora('Uploading baseline to Sankofa…').start();
+  try {
+    const release = await uploadRelease(envelopePath, {
+      label,
+      target_binary_version: appVersion,
+      platform: 'ios',
+      description: opts.description || `Flutter iOS baseline ${label}`,
+      is_mandatory: opts.mandatory || false,
+      rollout_percentage: rollout,
+      environment,
+      runtime: 'flutter-code',
+      engine_version: engineVersion,
+      ...previewArtifact,
+    });
+    uploadSpinner.succeed('Baseline registered.');
+
+    console.log('');
+    console.log(chalk.green.bold('  🚀 Flutter iOS baseline released'));
+    console.log(chalk.dim(`     Label:           ${release.label}`));
+    console.log(chalk.dim(`     Runtime:         ${release.runtime}`));
+    console.log(chalk.dim(`     Engine:          ${release.engine_version}`));
+    console.log(chalk.dim(`     Target binary:   ${release.target_binary_version}`));
+    console.log(chalk.dim(`     Rollout:         ${release.rollout_percentage}%`));
+    console.log(chalk.dim(`     Release ID:      ${release.id}`));
+
+    printIosArtifact(chalk, built);
+
+    console.log('');
+    console.log(chalk.bold('  📲 Next: submit to App Store Connect'));
+    if (built.ipaPath) {
+      console.log(chalk.dim(`     • Drag ${chalk.cyan(built.ipaPath)} into Transporter, or`));
+      console.log(chalk.dim(`     • xcrun altool --upload-app -t ios -f "${built.ipaPath}" --apiKey <KEY> --apiIssuer <ISSUER>`));
+    }
+    if (built.xcarchivePath) {
+      console.log(chalk.dim(`     • Or open the archive: `) + chalk.cyan(`open "${built.xcarchivePath}"`) + chalk.dim(' → Distribute App'));
+    }
+    console.log('');
+    console.log(chalk.yellow('  ⚠ In Xcode’s Distribute App dialog, UNCHECK “Manage Version and Build Number.”'));
+    console.log(chalk.dim('     If left checked, Xcode rewrites the build number and every patch silently fails to apply.'));
+    console.log('');
+    console.log(chalk.dim('  Future hot-patches: ') + chalk.cyan('sankofa patch ios'));
+    console.log('');
+  } catch (err: any) {
+    uploadSpinner.fail(`Upload failed: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function printIosArtifact(chalk: any, built: BuildIpaResult) {
+  console.log('');
+  if (built.ipaPath) {
+    console.log(chalk.bold('  🏬 Store binary — iOS .ipa (App Store / TestFlight)'));
+    console.log(chalk.dim('     Path:   ') + chalk.cyan(built.ipaPath));
+    console.log(chalk.dim('     Size:   ') + formatBytes(statSync(built.ipaPath).size));
+    console.log(chalk.dim('     ↑ This is your deployable. Sankofa does not store it — submit it yourself.'));
+  } else if (built.xcarchivePath) {
+    console.log(chalk.bold('  🏬 Store archive — .xcarchive (sign + export in Xcode)'));
+    console.log(chalk.dim('     Path:   ') + chalk.cyan(built.xcarchivePath));
   }
 }

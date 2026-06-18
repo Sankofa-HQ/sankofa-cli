@@ -425,6 +425,14 @@ sankofa release ios --ios-export-method app-store --ios-team-id ABC1234XYZ
 sankofa release android --android-format apk        # sideload APK instead of AAB
 
 sankofa release ios --skip-distribution             # OTA only (rare)
+
+# Flutter flavors + per-flavor entrypoint
+sankofa release android --flavor staging -t lib/main_staging.dart
+sankofa release ios --flavor staging -t lib/main_staging.dart
+
+# Also upload an installable preview build so testers can run this release
+# from the server (see `preview --from-server`)
+sankofa release android --preview-artifact
 ```
 
 **Arguments**
@@ -451,6 +459,19 @@ sankofa release ios --skip-distribution             # OTA only (rare)
 - `--ios-export-options <path>` — a hand-rolled `ExportOptions.plist` (overrides `--ios-export-method` / `--ios-team-id`).
 - `--android-format <aab|apk>` — default `aab` (Play Store). `apk` for sideload/legacy.
 
+**Flutter options**
+
+- `--flavor <name>` — gradle product flavor to build (e.g. `staging`, `production`). Required for apps that declare product flavors.
+- `-t, --target <file>` — app entry-point (e.g. `lib/main_staging.dart`). Required for flavored apps that don't have a `lib/main.dart`. Pair it with the matching `--flavor`.
+- `--no-codesign` — **iOS only**: build the `.xcarchive` without signing (sign + export later in Xcode). Without it, `release ios` produces a signed `.ipa`.
+- `--preview-artifact` — also build + upload an installable preview build (Android APK / iOS **simulator** app) so teammates can run this exact release with `sankofa preview --from-server` — no source needed.
+
+**Flutter release behavior**
+
+- **Android** builds your `.aab` (or `--apk` for sideload) and registers the release. The `.aab` is your Play Store deployable.
+- **iOS** builds a signed `.ipa` (App Store Connect / TestFlight) and registers the release. **In Xcode's Distribute App dialog, uncheck "Manage Version and Build Number"** — if Xcode rewrites the build number, patches silently stop applying. (The CLI prints this reminder at the end of every `release ios`.)
+- After the first release, ship code-only updates with `sankofa patch` — no store resubmission.
+
 **When a release for this version already exists**
 
 The CLI errors out (by design — OTA is immutable once published) and prints three escape hatches:
@@ -466,6 +487,7 @@ Ship a **code-only** update against an existing base release — no native rebui
 sankofa patch android                                  # Flutter or RN — auto-detected
 sankofa patch ios --publish --rollout 100 --mandatory
 sankofa patch ios --release v1.2.0                     # target a specific base release
+sankofa patch ios -t lib/patch_staging.dart            # pick a specific patch entry-point
 ```
 
 **Arguments**
@@ -474,36 +496,67 @@ sankofa patch ios --release v1.2.0                     # target a specific base 
 
 **Options**
 
-- `--entry-file <file>`, `--output-dir <dir>`, `--description <desc>`, `--mandatory`, `--rollout <percent>`, `--publish`, `--env <env>`, `--project <path>` — same semantics as `release`.
+- `--output-dir <dir>`, `--description <desc>`, `--mandatory`, `--rollout <percent>`, `--publish`, `--env <env>`, `--project <path>` — same semantics as `release`.
 - `--release <label>` — target base release (otherwise you're prompted to pick).
+- `-t, --target <file>` — **Flutter**: the patch entry-point to compile (default `lib/sankofa_patch.dart`). Use it when you keep several patch entries and want to ship one. `--entry-file` is an alias. (For React Native, `--entry-file` is the JS entry.)
 
-`patch` prompts you to pick the base release it targets (unless `--release`). Labels are auto-generated as `<base>-patch.<n>` where `<n>` is the next integer. A Flutter patch ships Dart logic changes from your patch entry-point — adding a brand-new asset or native dependency needs a new `sankofa release`.
+`patch` prompts you to pick the base release it targets (unless `--release`). Labels are auto-generated as `<base>-patch.<n>` where `<n>` is the next integer. A Flutter patch ships Dart code changes from your patch entry-point — adding a brand-new asset or native dependency needs a new `sankofa release`.
 
 ### `preview`
 
-Download + install + launch a published release or patch on your local simulator/emulator.
+Run your app for QA. Behavior depends on the stack (auto-detected):
+
+- **React Native** — downloads + installs + launches a published release or patch on your local simulator/emulator.
+- **Flutter** — two modes:
+  - **Local run** (default) — runs your current source on a device via the Sankofa Flutter runtime (a thin wrapper over `flutter run`), so what you preview matches what ships.
+  - **From server** (`--from-server`, or implied when you pass `--label`/`--version`) — downloads a *published* release and installs it on an **Android device/emulator** or an **iOS simulator**, so a tester can run a specific build without your source. Requires that release to have been published with `--preview-artifact`.
 
 ```bash
+# React Native
 sankofa preview ios
 sankofa preview ios --label v1.2.0-patch.3
 sankofa preview android --device <adb-serial>
 sankofa preview ios --skip-install   # only downloads + verifies
 sankofa preview ios --no-logs        # do not stream runtime logs
+
+# Flutter — local run (flavors + device pass straight through to flutter run)
+sankofa preview -d <device-id> --flavor staging -t lib/main_staging.dart
+sankofa preview --profile            # profile mode instead of release
+
+# Flutter — run a published release from the server (no source needed)
+sankofa preview android --from-server --label v1.2.0 -d <adb-serial>
+sankofa preview ios --from-server --label v1.2.0     # installs on a booted simulator
 ```
 
-**Options**
+**Options (React Native)**
 
 - `--version <version>` — skip the version picker.
 - `--label <label>` — pick a specific release.
 - `--env <live|test>`.
 - `--app-id <id>` — override the detected bundle identifier / package name.
-- `--device <device>` — iOS simulator UDID/name or Android `adb` serial. Defaults to the booted simulator / default device.
+- `-d, --device <device>` — iOS simulator UDID/name or Android `adb` serial. Defaults to the booted simulator / default device.
 - `--output-dir <dir>` — where to stage the downloaded artifacts.
 - `--skip-install` — just download + verify, don't install.
 - `--no-logs` — don't attach to the app's stdout after launch. Default: logs stream live via `xcrun simctl launch --console-pty` (iOS) or `adb logcat --pid=…` (Android). Ctrl+C detaches without killing the app.
-- `--project <path>` — RN app root override.
+- `--project <path>` — app root override.
 
-The CLI downloads the release, installs it on the simulator/emulator, and configures the SDK to load the correct bundle on startup.
+**Options (Flutter — local run)**
+
+- `-d, --device <device>` — device UDID / serial to launch on. Defaults to flutter's default device.
+- `--flavor <name>` — gradle product flavor (e.g. `staging`).
+- `-t, --target <file>` — app entry-point (e.g. `lib/main_staging.dart`).
+- `--release` (default) / `--profile` / `--debug` — build mode.
+- `--dart-define <KEY=VALUE>` — repeatable, passed to `flutter run`.
+
+**Options (Flutter — `--from-server`)**
+
+- `--from-server` — install a published release instead of running local source. Implied by `--label`/`--version`.
+- `--label <label>` / `--version <version>` — pick the release (otherwise you're prompted).
+- `-d, --device <device>` — Android device/emulator serial. (iOS installs on a booted simulator.)
+- `--app-id <id>` — override the auto-detected bundle id / package name.
+- `--env <live|test>`, `--output-dir <dir>`, `--no-logs` — as above.
+
+> Real-device iOS from-server isn't supported yet (the stored iOS preview build is simulator-only). For iOS local QA use the local-run mode above; for distributing a device build to testers, use TestFlight.
 
 ### `dist`
 

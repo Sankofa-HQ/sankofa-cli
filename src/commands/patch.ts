@@ -29,7 +29,8 @@ function isPatchRelease(release: any): boolean {
 export const patchCommand = new Command('patch')
   .description('Push an OTA patch to an existing release (Dart/JS code only — no native changes)')
   .argument('[platform]', 'Target platform: ios or android (prompts if omitted)')
-  .option('--entry-file <file>', 'RN: JS entry file')
+  .option('--entry-file <file>', 'RN: JS entry file. Flutter: patch entry-point (alias of -t/--target).')
+  .option('-t, --target <file>', "Flutter: patch entry-point file to compile (default lib/sankofa_patch.dart). Pick one when you keep several patch entries. The file must expose the @pragma('dyn-module:entry-point') function.")
   .option('--output-dir <dir>', 'Directory for built artifacts', './build')
   .option('--description <desc>', 'Patch description')
   .option('--mandatory', 'Mark this patch as mandatory (force-update)')
@@ -483,7 +484,9 @@ async function flutterKbcPatch(
 
   // ── 3. Resolve patch entry + optional dynamic interface ─────────────
   const projectRoot = project.root;
-  const entryFile = resolve(projectRoot, opts.entryFile || 'lib/sankofa_patch.dart');
+  // -t/--target and --entry-file are aliases for the patch entry; -t wins
+  // when both are given. Lets you keep multiple patch entries and select one.
+  const entryFile = resolve(projectRoot, opts.target || opts.entryFile || 'lib/sankofa_patch.dart');
   if (!existsSync(entryFile)) {
     console.error(chalk.red(`  ✖ Patch entry not found: ${entryFile}`));
     console.error(chalk.dim(

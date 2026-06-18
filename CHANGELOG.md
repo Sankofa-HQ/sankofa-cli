@@ -3,7 +3,37 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
-## 0.1.6 — Flutter init/login onboarding fixes
+## 0.1.6 — Flutter flavors, iOS release, server preview
+
+### Added
+- **Flutter flavors + custom entrypoints.** `sankofa release` (iOS + Android)
+  now accepts `--flavor <name>` and `-t, --target <file>`, threaded into the
+  underlying Flutter build (e.g.
+  `sankofa release android --flavor staging -t lib/main_staging.dart`).
+  Previously a flavored app (gradle product flavors + a per-flavor
+  `main_<flavor>.dart`, no `lib/main.dart`) could not be released at all —
+  the build failed with "you must specify a --flavor" / "lib/main.dart not
+  found". Flavored AAB discovery now also looks in
+  `build/app/outputs/bundle/<flavor>Release/`.
+- **`sankofa release ios` (Flutter) builds a signed `.ipa` and registers the
+  release** — at parity with Android. Produces your App Store / TestFlight
+  binary (or just the `.xcarchive` with `--no-codesign`) and prints the
+  "uncheck Manage Version and Build Number" reminder. After it, ship code
+  updates with `sankofa patch ios`.
+- **`sankofa preview` works for Flutter — two modes.** *Local run* (default):
+  runs your current source on a device via the Sankofa Flutter runtime (a thin
+  `flutter run` wrapper), passing `--flavor`, `-t/--target`, `-d/--device`,
+  build mode (`--release`/`--profile`/`--debug`), and repeatable
+  `--dart-define`. *From server* (`--from-server`, or implied by
+  `--label`/`--version`): downloads a published release and installs it on an
+  Android device/emulator or an iOS simulator — no source needed.
+- **`sankofa release --preview-artifact`** also builds + uploads an installable
+  preview build (Android APK / iOS simulator app) so teammates can run a
+  specific release with `sankofa preview --from-server`.
+- **`sankofa patch -t, --target <file>`** picks the Flutter patch entry-point
+  to compile (default `lib/sankofa_patch.dart`); `--entry-file` is an alias.
+  Lets you keep several patch entries and ship one.
+- **`-d, --device` short flag on `preview`** (was `--device` long-form only).
 
 ### Fixed
 - **`sankofa init` no longer corrupts a project's `pubspec.yaml`.** When a project
@@ -27,44 +57,39 @@ bumps may include breaking changes).
 ### Changed
 - Product picker description no longer exposes internal/implementation details.
 
-## 0.1.5 — release-branch rename
+## 0.1.5 — bundled-SDK install plumbing
 
 ### Changed
-- Bundled-SDK install now clones `release/sankofa-<version>` (renamed from the
-  legacy `phase1/sankofa-<…>` scheme). The legacy branch is kept on the remote
-  for one cycle and used as an automatic clone fallback, so older installs and
-  transitional states keep working. No behaviour change to the primary CDN
-  tarball install path.
+- Bundled-SDK install plumbing updated; older installs keep working via an
+  automatic fallback. No behaviour change to the standard install path.
 
-## 0.1.4 — cross-platform hosts + unified KBC
+## 0.1.4 — cross-platform hosts
 
 ### Added
-- **Unified Flutter KBC patching** — `sankofa patch` ships a signed `.skdp`
-  bytecode envelope for **both iOS and Android** (the engine interpreter runs it
-  on either platform). Android no longer takes the legacy `libapp.so` path.
+- **Unified Flutter patching** — `sankofa patch` ships a single signed code
+  patch that applies on **both iOS and Android** from one command.
 - **Windows host support** for the full Android `release` + `patch` loop —
   proven on-device. The CLI now resolves platform binaries correctly on Windows
-  (`flutter.bat` / `dart.exe` / `dartaotruntime.exe`), extracts archives with the
-  bundled `tar`, and finds Flutter via `where`.
-- **`sankofa release --dart-define <KEY=VALUE>`** — threaded into the Flutter AOT
-  build (repeatable). Used e.g. for engine-check bypass on unstamped forks.
+  (`flutter.bat` / `dart.exe`), extracts archives with the bundled `tar`, and
+  finds Flutter via `where`.
+- **`sankofa release --dart-define <KEY=VALUE>`** — extra compile-time defines
+  threaded into the Flutter build (repeatable).
 
 ### Changed / Fixed
 - Cross-platform file ops throughout (`sankofa init`, RN bundling, `engine
   install --local`, `preview`): replaced Unix-only `cp -R`/`rm -rf`/`mkdir -p`/
-  `ln -s`/`unzip` shellouts with Node `fs` APIs (`cpSync`/`rmSync`/`mkdirSync`/
-  `symlinkSync` + `tar`-on-Windows), so these commands work on Windows too.
-- KBC patch builds resolve the Flutter dart-sdk from the **project root** (not
-  the entry file's dir), so `sankofa patch` finds `sankofa.yaml`'s engine pin.
-- Engine-version detection falls back to the project's authoritative pin
-  (`sankofa.yaml` / `.sankofa/flutter-version`) when `flutter --version` is
-  unusable (`0.0.0-unknown` on a fork clone whose `git describe` is hijacked by
-  the `v…+sankofa-N` tag). `release`/`patch` no longer need `--engine-version`.
+  `ln -s`/`unzip` shellouts with Node `fs` APIs, so these commands work on
+  Windows too.
+- Patch builds resolve the Flutter SDK from the **project root** (not the entry
+  file's dir), so `sankofa patch` finds `sankofa.yaml`'s settings.
+- Engine-version detection falls back to the project's pin (`sankofa.yaml` /
+  `.sankofa/flutter-version`) when `flutter --version` is unusable on a managed
+  runtime. `release`/`patch` no longer need `--engine-version`.
 
 ### Host-OS support
 - **Android** release + patch: macOS, Linux, **Windows** — all on-device proven.
-- **iOS** release: macOS only (Xcode). iOS KBC patch is host-agnostic in
-  principle (no Xcode) but proven from macOS only.
+- **iOS** release + patch: macOS (Xcode for release; patch is host-agnostic but
+  proven from macOS).
 
 ## 0.1.2 and earlier
 - Engine cache install from the CDN tarball, single-command engine upgrades,

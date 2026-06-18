@@ -230,6 +230,21 @@ export function buildFlutterAOT(
      * fork stamps `tools/VERSION`, this bypass is no longer needed.
      */
     dartDefines?: string[];
+    /**
+     * Android product flavor (e.g. `staging`, `production`). Threaded
+     * through as `flutter build apk/appbundle --flavor <name>`. Required
+     * for apps that define gradle product flavors — without it the build
+     * fails ("you must specify a --flavor"). Flutter flavor names are
+     * alphanumeric identifiers, so no shell-quoting is needed.
+     */
+    flavor?: string;
+    /**
+     * App entry-point file (e.g. `lib/main_staging.dart`). Threaded
+     * through as `--target <file>`. Flavored apps typically pair a flavor
+     * with a per-flavor entrypoint; without this they'd build the wrong
+     * `main()` (or fail when there is no `lib/main.dart`).
+     */
+    target?: string;
   } = { outputDir: 'build' },
 ): BuildAndExtractResult {
   const cwd = resolve(projectRoot);
@@ -245,10 +260,18 @@ export function buildFlutterAOT(
     .map((d) => ` --dart-define=${d}`)
     .join('');
 
+  // Flavor + entry-point passthrough. Flavor names are alphanumeric
+  // gradle identifiers (no quoting); the target is a path (quote for
+  // spaces). Both apply to apk + appbundle so the store artifact and the
+  // libapp.so we extract come from the same variant.
+  const flavorFlag = opts.flavor ? ` --flavor ${opts.flavor}` : '';
+  const targetFlag = opts.target ? ` --target "${opts.target}"` : '';
+  const variantFlags = `${defineFlags}${flavorFlag}${targetFlag}`;
+
   // Always build the APK (cheap when AAB build is also queued — Flutter
   // shares the build graph). We need it to extract libapp.so +
   // AndroidManifest + flutter_assets for Diff Guard.
-  const apkCmd = flutterCmd(cwd, `build apk --release --target-platform android-arm64${defineFlags}`);
+  const apkCmd = flutterCmd(cwd, `build apk --release --target-platform android-arm64${variantFlags}`);
   if (opts.verbose) console.log(`  $ ${apkCmd}`);
   execSync(apkCmd, { cwd, stdio: opts.verbose ? 'inherit' : 'pipe' });
 
@@ -256,10 +279,10 @@ export function buildFlutterAOT(
   // artifact for Play Console.
   let aabPath: string | null = null;
   if (format === 'aab') {
-    const aabCmd = flutterCmd(cwd, `build appbundle --release --target-platform android-arm64${defineFlags}`);
+    const aabCmd = flutterCmd(cwd, `build appbundle --release --target-platform android-arm64${variantFlags}`);
     if (opts.verbose) console.log(`  $ ${aabCmd}`);
     execSync(aabCmd, { cwd, stdio: opts.verbose ? 'inherit' : 'pipe' });
-    aabPath = findAab(cwd);
+    aabPath = findAab(cwd, opts.flavor);
   }
 
   const apkDir = join(cwd, 'build', 'app', 'outputs', 'flutter-apk');
@@ -341,6 +364,165 @@ export function buildFlutterAOT(
   };
 }
 
+export interface BuildIpaResult {
+  /** Absolute path to the produced `.ipa`, or null with --no-codesign / when export is deferred to Xcode. */
+  ipaPath: string | null;
+  /** Absolute path to the `.xcarchive` (always produced by `flutter build ipa`). */
+  xcarchivePath: string | null;
+  /** App version from pubspec.yaml — the iOS baseline's `target_binary_version`. */
+  appVersion: string;
+  /** Engine info captured at build time. */
+  engine: FlutterEngineInfo;
+}
+
+/**
+ * Build a signed iOS `.ipa` for App Store submission via `flutter build ipa`.
+ *
+ * Unlike the Android path (which extracts `libapp.so` as the OTA baseline
+ * payload), the iOS `.ipa` is purely the developer's STORE artifact — Sankofa
+ * never stores it and devices never download it. The iOS OTA baseline is a
+ * signed KBC envelope registered separately (see flutterReleaseIOS in
+ * release.ts), because iOS OTA runs through the bytecode interpreter, not a
+ * native `libapp.so` swap.
+ *
+ * `flutter build ipa` runs xcodebuild archive + export under the hood:
+ *   - with signing configured → build/ios/ipa/*.ipa (and the .xcarchive)
+ *   - with --no-codesign       → build/ios/archive/Runner.xcarchive only
+ *     (sign + export later via Xcode's Distribute App flow)
+ *
+ * `--flavor` / `--target` are threaded through identically to the Android
+ * path so flavored apps (gradle flavors + per-flavor entrypoint) build the
+ * right variant.
+ */
+export function buildFlutterIPA(
+  projectRoot: string,
+  opts: {
+    flavor?: string;
+    target?: string;
+    dartDefines?: string[];
+    /** Default true. false → pass `--no-codesign` (archive only; sign in Xcode). */
+    codesign?: boolean;
+    /** Path to an ExportOptions.plist forwarded to `flutter build ipa`. */
+    exportOptionsPlist?: string;
+    verbose?: boolean;
+  } = {},
+): BuildIpaResult {
+  const cwd = resolve(projectRoot);
+  const appVersion = detectFlutterAppVersion(cwd);
+  const engine = detectFlutterEngineInfo(cwd);
+
+  const flags = ['build', 'ipa', '--release'];
+  if (opts.codesign === false) flags.push('--no-codesign');
+  if (opts.flavor) flags.push(`--flavor ${opts.flavor}`);
+  if (opts.target) flags.push(`--target "${opts.target}"`);
+  for (const d of opts.dartDefines ?? []) flags.push(`--dart-define=${d}`);
+  if (opts.exportOptionsPlist) flags.push(`--export-options-plist "${opts.exportOptionsPlist}"`);
+
+  const cmd = flutterCmd(cwd, flags.join(' '));
+  if (opts.verbose) console.log(`  $ ${cmd}`);
+  // Inherit stdio — an iOS archive+export is a long, signing-sensitive build;
+  // streaming xcodebuild output is far more useful than a silent spinner.
+  execSync(cmd, { cwd, stdio: 'inherit' });
+
+  const ipaPath = findIpa(join(cwd, 'build', 'ios', 'ipa'));
+  const xcarchivePath = findXcarchive(join(cwd, 'build', 'ios', 'archive'));
+  return { ipaPath, xcarchivePath, appVersion, engine };
+}
+
+function findIpa(dir: string): string | null {
+  if (!existsSync(dir)) return null;
+  const ipa = readdirSync(dir).find((e) => e.endsWith('.ipa'));
+  return ipa ? join(dir, ipa) : null;
+}
+
+/**
+ * Build an iOS **simulator** `.app` and zip it for `sankofa preview` from the
+ * server. The server's preview-artifact slot is simulator-only for iOS
+ * (`ios-simulator-app-zip`), so a device `.ipa` can't be used here. Built with
+ * the bundled Sankofa fork (its xcframework includes the simulator slice), so
+ * the previewed app carries the same engine a real release would.
+ *
+ * Returns the zip path + the app's bundle id (read from the built Info.plist,
+ * the most reliable source) for the later `simctl launch`.
+ */
+export function buildFlutterIOSSimulatorApp(
+  projectRoot: string,
+  opts: { flavor?: string; target?: string; dartDefines?: string[]; outputDir: string; verbose?: boolean },
+): { appZipPath: string; appId: string } {
+  const cwd = resolve(projectRoot);
+  const outDir = resolve(opts.outputDir);
+  mkdirSync(outDir, { recursive: true });
+
+  // `flutter build ios --simulator` produces a debug simulator build at
+  // build/ios/iphonesimulator/Runner.app (no codesign needed for sims).
+  const flags = ['build', 'ios', '--simulator'];
+  if (opts.flavor) flags.push(`--flavor ${opts.flavor}`);
+  if (opts.target) flags.push(`--target "${opts.target}"`);
+  for (const d of opts.dartDefines ?? []) flags.push(`--dart-define=${d}`);
+  const cmd = flutterCmd(cwd, flags.join(' '));
+  if (opts.verbose) console.log(`  $ ${cmd}`);
+  execSync(cmd, { cwd, stdio: 'inherit' });
+
+  const appPath = join(cwd, 'build', 'ios', 'iphonesimulator', 'Runner.app');
+  if (!existsSync(appPath)) {
+    throw new Error(
+      `Simulator app not found at ${appPath} after \`flutter build ios --simulator\`.\n` +
+        `(Your Sankofa engine fork may not include an iOS simulator slice.)`,
+    );
+  }
+  const appId = readBundleIdFromApp(appPath);
+  const appZipPath = join(outDir, 'Runner-ios-simulator.app.zip');
+  if (existsSync(appZipPath)) rmSync(appZipPath, { force: true });
+  // Same packaging the RN path uses, so the server + preview install agree.
+  execSync(`ditto -c -k --sequesterRsrc --keepParent "${appPath}" "${appZipPath}"`, {
+    stdio: opts.verbose ? 'inherit' : 'pipe',
+  });
+  return { appZipPath, appId };
+}
+
+function readBundleIdFromApp(appPath: string): string {
+  const plist = join(appPath, 'Info.plist');
+  try {
+    return execSync(`/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "${plist}"`, {
+      encoding: 'utf-8',
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Detect a Flutter app's NATIVE bundle id / package name (for `simctl launch`
+ * / `adb shell monkey`). Android: `applicationId` in app/build.gradle[.kts].
+ * iOS: `PRODUCT_BUNDLE_IDENTIFIER` from the Runner target's pbxproj (skipping
+ * the test target and any `$(...)` variable form). Returns null if unknown —
+ * callers fall back to an explicit `--app-id`.
+ */
+export function detectFlutterAppId(projectRoot: string, platform: 'ios' | 'android'): string | null {
+  const cwd = resolve(projectRoot);
+  if (platform === 'android') {
+    for (const f of ['android/app/build.gradle.kts', 'android/app/build.gradle']) {
+      const p = join(cwd, f);
+      if (!existsSync(p)) continue;
+      const m = readFileSync(p, 'utf-8').match(/applicationId\s*=?\s*["']([^"']+)["']/);
+      if (m) return m[1];
+    }
+    return null;
+  }
+  const pbx = join(cwd, 'ios', 'Runner.xcodeproj', 'project.pbxproj');
+  if (!existsSync(pbx)) return null;
+  const ids = Array.from(
+    readFileSync(pbx, 'utf-8').matchAll(/PRODUCT_BUNDLE_IDENTIFIER = ([^;]+);/g),
+  ).map((m) => m[1].trim());
+  return ids.find((id) => !/test/i.test(id) && !id.includes('$(')) || ids[0] || null;
+}
+
+function findXcarchive(dir: string): string | null {
+  if (!existsSync(dir)) return null;
+  const arch = readdirSync(dir).find((e) => e.endsWith('.xcarchive'));
+  return arch ? join(dir, arch) : null;
+}
+
 /**
  * Stream-hash a file with SHA-256. Loads at most 64 KiB at a time so
  * a 150 MB `libflutter.so` doesn't allocate a contiguous buffer.
@@ -364,13 +546,32 @@ function sha256OfFile(path: string): string {
   return hash.digest('hex');
 }
 
-function findAab(projectRoot: string): string | null {
-  // Flutter places release AABs under build/app/outputs/bundle/release/.
-  const dir = join(projectRoot, 'build', 'app', 'outputs', 'bundle', 'release');
-  if (!existsSync(dir)) return null;
-  const entries = readdirSync(dir);
-  const release = entries.find((e) => /\.aab$/.test(e));
-  return release ? join(dir, release) : null;
+function findAab(projectRoot: string, flavor?: string): string | null {
+  // Plain builds write to build/app/outputs/bundle/release/; flavored
+  // builds write to build/app/outputs/bundle/<flavor>Release/ (e.g.
+  // stagingRelease/). Search the whole bundle/ dir so both layouts work.
+  const bundleRoot = join(projectRoot, 'build', 'app', 'outputs', 'bundle');
+  if (!existsSync(bundleRoot)) return null;
+
+  const subdirs = readdirSync(bundleRoot, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name);
+
+  // Prefer the flavor-specific release dir, then any *Release dir, then
+  // anything else — so a flavored build never picks up a stale plain AAB.
+  const preferred = flavor ? `${flavor}release` : '';
+  const ordered = [
+    ...subdirs.filter((d) => d.toLowerCase() === preferred),
+    ...subdirs.filter((d) => d.toLowerCase() !== preferred && /release$/i.test(d)),
+    ...subdirs.filter((d) => !/release$/i.test(d)),
+  ];
+
+  for (const sub of ordered) {
+    const dir = join(bundleRoot, sub);
+    const aab = readdirSync(dir).find((e) => /\.aab$/.test(e));
+    if (aab) return join(dir, aab);
+  }
+  return null;
 }
 
 function findApk(dir: string): string | null {
