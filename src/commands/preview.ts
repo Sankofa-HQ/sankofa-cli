@@ -345,6 +345,30 @@ export const previewCommand = new Command('preview')
  * the build mode, and `--dart-define` straight through — so a flavored app
  * (`main_staging.dart` + `staging` flavor) previews with one command.
  */
+/**
+ * Pick a connected device matching the requested mobile platform, so
+ * `flutter run` builds for THAT platform only (never web/desktop). Returns the
+ * device id, or undefined if none is connected / on error.
+ */
+function pickFlutterDevice(quotedBin: string, cwd: string, platform: 'ios' | 'android'): string | undefined {
+  try {
+    const out = execSync(`${quotedBin} devices --machine`, { cwd, encoding: 'utf-8' });
+    // `flutter devices --machine` can print a non-JSON preamble (e.g. a
+    // startup-lock notice) before the array — slice to the JSON span.
+    const start = out.indexOf('[');
+    const end = out.lastIndexOf(']');
+    if (start < 0 || end <= start) return undefined;
+    const devices = JSON.parse(out.slice(start, end + 1)) as Array<{ id?: string; targetPlatform?: string }>;
+    const match = devices.find((d) => {
+      const tp = String(d.targetPlatform || '');
+      return platform === 'ios' ? tp.startsWith('ios') : tp.startsWith('android');
+    });
+    return match?.id;
+  } catch {
+    return undefined;
+  }
+}
+
 async function flutterPreview(project: ProjectInfo, platformArg: string | undefined, opts: any) {
   // Server mode: pull a PUBLISHED release's installable artifact and run it
   // (Android device / iOS simulator), like RN/Shorebird preview. Triggered by
@@ -363,10 +387,27 @@ async function flutterPreview(project: ProjectInfo, platformArg: string | undefi
   const flutterBin = resolveFlutterBinary(project.root);
   const quotedBin = /\s/.test(flutterBin) ? `"${flutterBin}"` : flutterBin;
 
+  // `sankofa preview ios|android` must target a device of THAT platform.
+  // Sankofa is a mobile (iOS + Android) runtime; if we leave the device
+  // ambiguous, `flutter run` tries to satisfy every connected device's
+  // platform — including a Mac/Chrome — and pulls web/desktop engine
+  // artifacts the mobile runtime doesn't ship (→ the web-SDK 404). Selecting
+  // the matching device scopes the build to that platform's artifacts only,
+  // so the user never has to think about web.
+  let device: string | undefined = opts.device;
+  if (!device && (platformArg === 'ios' || platformArg === 'android')) {
+    device = pickFlutterDevice(quotedBin, project.root, platformArg);
+    if (!device) {
+      console.log(
+        chalk.yellow(`  ⚠ No connected ${platformArg} device/emulator found — connect one, or pass -d <id>.`),
+      );
+    }
+  }
+
   const args: string[] = ['run', `--${mode}`];
   if (opts.flavor) args.push('--flavor', opts.flavor);
   if (opts.target) args.push('--target', opts.target);
-  if (opts.device) args.push('-d', opts.device);
+  if (device) args.push('-d', device);
   for (const d of (opts.dartDefine || [])) args.push(`--dart-define=${d}`);
 
   // Quote any arg containing whitespace (the target path may); flavor/device
@@ -381,7 +422,7 @@ async function flutterPreview(project: ProjectInfo, platformArg: string | undefi
   console.log(`  Mode:    ${chalk.bold(mode)}`);
   if (opts.flavor) console.log(`  Flavor:  ${chalk.bold(opts.flavor)}`);
   if (opts.target) console.log(`  Target:  ${chalk.bold(opts.target)}`);
-  console.log(`  Device:  ${chalk.bold(opts.device || 'auto (flutter default)')}`);
+  console.log(`  Device:  ${chalk.bold(device || (platformArg ? `auto (${platformArg})` : 'auto (flutter default)'))}`);
   console.log('');
   console.log(chalk.dim(`  $ ${cmdline}`));
   console.log('');

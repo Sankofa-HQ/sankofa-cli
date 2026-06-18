@@ -3,6 +3,19 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.8 — `preview` targets the right device automatically
+
+### Fixed
+- **`sankofa preview ios` / `preview android` now auto-select a connected
+  device of that platform.** Previously the platform argument was ignored and
+  the CLI ran a bare `flutter run` with no device — so on a machine with a
+  Mac/Chrome device also present, Flutter tried to satisfy **web/desktop**
+  artifacts too and failed fetching the web SDK (a 404 that aborted the whole
+  run). You no longer need `flutter config --no-enable-web` or any web
+  workaround: `preview ios` builds for iOS only, `preview android` for Android
+  only. Pass `-d <id>` to override; pass neither platform nor device and it
+  falls back to Flutter's default selection.
+
 ## 0.1.7 — correct `--version` reporting
 
 ### Fixed
