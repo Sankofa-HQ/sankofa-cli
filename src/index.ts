@@ -25,7 +25,7 @@ import { flagsCommand } from './commands/flags.js';
 import { configCommand } from './commands/config.js';
 import { catchCommand } from './commands/catch.js';
 import { demoCommand } from './commands/demo.js';
-import { kbcCommand } from './commands/kbc.js';
+import { patchToolsCommand } from './commands/patchTools.js';
 import { keysCommand } from './commands/keys.js';
 import { maybePrintUpdateNotices } from './utils/updateCheck.js';
 
@@ -79,9 +79,9 @@ program.addCommand(catchCommand);
 program.addCommand(demoCommand);
 // Advanced low-level patch tooling — hidden from `sankofa --help`
 // because `sankofa patch` orchestrates these steps already. Still
-// callable via `sankofa kbc <subcommand>` for power users / CI.
-program.addCommand(kbcCommand, { hidden: true });
-// Ed25519 signing key management.
+// callable via `sankofa patch-tools <subcommand>` for power users / CI.
+program.addCommand(patchToolsCommand, { hidden: true });
+// Signing key management.
 program.addCommand(keysCommand);
 
 program.parse();
@@ -89,10 +89,10 @@ program.parse();
 // Update notices (CLI version + project engine pin) — printed after the
 // command's own output, throttled to one network round-trip per 24h via
 // ~/.sankofa/update-check.json, and silent on every failure path. Skipped
-// for plumbing surfaces where unexpected stderr is unwelcome (kbc/CI).
+// for plumbing surfaces where unexpected stderr is unwelcome (patch-tools/CI).
 process.on('exit', () => {
   const cmd = process.argv[2] || '';
-  if (['kbc', '--version', '-V', '--help', '-h'].includes(cmd)) return;
+  if (['patch-tools', '--version', '-V', '--help', '-h'].includes(cmd)) return;
   if (process.env.SANKOFA_NO_UPDATE_CHECK === '1' || process.env.CI) return;
   maybePrintUpdateNotices(VERSION, process.cwd());
 });

@@ -18,8 +18,8 @@ import { resolveProjectRoot, type ProjectInfo } from '../utils/stack.js';
 import { escapeRegExp, parseRollout } from '../utils/validation.js';
 import { detectFlutterEngineInfo, resolveFlutterPlatform } from '../utils/flutterBundler.js';
 import { readBaselineManifest } from '../utils/baseline.js';
-import { buildKbcPatch, resolveFlutterDartSdk } from '../utils/flutterKbcBundler.js';
-import { wrapKbc, type KbcEnvelopeMetadata } from '../utils/flutterKbcEnvelope.js';
+import { buildFlutterPatch, resolveFlutterDartSdk } from '../utils/flutterPatchCompiler.js';
+import { packPatch, type PatchMetadata } from '../utils/flutterPatchPackage.js';
 import { loadSigningKey, signEd25519 } from './keys.js';
 
 function isPatchRelease(release: any): boolean {
@@ -39,6 +39,7 @@ export const patchCommand = new Command('patch')
   .option('--env <environment>', 'Target environment: live or test')
   .option('--project <path>', 'Project root (defaults to auto-detect)')
   .option('--release <labelOrId>', 'Baseline release label or id to patch (skips the interactive picker — required for headless/CI patching)')
+  .option('--flavor <name>', 'Flutter: product flavor the base release was built with (e.g. staging, production). Scopes which base release this patch targets, mirroring `sankofa release --flavor`. The KBC patch itself is flavor-independent.')
   .option('--engine-version <version>', 'Flutter: override the detected engine version (rare)')
   // Flutter Code patch options (iOS + Android — RN ignores these).
   .option('--label <label>', 'Flutter: standalone base-patch label override (used only when no baseline release exists)')
@@ -284,7 +285,7 @@ export async function flutterPatch(
   // `fetchAndApplyKbcPatch` on both platforms.
   // See sankofa-flutter-deploy/docs/codepush-beta3-architecture.md.
   const platform = await resolveFlutterPlatform(platformArg);
-  return flutterKbcPatch(project, platform, opts);
+  return runFlutterPatch(project, platform, opts);
 }
 
 // ── Flutter Code (β.3) — unified KBC patch pipeline (iOS + Android) ──────────
@@ -338,7 +339,7 @@ export async function flutterPatch(
  * server baseline (and an explicit --target-binary-version) it falls back to
  * publishing a standalone base release labelled `kbc-<platform>-<ts>`.
  */
-async function flutterKbcPatch(
+async function runFlutterPatch(
   project: ProjectInfo,
   platform: 'ios' | 'android',
   opts: any,
@@ -394,9 +395,24 @@ async function flutterKbcPatch(
         !isPatchRelease(r) &&
         (r.runtime === 'flutter-code' || r.runtime === 'flutter_code'),
       );
+      // Scope to the requested flavor. KBC patches are flavor-independent,
+      // so this only picks WHICH base release / targeting band the patch
+      // lands in — mirroring `sankofa release --flavor`. Graceful: if no
+      // base release records a flavor (older server that drops it), keep
+      // them all and surface the heads-up below rather than filtering to
+      // zero.
+      if (opts.flavor && baseReleases.some((r: any) => r.flavor)) {
+        baseReleases = baseReleases.filter((r: any) => r.flavor === opts.flavor);
+      }
     } catch (err: any) {
       spinner.fail(`Failed to fetch releases: ${err.message}`);
       process.exit(1);
+    }
+    if (opts.flavor && !releases.some((r: any) => r.flavor)) {
+      console.log(
+        `  · --flavor ${opts.flavor} noted; releases don't record a flavor server-side yet, ` +
+          `so all ${platform} base releases are eligible (KBC patches are flavor-independent).`,
+      );
     }
 
     if (baseReleases.length === 0 && !opts.targetBinaryVersion) {
@@ -479,7 +495,7 @@ async function flutterKbcPatch(
     label = `${baseLabel}-patch.${maxPatchNumber + 1}`;
   } else {
     const timestamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
-    label = opts.label || `kbc-${platform}-${timestamp}`;
+    label = opts.label || `patch-${platform}-${timestamp}`;
   }
 
   // ── 3. Resolve patch entry + optional dynamic interface ─────────────
@@ -498,6 +514,34 @@ async function flutterKbcPatch(
     process.exit(2);
   }
 
+  // Guard the common Shorebird reflex: passing the APP entry-point (e.g.
+  // `-t lib/main_prod.dart`) as the patch target. In Sankofa β.3 the patch
+  // is a SEPARATE file exposing @pragma('dyn-module:entry-point') — the app
+  // main is not one. Catch it here with a clear message instead of a
+  // downstream compile failure on a 10k-line app graph.
+  try {
+    const entrySrc = readFileSync(entryFile, 'utf8');
+    if (!entrySrc.includes('dyn-module:entry-point')) {
+      const looksLikeApp = /runApp\s*\(/.test(entrySrc) || /void\s+main\s*\(/.test(entrySrc);
+      console.error(chalk.red(`  ✖ ${entryFile} is not a Sankofa patch entry.`));
+      console.error(chalk.dim(
+        looksLikeApp
+          ? "     That looks like your app's entry-point. A Sankofa patch is a SEPARATE\n" +
+            "     file (default lib/sankofa_patch.dart) exposing:\n" +
+            "        @pragma('dyn-module:entry-point')\n" +
+            "        Object? main() => 'sankofa patch v1';\n" +
+            `     For a flavored app you don't pass -t — the flavor scopes the base\n` +
+            `     release, not the patch entry. Just run:\n` +
+            `        sankofa patch ${platform}${opts.flavor ? ` --flavor ${opts.flavor}` : ''}`
+          : "     The patch entry must expose exactly one\n" +
+            "        @pragma('dyn-module:entry-point') function."
+      ));
+      process.exit(2);
+    }
+  } catch {
+    /* unreadable file — let the compiler surface the real error */
+  }
+
   let dynamicInterface: string | undefined;
   const conventional = join(projectRoot, 'sankofa', 'dynamic_interface.yaml');
   if (opts.dynamicInterface) {
@@ -508,22 +552,22 @@ async function flutterKbcPatch(
   }
 
   const buildDir = resolve(projectRoot, '.sankofa/build');
-  const kbcPath = join(buildDir, 'patch.kbc');
-  const envelopePath = join(buildDir, 'patch.skdp');
+  const payloadPath = join(buildDir, 'patch.payload');
+  const patchPath = join(buildDir, 'patch.skdp');
   mkdirSync(buildDir, { recursive: true });
 
-  // ── 4. γ: compile Dart → KBC ────────────────────────────────────────
+  // ── 4. Compile the patch entry-point ────────────────────────────────
   console.log('');
-  const buildSpinner = ora(`Building KBC patch from ${entryFile}…`).start();
+  const buildSpinner = ora(`Building patch from ${entryFile}…`).start();
   let buildResult;
   try {
-    buildResult = buildKbcPatch({
+    buildResult = buildFlutterPatch({
       entryFile,
-      outputPath: kbcPath,
+      outputPath: payloadPath,
       validateYaml: dynamicInterface,
       // Resolve the dart-sdk from the PROJECT root (where sankofa.yaml lives).
-      // buildKbcPatch otherwise derives it from dirname(entryFile)=lib/, which
-      // misses sankofa.yaml → falls back to PATH flutter (absent on Windows).
+      // buildFlutterPatch otherwise derives it from dirname(entryFile)=lib/,
+      // which misses sankofa.yaml → falls back to PATH flutter (absent on Windows).
       flutterDartSdk: resolveFlutterDartSdk(projectRoot),
     });
     buildSpinner.succeed(`Patch compiled (${buildResult.sizeBytes} B).`);
@@ -532,9 +576,9 @@ async function flutterKbcPatch(
     process.exit(1);
   }
 
-  // ── 5. β.4: wrap (+ Ed25519 sign if a project key exists) ───────────
+  // ── 5. Package (+ sign if a project key exists) ─────────────────────
   const wrapSpinner = ora('Packaging patch…').start();
-  const meta: KbcEnvelopeMetadata = {
+  const meta: PatchMetadata = {
     label,
     description: opts.description || `Flutter ${platform} patch from ${entryFile}`,
     engineCommit: opts.engineCommit,
@@ -548,19 +592,19 @@ async function flutterKbcPatch(
   const signingKey = projectCfg?.projectId
     ? loadSigningKey(projectCfg.projectId)
     : null;
-  let envelopeBytes: Buffer;
+  let patchBytes: Buffer;
   try {
-    envelopeBytes = wrapKbc({
-      kbcPayload: readFileSync(kbcPath),
+    patchBytes = packPatch({
+      payload: readFileSync(payloadPath),
       metadata: meta,
       sigAlg: signingKey ? 1 : 0,
       signer: signingKey
         ? (bytes) => signEd25519(signingKey.privateKeyPem, bytes)
         : undefined,
     });
-    writeFileSync(envelopePath, envelopeBytes);
+    writeFileSync(patchPath, patchBytes);
     const signedNote = signingKey ? ' (signed)' : ' (unsigned)';
-    wrapSpinner.succeed(`Patch packaged${signedNote} (${envelopeBytes.length} B).`);
+    wrapSpinner.succeed(`Patch packaged${signedNote} (${patchBytes.length} B).`);
   } catch (err: any) {
     wrapSpinner.fail(`Packaging failed: ${err.message}`);
     process.exit(1);
@@ -569,12 +613,12 @@ async function flutterKbcPatch(
   console.log(chalk.dim(`  Label:          ${label}`));
   console.log(chalk.dim(`  Engine:         ${engineVersion}`));
   console.log(chalk.dim(`  Target binary:  ${targetBinaryVersion}`));
-  console.log(chalk.dim(`  Envelope:       ${envelopePath}`));
+  console.log(chalk.dim(`  Patch:          ${patchPath}`));
 
   if (opts.dryRun) {
     console.log('');
     console.log(chalk.green.bold('  ✓ Dry-run complete'));
-    console.log(chalk.dim(`     Patch file:   ${envelopePath}`));
+    console.log(chalk.dim(`     Patch file:   ${patchPath}`));
     console.log(chalk.dim('     Re-run without --dry-run when the server is reachable.'));
     return;
   }
@@ -626,7 +670,7 @@ async function flutterKbcPatch(
   // ── 7. δ: upload ────────────────────────────────────────────────────
   const uploadSpinner = ora('Uploading patch to Sankofa…').start();
   try {
-    const release = await uploadRelease(envelopePath, {
+    const release = await uploadRelease(patchPath, {
       label,
       target_binary_version: targetBinaryVersion,
       platform,
@@ -650,8 +694,8 @@ async function flutterKbcPatch(
     console.log('');
     console.log(
       chalk.dim(
-        'Devices in this rollout fetch the patch on next launch via\n' +
-        '`fetchAndApplyKbcPatch()` / `tryApplyStagedKbcPatch()` and apply it in the interpreter.',
+        'Devices in this rollout fetch + apply the patch on next launch\n' +
+        'via the Sankofa updater (SankofaUpdater.preFlight() at startup).',
       ),
     );
   } catch (err: any) {

@@ -3,6 +3,37 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.11 — clean, customer-facing output (no implementation jargon)
+
+### Changed
+- **Plain-English everywhere the CLI talks to you.** The platform picker, build
+  spinners, publish summaries, help text, and error messages no longer expose
+  build-internal jargon. The `release`/`patch`/`preview` flows now read as a
+  product ("Building patch…", "Android", "iOS", "Registering iOS baseline…")
+  instead of leaking how the pipeline is implemented under the hood. No
+  behaviour change — same commands, same flags, same output structure.
+
+- **Advanced command renamed** `sankofa kbc …` → `sankofa patch-tools …` (still
+  hidden; same `build` / `wrap` / `inspect` subcommands and flags). Update any
+  CI script that called the old name. Most users use `sankofa patch` and are
+  unaffected.
+
+### Fixed
+- **Honest message for `preview --from-server` on iOS.** It previously failed
+  with "no installable preview artifact" and told you to re-publish with
+  `release ios --preview-artifact` — a flag that's intentionally a no-op on iOS,
+  so following it did nothing. iOS now explains the real situation (a physical
+  iPhone can't install a downloaded build, so there's no server-side iOS preview
+  artifact) and points to `sankofa preview ios` for local QA and TestFlight for
+  on-device testing. Android is unchanged.
+
+### Packaging
+- **Published package is now source-clean.** The build strips comments and no
+  longer ships `.d.ts` type declarations or `.js.map` source maps (neither is
+  used by a CLI binary). The shipped JavaScript carries no internal
+  implementation identifiers or filenames. The npm tarball is smaller and
+  contains only the executable JavaScript.
+
 ## 0.1.10 — `release ios`: single build, fail-fast auth, no presign trap
 
 ### Fixed

@@ -135,11 +135,11 @@ async function resolveProjectId(opts: any): Promise<string> {
 }
 
 export const keysCommand = new Command('keys')
-  .description('Manage Sankofa Deploy signing keys (Ed25519)');
+  .description('Manage Sankofa Deploy signing keys');
 
 keysCommand
   .command('generate')
-  .description('Generate an Ed25519 keypair for signing patches in this project')
+  .description('Generate a signing keypair for patches in this project')
   .option('--project <projectId>', 'Project ID (defaults to .sankofa.json)')
   .option('--force', 'Overwrite an existing key (DANGER: invalidates already-shipped patches)')
   .action(async (opts: any) => {
@@ -173,7 +173,7 @@ keysCommand
     writeFileSync(publicPath, rawPubB64 + '\n', { mode: 0o644 });
 
     console.log('');
-    console.log(chalk.green('  ✔ Ed25519 keypair generated'));
+    console.log(chalk.green('  ✔ Signing keypair generated'));
     console.log(`     Private:    ${chalk.dim(privatePath)}`);
     console.log(`     Public:     ${chalk.dim(publicPath)}`);
     console.log(`     Algorithm:  ed25519`);

@@ -179,8 +179,8 @@ export async function resolveFlutterPlatform(
         name: 'picked',
         message: 'Target platform:',
         choices: [
-          { name: 'Android (β.3 — KBC interpreter)', value: 'android' },
-          { name: 'iOS (β.3 — KBC interpreter)', value: 'ios' },
+          { name: 'Android', value: 'android' },
+          { name: 'iOS', value: 'ios' },
         ],
       },
     ]);
@@ -309,7 +309,7 @@ export function buildFlutterAOT(
     execSync(extractCmd, { stdio: opts.verbose ? 'inherit' : 'pipe' });
   } catch (err: any) {
     throw new Error(
-      `Failed to extract libapp.so / libflutter.so from ${apk}: ${err.message}\n` +
+      `Failed to extract the native libraries from ${apk}: ${err.message}\n` +
         `(Check that the APK was built --release and includes the AOT libs for arm64-v8a.)`,
     );
   }
@@ -467,7 +467,7 @@ export function buildFlutterIOSSimulatorApp(
   if (!existsSync(appPath)) {
     throw new Error(
       `Simulator app not found at ${appPath} after \`flutter build ios --simulator\`.\n` +
-        `(Your Sankofa engine fork may not include an iOS simulator slice.)`,
+        `(Your Sankofa engine build may not include an iOS simulator slice.)`,
     );
   }
   const appId = readBundleIdFromApp(appPath);

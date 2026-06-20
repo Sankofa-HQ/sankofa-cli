@@ -417,7 +417,7 @@ async function flutterPreview(project: ProjectInfo, platformArg: string | undefi
     .join(' ')}`;
 
   console.log('');
-  console.log(chalk.bold('  Sankofa preview — flutter run (Sankofa engine fork)'));
+  console.log(chalk.bold('  Sankofa preview — flutter run'));
   console.log(chalk.dim(`  ${'─'.repeat(52)}`));
   console.log(`  Mode:    ${chalk.bold(mode)}`);
   if (opts.flavor) console.log(`  Flavor:  ${chalk.bold(opts.flavor)}`);
@@ -486,7 +486,11 @@ async function flutterPreviewFromServer(
   }
   if (releases.length === 0) {
     console.log(chalk.yellow(`No active ${environment} ${platform} releases${opts.label ? ` matching "${opts.label}"` : ''}.`));
-    console.log(chalk.dim(`  Publish one with ${chalk.cyan(`sankofa release ${platform} --preview-artifact`)} first.`));
+    if (platform === 'ios') {
+      console.log(chalk.dim(`  iOS can't run a downloaded build from the server — for QA run ${chalk.cyan('sankofa preview ios')} locally, or ship to TestFlight for on-device.`));
+    } else {
+      console.log(chalk.dim(`  Publish one with ${chalk.cyan(`sankofa release ${platform} --preview-artifact`)} first.`));
+    }
     process.exit(1);
   }
 
@@ -538,8 +542,16 @@ async function flutterPreviewFromServer(
   const nativeUrl = detail.native_download_url || detail.release?.native_download_url;
   const artifactKind = detail.native_artifact_kind || detail.release?.native_artifact_kind || '';
   if (!nativeUrl) {
-    console.log(chalk.red(`  ✖ Release ${selectedRelease.label} has no installable preview artifact.`));
-    console.log(chalk.dim(`     Re-publish it with ${chalk.cyan(`sankofa release ${platform} --preview-artifact`)} so the server stores one.`));
+    if (platform === 'ios') {
+      console.log(chalk.red(`  ✖ iOS releases can't be previewed from the server.`));
+      console.log(chalk.dim(`     A physical iPhone can't install a downloaded build (Apple code-signing),`));
+      console.log(chalk.dim(`     so Sankofa doesn't store an installable iOS preview artifact.`));
+      console.log(chalk.dim(`     • Local QA:   ${chalk.cyan('sankofa preview ios')}`));
+      console.log(chalk.dim(`     • On-device:  ship this build to TestFlight`));
+    } else {
+      console.log(chalk.red(`  ✖ Release ${selectedRelease.label} has no installable preview artifact.`));
+      console.log(chalk.dim(`     Re-publish it with ${chalk.cyan(`sankofa release ${platform} --preview-artifact`)} so the server stores one.`));
+    }
     process.exit(1);
   }
   const expectedKind = platform === 'ios' ? 'ios-simulator-app-zip' : 'android-apk';
@@ -596,7 +608,7 @@ async function flutterPreviewFromServer(
       device: opts.device,
       streamLogs: opts.logs !== false,
     });
-    console.log(chalk.green(`\n  Launched ${selectedRelease.label} from the server. It will pull any KBC patches on the normal update check.\n`));
+    console.log(chalk.green(`\n  Launched ${selectedRelease.label} from the server. It will pull any pending updates on the normal update check.\n`));
   } catch (err: any) {
     console.error(chalk.red(`\n  Preview install failed: ${err.message}`));
     if (platform === 'ios') {

@@ -37,8 +37,8 @@ import { resolveProjectRoot, type ProjectInfo } from '../utils/stack.js';
 import { parseRollout } from '../utils/validation.js';
 import { buildFlutterAOT, buildFlutterIPA, detectFlutterAppVersion, detectFlutterEngineInfo, resolveFlutterPlatform, type BuildIpaResult } from '../utils/flutterBundler.js';
 import { captureFlutterBaseline, type BaselineManifest } from '../utils/baseline.js';
-import { buildKbcPatch, resolveFlutterDartSdk } from '../utils/flutterKbcBundler.js';
-import { wrapKbc, type KbcEnvelopeMetadata } from '../utils/flutterKbcEnvelope.js';
+import { buildFlutterPatch, resolveFlutterDartSdk } from '../utils/flutterPatchCompiler.js';
+import { packPatch, type PatchMetadata } from '../utils/flutterPatchPackage.js';
 import { loadSigningKey, signEd25519 } from './keys.js';
 
 export const releaseCommand = new Command('release')
@@ -75,7 +75,7 @@ export const releaseCommand = new Command('release')
   .option('--preview-artifact', 'Flutter: also build + upload an installable preview artifact (Android APK / iOS simulator .app) so `sankofa preview --label <v>` can run this release from the server')
   .option(
     '--dart-define <KEY=VALUE>',
-    'Flutter: extra dart-define baked into the build (repeatable). Use SANKOFA_SKIP_ENGINE_CHECK=1 if your Sankofa engine fork is unstamped (Platform.version lacks +sankofa-N).',
+    'Flutter: extra dart-define baked into the build (repeatable). Use SANKOFA_SKIP_ENGINE_CHECK=1 to bypass the bundled-engine compatibility check.',
     (val: string, acc: string[]) => { acc.push(val); return acc; },
     [] as string[],
   )
@@ -577,7 +577,7 @@ export async function flutterRelease(
       target: opts.target,
     });
     buildSpinner.succeed(
-      `Built ${format.toUpperCase()}${format === 'aab' ? ' + APK' : ''} + extracted libapp.so (${formatBytes(statSync(built.libappPath).size)})`,
+      `Built ${format.toUpperCase()}${format === 'aab' ? ' + APK' : ''} (baseline ${formatBytes(statSync(built.libappPath).size)})`,
     );
   } catch (err: any) {
     buildSpinner.fail(`Flutter build failed: ${err.message}`);
@@ -624,10 +624,10 @@ export async function flutterRelease(
           `Bundled Flutter engine is a vanilla baseline (${known.flutter_version}) — patches won't load on devices running it.`,
         );
         console.log(chalk.yellow(
-          `     ⚠ This engine is a vanilla Flutter baseline (no \`+sankofa-N\` modifications).`,
+          `     ⚠ This is a vanilla Flutter engine, not the Sankofa build.`,
         ));
         console.log(chalk.yellow(
-          `       Devices running it cannot load OTA patches; only modified engines support libapp.so swap.`,
+          `       Devices running it cannot load OTA patches; only the Sankofa engine build can apply them.`,
         ));
         console.log(chalk.dim(`       Continuing — but the release will be tagged as \`${known.sankofa_engine_version}\` and devices that install it won't accept patches.`));
       } else {
@@ -943,18 +943,18 @@ async function flutterReleaseIOS(
       `@pragma('dyn-module:entry-point')\n` +
       `Object? main() => 'sankofa-baseline-${appVersion}';\n`,
   );
-  const kbcPath = join(buildDir, 'baseline.kbc');
-  const envelopePath = join(buildDir, 'baseline.skdp');
+  const payloadPath = join(buildDir, 'baseline.payload');
+  const patchPath = join(buildDir, 'baseline.skdp');
 
-  const pkgSpinner = ora('Registering iOS baseline (KBC envelope)…').start();
-  let envelopeBytes: Buffer;
+  const pkgSpinner = ora('Registering iOS baseline…').start();
+  let patchBytes: Buffer;
   try {
-    buildKbcPatch({
+    buildFlutterPatch({
       entryFile: baselineEntry,
-      outputPath: kbcPath,
+      outputPath: payloadPath,
       flutterDartSdk: resolveFlutterDartSdk(project.root),
     });
-    const meta: KbcEnvelopeMetadata = {
+    const meta: PatchMetadata = {
       label,
       description: opts.description || `Flutter iOS baseline ${label}`,
       engineCommit: opts.engineCommit,
@@ -966,17 +966,17 @@ async function flutterReleaseIOS(
     };
     const projectCfg = findProjectConfig();
     const signingKey = projectCfg?.projectId ? loadSigningKey(projectCfg.projectId) : null;
-    envelopeBytes = wrapKbc({
-      kbcPayload: fs.readFileSync(kbcPath),
+    patchBytes = packPatch({
+      payload: fs.readFileSync(payloadPath),
       metadata: meta,
       sigAlg: signingKey ? 1 : 0,
       signer: signingKey
         ? (bytes) => signEd25519(signingKey.privateKeyPem, bytes)
         : undefined,
     });
-    fs.writeFileSync(envelopePath, envelopeBytes);
+    fs.writeFileSync(patchPath, patchBytes);
     pkgSpinner.succeed(
-      `Baseline envelope packaged${signingKey ? ' (signed)' : ' (unsigned)'} (${envelopeBytes.length} B).`,
+      `Baseline packaged${signingKey ? ' (signed)' : ' (unsigned)'} (${patchBytes.length} B).`,
     );
   } catch (err: any) {
     pkgSpinner.fail(`Baseline packaging failed: ${err.message}`);
@@ -1034,7 +1034,7 @@ async function flutterReleaseIOS(
   // 6. Upload the baseline envelope.
   const uploadSpinner = ora('Uploading baseline to Sankofa…').start();
   try {
-    const release = await uploadRelease(envelopePath, {
+    const release = await uploadRelease(patchPath, {
       label,
       target_binary_version: appVersion,
       platform: 'ios',

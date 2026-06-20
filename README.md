@@ -464,7 +464,7 @@ sankofa release android --preview-artifact
 - `--flavor <name>` — gradle product flavor to build (e.g. `staging`, `production`). Required for apps that declare product flavors.
 - `-t, --target <file>` — app entry-point (e.g. `lib/main_staging.dart`). Required for flavored apps that don't have a `lib/main.dart`. Pair it with the matching `--flavor`.
 - `--no-codesign` — **iOS only**: build the `.xcarchive` without signing (sign + export later in Xcode). Without it, `release ios` produces a signed `.ipa`.
-- `--preview-artifact` — also build + upload an installable preview build (Android APK / iOS **simulator** app) so teammates can run this exact release with `sankofa preview --from-server` — no source needed.
+- `--preview-artifact` — **Android only**: also build + upload an installable APK so teammates can run this exact release with `sankofa preview --from-server` — no source needed. iOS isn't supported (a physical iPhone can't install a downloaded build); use `sankofa preview ios` for local QA or ship to TestFlight.
 
 **Flutter release behavior**
 
@@ -509,7 +509,7 @@ Run your app for QA. Behavior depends on the stack (auto-detected):
 - **React Native** — downloads + installs + launches a published release or patch on your local simulator/emulator.
 - **Flutter** — two modes:
   - **Local run** (default) — runs your current source on a device via the Sankofa Flutter runtime (a thin wrapper over `flutter run`), so what you preview matches what ships.
-  - **From server** (`--from-server`, or implied when you pass `--label`/`--version`) — downloads a *published* release and installs it on an **Android device/emulator** or an **iOS simulator**, so a tester can run a specific build without your source. Requires that release to have been published with `--preview-artifact`.
+  - **From server** (`--from-server`, or implied when you pass `--label`/`--version`) — **Android only**: downloads a *published* release and installs it on an **Android device/emulator**, so a tester can run a specific build without your source. Requires that release to have been published with `--preview-artifact`. iOS can't install a downloaded build on a device — use **Local run** for QA or TestFlight for on-device testing.
 
 ```bash
 # React Native
@@ -523,9 +523,9 @@ sankofa preview ios --no-logs        # do not stream runtime logs
 sankofa preview -d <device-id> --flavor staging -t lib/main_staging.dart
 sankofa preview --profile            # profile mode instead of release
 
-# Flutter — run a published release from the server (no source needed)
+# Flutter — run a published Android release from the server (no source needed)
 sankofa preview android --from-server --label v1.2.0 -d <adb-serial>
-sankofa preview ios --from-server --label v1.2.0     # installs on a booted simulator
+# (iOS: no server preview — use `sankofa preview ios` locally, or TestFlight)
 ```
 
 **Options (React Native)**
@@ -552,11 +552,11 @@ sankofa preview ios --from-server --label v1.2.0     # installs on a booted simu
 
 - `--from-server` — install a published release instead of running local source. Implied by `--label`/`--version`.
 - `--label <label>` / `--version <version>` — pick the release (otherwise you're prompted).
-- `-d, --device <device>` — Android device/emulator serial. (iOS installs on a booted simulator.)
+- `-d, --device <device>` — Android device/emulator serial.
 - `--app-id <id>` — override the auto-detected bundle id / package name.
 - `--env <live|test>`, `--output-dir <dir>`, `--no-logs` — as above.
 
-> Real-device iOS from-server isn't supported yet (the stored iOS preview build is simulator-only). For iOS local QA use the local-run mode above; for distributing a device build to testers, use TestFlight.
+> `--from-server` is **Android only**. A physical iPhone can't install a downloaded build, so there's no server-side iOS preview. For iOS QA use the **local-run** mode above; to put a device build in testers' hands, use TestFlight.
 
 ### `dist`
 

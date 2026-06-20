@@ -1,36 +1,17 @@
 /**
- * Sankofa Deploy: Flutter Code — KBC patch producer (sub-phase γ).
+ * Sankofa Deploy — Flutter patch compiler.
  *
- * Wraps the upstream `dart2bytecode.dart.snapshot` that ships with the
- * Flutter SDK to compile a single Dart source file into a `.kbc`
- * bytecode file consumable by `dynamic_modules.loadModuleFromBytes`
- * inside the Sankofa β.1 Flutter engine.
+ * Drives the Flutter SDK's bundled compiler to turn a single Dart
+ * source file into a compiled patch payload that the on-device SDK can
+ * apply. The companion runtime side lives in the Sankofa Flutter SDK.
  *
- * Producer-side proof for β.3 (Path C, the KBC interpreter program).
- * The companion runtime side is in
- * `sdks/sankofa_sdk_flutter/lib/src/deploy/` (η work, not yet wired).
- *
- * v0 scope:
+ * Scope:
  *   - Compile ONE designated patch entry file (default
- *     `lib/sankofa_patch.dart`) into a single `patch.kbc`.
+ *     `lib/sankofa_patch.dart`) into a single payload.
  *   - Optional `--validate <yaml>` enforces the host's dynamic
- *     interface, mirroring `--dynamic-interface` passed to the host's
- *     kernel compile.
- *   - Verify `DBC3` magic (little-endian 33 43 42 44) in the output.
- *   - Report producer metadata (size, instruction count, magic).
- *
- * v1 will add:
- *   - Multi-file patch bundles (the patch may import patch-local
- *     helpers from multiple .dart files; dart2bytecode handles this
- *     natively).
- *   - Old-vs-new source-diff so callers don't manually maintain
- *     `sankofa_patch.dart` — the CLI infers the changed surface from
- *     the project's git baseline.
- *   - β.4 envelope: signed + versioned wrapper so the server side
- *     can verify provenance before applying.
- *
- * See sankofa-flutter-deploy/docs/build-log-interpreter-program.md for
- * the architecture rationale (β.3 + ε spike entries).
+ *     interface.
+ *   - Verify the output container magic.
+ *   - Report producer metadata (size, magic).
  */
 
 import { execFileSync } from 'child_process';
@@ -38,33 +19,33 @@ import { existsSync, statSync, readFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { resolveBundledFlutter } from './flutterBundleCache.js';
 
-export type KbcBuildResult = {
-  /** Absolute path to the produced .kbc file. */
+export type PatchBuildResult = {
+  /** Absolute path to the produced payload file. */
   outputPath: string;
-  /** Size of the .kbc file in bytes. */
+  /** Size of the payload file in bytes. */
   sizeBytes: number;
-  /** Magic bytes at offset 0, hex (expected "33434244" = DBC3 little-endian). */
+  /** Magic bytes at offset 0, hex. */
   magic: string;
   /** True if magic matched. */
   magicOk: boolean;
-  /** Dart SDK root the snapshot was loaded from. */
+  /** Dart SDK root the compiler was loaded from. */
   flutterDartSdk: string;
   /** Whether --validate was passed (and against what file). */
   validatedAgainst: string | null;
-  /** Free-form stdout from dart2bytecode (useful for size breakdown). */
+  /** Free-form stdout from the compiler (useful for size breakdown). */
   toolStdout: string;
 };
 
-export type KbcBuildOptions = {
+export type PatchBuildOptions = {
   /** Patch entry-point Dart file (single file). */
   entryFile: string;
-  /** Output .kbc path. */
+  /** Output payload path. */
   outputPath: string;
   /** Optional dynamic_interface.yaml to validate the patch against. */
   validateYaml?: string;
   /** Override the Flutter dart-sdk path. Defaults to `flutter` on PATH. */
   flutterDartSdk?: string;
-  /** Additional --bytecode-options entries (CSV). Default includes source-positions. */
+  /** Additional compiler options (CSV). Default includes source-positions. */
   bytecodeOptions?: string;
 };
 
@@ -77,7 +58,7 @@ export type KbcBuildOptions = {
  * Throws if neither layout yields a valid dart-sdk path.
  */
 export function resolveFlutterDartSdk(projectRoot?: string): string {
-  // 1) Bundled flutter (Shorebird-style isolation).
+  // 1) Bundled flutter (isolated per-project toolchain).
   if (projectRoot) {
     const bundled = resolveBundledFlutter(projectRoot);
     if (bundled?.exists) {
@@ -109,14 +90,14 @@ export function resolveFlutterDartSdk(projectRoot?: string): string {
 }
 
 /**
- * Compile a single Dart source file into a Sankofa KBC patch.
- * Returns metadata about the produced .kbc.
+ * Compile a single Dart source file into a Sankofa patch payload.
+ * Returns metadata about the produced file.
  *
- * Throws if dart2bytecode fails (invalid Dart, duplicate dyn-module
- * entry-points, --validate mismatch, etc.) — the error message is the
- * combined stderr/stdout so the caller can surface it.
+ * Throws if compilation fails (invalid Dart, duplicate entry-points,
+ * --validate mismatch, etc.) — the error message is the combined
+ * stderr/stdout so the caller can surface it.
  */
-export function buildKbcPatch(opts: KbcBuildOptions): KbcBuildResult {
+export function buildFlutterPatch(opts: PatchBuildOptions): PatchBuildResult {
   const entryFile = resolve(opts.entryFile);
   if (!existsSync(entryFile)) {
     throw new Error(`Patch entry file not found: ${entryFile}`);
@@ -148,7 +129,7 @@ export function buildKbcPatch(opts: KbcBuildOptions): KbcBuildResult {
       throw new Error(
         `Required Flutter SDK file missing: ${f}\n` +
           '   Your Flutter SDK is older than 3.11 or the layout has shifted.\n' +
-          '   Sankofa requires Flutter 3.11+ for KBC patch production.',
+          '   Sankofa requires Flutter 3.11+ to build patches.',
       );
     }
   }
@@ -184,18 +165,18 @@ export function buildKbcPatch(opts: KbcBuildOptions): KbcBuildResult {
     const stderr = err.stderr?.toString() ?? '';
     const stdout = err.stdout?.toString() ?? '';
     throw new Error(
-      `dart2bytecode failed (exit ${err.status ?? '?'}):\n${stdout}${stderr}`,
+      `Patch compilation failed (exit ${err.status ?? '?'}):\n${stdout}${stderr}`,
     );
   }
 
   if (!existsSync(outputPath)) {
     throw new Error(
-      `dart2bytecode reported success but no output at ${outputPath}.`,
+      `Patch compilation reported success but produced no output at ${outputPath}.`,
     );
   }
   const sizeBytes = statSync(outputPath).size;
 
-  // Verify DBC3 magic (little-endian: 33 43 42 44).
+  // Verify the container magic (little-endian: 33 43 42 44).
   const head = readFileSync(outputPath).subarray(0, 4);
   const magic = Array.from(head)
     .map((b) => b.toString(16).padStart(2, '0'))

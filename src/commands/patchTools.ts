@@ -1,47 +1,32 @@
 /**
- * `sankofa kbc build` — Sankofa Deploy: Flutter Code KBC patch producer.
+ * `sankofa patch-tools` — advanced, low-level Flutter patch tooling.
  *
- * Compiles a single Dart entry-point file into a `.kbc` bytecode patch
- * runnable by the Sankofa β.1 Flutter engine on iOS. The output is a
- * raw KBC file (β.4 envelope wrapping is separate) ready to drop into
- * `<App Documents>/sankofa-deploy/patches/active/patch.kbc` for manual
- * device testing, or to be uploaded via `sankofa patch ios` once that
- * pipeline lands.
+ * Compiles a single Dart entry-point file into a patch payload, packages
+ * it into an upload artifact, and inspects packaged patches. Hidden from
+ * `sankofa --help` because 99% of customers should use `sankofa patch`
+ * instead — these are the low-level build/pack/inspect steps `patch`
+ * orchestrates internally. Still callable for power users and CI scripts
+ * that need fine-grained control.
  *
  * Defaults follow project convention:
  *   - Entry file: lib/sankofa_patch.dart (single file; multi-file
- *     bundles via imports are supported via dart2bytecode natively)
- *   - Dynamic interface: sankofa/dynamic_interface.yaml (if present;
- *     skipped otherwise)
+ *     bundles via imports are supported natively)
+ *   - Dynamic interface: sankofa/dynamic_interface.yaml (if present)
  *   - Output: build/sankofa-deploy/patch.kbc
- *
- * Why a standalone command before integrating into `sankofa patch ios`:
- * γ v0 is a producer-only spike. Server upload + diff-guard come later
- * once we've stabilized the envelope format (β.4) and the host-side
- * apply API (η). Until then, founders run this manually + drop the
- * .kbc on-device to exercise the interpreter pipeline.
- *
- * See sankofa-flutter-deploy/docs/build-log-interpreter-program.md
- * (β.3 + ε spike entries) for the architectural rationale.
  */
 
 import { Command } from 'commander';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
-import { buildKbcPatch } from '../utils/flutterKbcBundler.js';
+import { buildFlutterPatch } from '../utils/flutterPatchCompiler.js';
 import {
-  ENVELOPE_VERSION,
-  parseKbcEnvelope,
-  wrapKbc,
-  type KbcEnvelopeMetadata,
-} from '../utils/flutterKbcEnvelope.js';
+  PACKAGE_VERSION,
+  parsePatchPackage,
+  packPatch,
+  type PatchMetadata,
+} from '../utils/flutterPatchPackage.js';
 
-// Advanced patch tooling. Hidden from `sankofa --help` because 99%
-// of customers should use `sankofa patch` instead — these are the
-// low-level build/wrap/inspect steps `patch` orchestrates internally.
-// Still callable as `sankofa kbc <subcommand>` for power users and
-// CI scripts that need fine-grained control.
-export const kbcCommand = new Command('kbc')
+export const patchToolsCommand = new Command('patch-tools')
   .description('Advanced: low-level Flutter patch tooling (compile, package, inspect)')
   .addCommand(
     new Command('build')
@@ -53,8 +38,8 @@ export const kbcCommand = new Command('kbc')
       )
       .option(
         '-o, --output <file>',
-        'Output .kbc path',
-        'build/sankofa-deploy/patch.kbc',
+        'Output payload path',
+        'build/sankofa-deploy/patch.payload',
       )
       .option(
         '-i, --dynamic-interface <yaml>',
@@ -66,7 +51,7 @@ export const kbcCommand = new Command('kbc')
       )
       .option(
         '--bytecode-options <csv>',
-        'CSV of options passed through to dart2bytecode --bytecode-options',
+        'CSV of advanced compiler options (passed through)',
       )
       .action(async (opts: any) => {
         const chalk = (await import('chalk')).default;
@@ -111,7 +96,7 @@ export const kbcCommand = new Command('kbc')
         const startedAt = Date.now();
         let result;
         try {
-          result = buildKbcPatch({
+          result = buildFlutterPatch({
             entryFile,
             outputPath,
             validateYaml: dynamicInterface,
@@ -157,7 +142,7 @@ export const kbcCommand = new Command('kbc')
             `  • Package + ship in one command:\n` +
               `      sankofa patch ios\n` +
               `  • Or, to package manually for later upload:\n` +
-              `      sankofa kbc wrap -i ${result.outputPath} -o patch.skdp \\\n` +
+              `      sankofa patch-tools wrap -i ${result.outputPath} -o patch.skdp \\\n` +
               `        --label 'my-patch-v1' --rollout 100`,
           ),
         );
@@ -166,10 +151,10 @@ export const kbcCommand = new Command('kbc')
   .addCommand(
     new Command('wrap')
       .description('Package a compiled patch into a signed-capable upload artifact')
-      .requiredOption('-i, --input <file>', 'Path to raw .kbc input')
+      .requiredOption('-i, --input <file>', 'Path to raw compiled payload')
       .requiredOption(
         '-o, --output <file>',
-        'Path to write envelope (.skdp by convention)',
+        'Path to write packaged patch (.skdp by convention)',
       )
       .option('--label <label>', 'Free-form patch label')
       .option('--description <desc>', 'Free-form patch description')
@@ -177,7 +162,7 @@ export const kbcCommand = new Command('kbc')
       .option('--project-id <id>', 'Sankofa project id')
       .option(
         '--engine-commit <sha>',
-        'Sankofa engine fork commit this patch targets',
+        'Engine build commit this patch targets',
       )
       .option(
         '--dart-version <semver>',
@@ -203,27 +188,27 @@ export const kbcCommand = new Command('kbc')
           process.exit(2);
         }
 
-        const kbcBytes = readFileSync(inputPath);
-        // Quick sanity: magic check (don't accept an envelope-of-envelope).
+        const payloadBytes = readFileSync(inputPath);
+        // Quick sanity: magic check (don't accept a package-of-package).
         if (
-          kbcBytes.length < 4 ||
-          kbcBytes[0] !== 0x33 ||
-          kbcBytes[1] !== 0x43 ||
-          kbcBytes[2] !== 0x42 ||
-          kbcBytes[3] !== 0x44
+          payloadBytes.length < 4 ||
+          payloadBytes[0] !== 0x33 ||
+          payloadBytes[1] !== 0x43 ||
+          payloadBytes[2] !== 0x42 ||
+          payloadBytes[3] !== 0x44
         ) {
           console.error(
             chalk.red(`  ✖ Input is not a Sankofa-compiled patch.`),
           );
           console.error(
             chalk.dim(
-              `     If it's already a packaged patch, use \`sankofa kbc inspect\` instead.`,
+              `     If it's already a packaged patch, use \`sankofa patch-tools inspect\` instead.`,
             ),
           );
           process.exit(1);
         }
 
-        const meta: KbcEnvelopeMetadata = {
+        const meta: PatchMetadata = {
           createdAt: new Date().toISOString(),
         };
         if (opts.label) meta.label = String(opts.label);
@@ -259,22 +244,22 @@ export const kbcCommand = new Command('kbc')
           }
         }
 
-        const envelope = wrapKbc({ kbcPayload: kbcBytes, metadata: meta });
+        const packaged = packPatch({ payload: payloadBytes, metadata: meta });
         mkdirSync(dirname(outputPath), { recursive: true });
-        writeFileSync(outputPath, envelope);
+        writeFileSync(outputPath, packaged);
 
         console.log('');
         console.log(chalk.bold('─── Patch packaged ───'));
-        console.log(`  Source patch     ${inputPath} (${kbcBytes.length} B)`);
+        console.log(`  Source patch     ${inputPath} (${payloadBytes.length} B)`);
         console.log(`  Output           ${outputPath}`);
-        console.log(`  Output size      ${envelope.length} B`);
-        console.log(`  Format version   v${ENVELOPE_VERSION} (unsigned)`);
+        console.log(`  Output size      ${packaged.length} B`);
+        console.log(`  Format version   v${PACKAGE_VERSION} (unsigned)`);
         console.log(`  Metadata         ${JSON.stringify(meta)}`);
         console.log('');
         console.log(
           chalk.green('  ✅ Packaged patch ready. ') +
             chalk.dim(
-              `Inspect any time: ${chalk.cyan(`sankofa kbc inspect ${outputPath}`)}`,
+              `Inspect any time: ${chalk.cyan(`sankofa patch-tools inspect ${outputPath}`)}`,
             ),
         );
       }),
@@ -295,7 +280,7 @@ export const kbcCommand = new Command('kbc')
         const bytes = readFileSync(inputPath);
         let parsed;
         try {
-          parsed = parseKbcEnvelope(bytes);
+          parsed = parsePatchPackage(bytes);
         } catch (err: any) {
           console.error(chalk.red(`  ✖ ${err.message}`));
           process.exit(1);
@@ -308,14 +293,14 @@ export const kbcCommand = new Command('kbc')
           parsed.sigAlg === 0
             ? 'unsigned'
             : parsed.sigAlg === 1
-              ? 'Ed25519'
+              ? 'signed'
               : `unknown (${parsed.sigAlg})`;
 
         console.log(chalk.bold(`─── ${inputPath} ───`));
         console.log(`  File size          ${fileSize} B`);
-        console.log(`  Format version     v${parsed.envelopeVersion}`);
+        console.log(`  Format version     v${parsed.packageVersion}`);
         console.log(`  Flags              0x${parsed.flags.toString(16).padStart(4, '0')}`);
-        console.log(`  Patch payload      ${parsed.kbcLength} B`);
+        console.log(`  Patch payload      ${parsed.payloadLength} B`);
         console.log(
           `  Payload sha-256    ${shaShown} ${
             parsed.payloadShaValid
@@ -339,19 +324,19 @@ export const kbcCommand = new Command('kbc')
           );
           process.exit(1);
         }
-        // Sanity-check the KBC payload's magic too — catches the case
-        // where someone wrapped the wrong file.
-        const kp = parsed.kbcPayload;
-        const kbcMagicOk =
+        // Sanity-check the payload's own magic too — catches the case
+        // where someone packaged the wrong file.
+        const kp = parsed.payload;
+        const payloadMagicOk =
           kp.length >= 4 &&
           kp[0] === 0x33 &&
           kp[1] === 0x43 &&
           kp[2] === 0x42 &&
           kp[3] === 0x44;
-        if (!kbcMagicOk) {
+        if (!payloadMagicOk) {
           console.log(
             chalk.red(
-              '  ⚠ KBC payload magic mismatch — envelope wraps non-KBC data.',
+              '  ⚠ Payload magic mismatch — package wraps unexpected data.',
             ),
           );
           process.exit(1);

@@ -178,7 +178,7 @@ function compareFlutterAssets(
   findings.push({
     label: 'flutter_assets/ tree',
     detail:
-      'flutter_assets/ has changed since the baseline. The OTA patch only ships libapp.so — ' +
+      'flutter_assets/ has changed since the baseline. The OTA patch only ships code changes — ' +
       'new or changed assets will NOT reach users.\n' + lines.join('\n'),
     remedy: 'Either revert the asset change, or run `sankofa release` to ship a new store binary that bundles it.',
   });
