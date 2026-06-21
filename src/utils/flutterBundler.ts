@@ -256,9 +256,14 @@ export function buildFlutterAOT(
   const engine = detectFlutterEngineInfo(cwd);
 
   // Optional --dart-define passthrough (e.g. SANKOFA_SKIP_ENGINE_CHECK=1).
-  const defineFlags = (opts.dartDefines ?? [])
-    .map((d) => ` --dart-define=${d}`)
-    .join('');
+  // Auto-inject SANKOFA_FLAVOR on flavored builds so the SDK reports the
+  // flavor at runtime and Deploy scopes OTA per flavor — the caller's
+  // existing --flavor drives it, no extra flag or app-code change needed.
+  const allDefines = [...(opts.dartDefines ?? [])];
+  if (opts.flavor && !allDefines.some((d) => d.startsWith('SANKOFA_FLAVOR='))) {
+    allDefines.push(`SANKOFA_FLAVOR=${opts.flavor}`);
+  }
+  const defineFlags = allDefines.map((d) => ` --dart-define=${d}`).join('');
 
   // Flavor + entry-point passthrough. Flavor names are alphanumeric
   // gradle identifiers (no quoting); the target is a path (quote for
@@ -415,7 +420,13 @@ export function buildFlutterIPA(
   if (opts.codesign === false) flags.push('--no-codesign');
   if (opts.flavor) flags.push(`--flavor ${opts.flavor}`);
   if (opts.target) flags.push(`--target "${opts.target}"`);
-  for (const d of opts.dartDefines ?? []) flags.push(`--dart-define=${d}`);
+  const iosDefines = [...(opts.dartDefines ?? [])];
+  // Auto-inject SANKOFA_FLAVOR so the iOS build reports its flavor at
+  // runtime (Deploy scopes OTA per flavor). Mirrors the Android path.
+  if (opts.flavor && !iosDefines.some((d) => d.startsWith('SANKOFA_FLAVOR='))) {
+    iosDefines.push(`SANKOFA_FLAVOR=${opts.flavor}`);
+  }
+  for (const d of iosDefines) flags.push(`--dart-define=${d}`);
   if (opts.exportOptionsPlist) flags.push(`--export-options-plist "${opts.exportOptionsPlist}"`);
 
   const cmd = flutterCmd(cwd, flags.join(' '));
