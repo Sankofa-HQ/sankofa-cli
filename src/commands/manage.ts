@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import {
   listReleases,
   updateRelease,
+  getRelease,
   getReleaseRule,
   putReleaseRule,
   deleteReleaseRule,
@@ -191,14 +192,78 @@ async function resolveRelease(
   }
 }
 
+function buildInfo(kind: ManageKind): Command {
+  const listCmd = kind === 'release' ? 'releases list' : 'patches list';
+  return new Command('info')
+    .description(`Show full details for a single ${kind}`)
+    .argument('<id>', `The ${kind} id (from \`sankofa ${listCmd}\`)`)
+    .option('--json', 'Emit machine-readable JSON')
+    .action(async (id: string, opts: { json?: boolean }) => {
+      const chalk = (await import('chalk')).default;
+      await requireAuth();
+      let rel: any;
+      try {
+        rel = await getRelease(id);
+      } catch (err: any) {
+        console.error(chalk.red(`Failed to fetch ${kind} ${id}: ${err.message}`));
+        process.exit(1);
+      }
+      if (opts.json) {
+        console.log(JSON.stringify(rel, null, 2));
+        return;
+      }
+      const label = rel.label ?? rel.name ?? id;
+      if (kind === 'patch' && !isPatch(String(label))) {
+        console.log(chalk.yellow(`Note: ${label} looks like a base release, not a patch.`));
+      }
+      const rollout = rel.rollout_percentage ?? 100;
+      const status = rel.is_disabled
+        ? chalk.red('KILLED')
+        : rollout < 100
+          ? chalk.yellow(`ROLLING OUT ${rollout}%`)
+          : rel.is_mandatory
+            ? chalk.blue('MANDATORY')
+            : chalk.green('ACTIVE');
+      const line = (k: string, v: unknown) => console.log(`  ${chalk.dim(k.padEnd(16))} ${v}`);
+      console.log('');
+      console.log(chalk.bold(`  ${label}`));
+      console.log(chalk.dim('  ' + '─'.repeat(60)));
+      line('id', rel.id ?? id);
+      line('platform', rel.platform ?? '—');
+      line('binary ver', rel.target_binary_version ?? '—');
+      line('status', status);
+      line('rollout', `${rollout}%`);
+      line('mandatory', rel.is_mandatory ? 'yes' : 'no');
+      line('installs', rel.total_installs ?? 0);
+      line('rollbacks', rel.total_rollbacks ?? 0);
+      if (rel.description) line('description', rel.description);
+      if (rel.created_at) line('created', rel.created_at);
+      // Best-effort enrichment — a missing rule/schedule is normal, not an error.
+      try {
+        const rule = await getReleaseRule(rel.id ?? id);
+        if (rule && Object.keys(rule).length) line('targeting', JSON.stringify(rule));
+      } catch {
+        /* no targeting rule */
+      }
+      try {
+        const sched = await getReleaseSchedule(rel.id ?? id);
+        if (sched && Object.keys(sched).length) line('schedule', JSON.stringify(sched));
+      } catch {
+        /* no schedule */
+      }
+      console.log('');
+    });
+}
+
 function buildGroup(kind: ManageKind): Command {
   const name = kind === 'release' ? 'releases' : 'patches';
   const group = new Command(name).description(
     kind === 'release'
-      ? 'Manage base releases (list, kill-switch, rollout, mandatory)'
-      : 'Manage patches (list, kill-switch, rollout, mandatory)',
+      ? 'Manage base releases (list, info, kill-switch, rollout, mandatory)'
+      : 'Manage patches (list, info, kill-switch, rollout, mandatory)',
   );
   group.addCommand(buildList(kind));
+  group.addCommand(buildInfo(kind));
   group.addCommand(buildUpdate(kind, 'rollout'));
   group.addCommand(buildUpdate(kind, 'mandatory'));
   group.addCommand(buildUpdate(kind, 'kill'));
