@@ -15,7 +15,7 @@
  */
 
 import { execFileSync } from 'child_process';
-import { existsSync, statSync, readFileSync } from 'fs';
+import { existsSync, statSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { resolveBundledFlutter } from './flutterBundleCache.js';
 
@@ -47,6 +47,21 @@ export type PatchBuildOptions = {
   flutterDartSdk?: string;
   /** Additional compiler options (CSV). Default includes source-positions. */
   bytecodeOptions?: string;
+  /**
+   * AUTO-DIFF mode. The base app's no-aot kernel to compile the changed source
+   * against (--import-dill), so the patch module references the base program.
+   */
+  importDill?: string;
+  /**
+   * AUTO-DIFF mode. The comma-separated Class.method manifest (from
+   * computeChangedSet). When set, `_sankofaManifest()` + a retaining
+   * `@dyn-module:entry-point` are appended to a temp sibling of entryFile before
+   * compiling, so the produced module is self-describing: the boot hook invokes
+   * `_sankofaManifest()` then transplants each named changed method.
+   */
+  sankofaManifest?: string;
+  /** Prefix the module's library URIs (avoids clashing with the base app). */
+  prefixLibraryUris?: string;
 };
 
 /**
@@ -138,6 +153,25 @@ export function buildFlutterPatch(opts: PatchBuildOptions): PatchBuildResult {
   const bytecodeOptions =
     opts.bytecodeOptions ?? 'source-positions,show-bytecode-size-stat';
 
+  // AUTO-DIFF: append a self-describing _sankofaManifest() (+ a retaining
+  // dyn-module:entry-point) to a temp sibling of the entry file, so the produced
+  // module carries the changed-method manifest the boot hook invokes. Sibling
+  // path (same dir) keeps the source's relative imports resolvable.
+  let sourceToCompile = entryFile;
+  let tempFile: string | null = null;
+  if (opts.sankofaManifest !== undefined) {
+    const esc = opts.sankofaManifest.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const inject =
+      `\n\n// [sankofa] auto-generated code-push manifest (DO NOT EDIT)\n` +
+      `@pragma('vm:entry-point')\n` +
+      `String _sankofaManifest() => '${esc}';\n` +
+      `@pragma('dyn-module:entry-point')\n` +
+      `Object? _sankofaEntry() { _sankofaManifest(); return null; }\n`;
+    tempFile = entryFile.replace(/\.dart$/, '.sankofa_patch.g.dart');
+    writeFileSync(tempFile, readFileSync(entryFile, 'utf8') + inject);
+    sourceToCompile = tempFile;
+  }
+
   const args: string[] = [
     snapshot,
     '--platform',
@@ -146,6 +180,16 @@ export function buildFlutterPatch(opts: PatchBuildOptions): PatchBuildResult {
     outputPath,
     '--bytecode-options=' + bytecodeOptions,
   ];
+  if (opts.importDill) {
+    const importPath = resolve(opts.importDill);
+    if (!existsSync(importPath)) {
+      throw new Error(`--import-dill kernel not found: ${importPath}`);
+    }
+    args.push('--import-dill', importPath);
+  }
+  if (opts.prefixLibraryUris) {
+    args.push('--prefix-library-uris', opts.prefixLibraryUris);
+  }
   if (opts.validateYaml) {
     const yamlPath = resolve(opts.validateYaml);
     if (!existsSync(yamlPath)) {
@@ -153,7 +197,7 @@ export function buildFlutterPatch(opts: PatchBuildOptions): PatchBuildResult {
     }
     args.push('--validate', yamlPath);
   }
-  args.push(entryFile);
+  args.push(sourceToCompile);
 
   let toolStdout = '';
   try {
@@ -167,6 +211,14 @@ export function buildFlutterPatch(opts: PatchBuildOptions): PatchBuildResult {
     throw new Error(
       `Patch compilation failed (exit ${err.status ?? '?'}):\n${stdout}${stderr}`,
     );
+  } finally {
+    if (tempFile) {
+      try {
+        unlinkSync(tempFile);
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
   }
 
   if (!existsSync(outputPath)) {
