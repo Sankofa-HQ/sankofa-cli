@@ -255,15 +255,56 @@ function buildInfo(kind: ManageKind): Command {
     });
 }
 
+function buildGetApks(): Command {
+  return new Command('get-apks')
+    .description("Download a release's build artifact (APK/AAB) to a directory")
+    .argument('<id>', 'The release id (from `sankofa releases list`)')
+    .option('--out <dir>', 'Output directory', './build/sankofa-apks')
+    .action(async (id: string, opts: { out: string }) => {
+      const chalk = (await import('chalk')).default;
+      const { mkdirSync, writeFileSync } = await import('fs');
+      const { join } = await import('path');
+      await requireAuth();
+      let rel: any;
+      try {
+        rel = await getRelease(id);
+      } catch (err: any) {
+        console.error(chalk.red(`Failed to fetch release ${id}: ${err.message}`));
+        process.exit(1);
+      }
+      const url: string | undefined =
+        rel.download_url ?? rel.native_artifact_url ?? rel.artifact_url ?? rel.native_artifact_path;
+      if (!url || !/^https?:\/\//.test(url)) {
+        console.log(chalk.yellow(`No downloadable build artifact stored for release ${id}.`));
+        console.log(
+          chalk.dim('  Releases store a native artifact only when the build was uploaded with one.'),
+        );
+        return;
+      }
+      mkdirSync(opts.out, { recursive: true });
+      const res = await fetch(url);
+      if (!res.ok) {
+        console.error(chalk.red(`Download failed (${res.status})`));
+        process.exit(1);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ext = url.includes('.aab') ? 'aab' : url.includes('.apk') ? 'apk' : 'bin';
+      const dest = join(opts.out, `${String(rel.label ?? id).replace(/[^\w.-]/g, '_')}.${ext}`);
+      writeFileSync(dest, buf);
+      console.log(chalk.green(`✓ Downloaded ${buf.length} bytes → ${dest}`));
+    });
+}
+
 function buildGroup(kind: ManageKind): Command {
   const name = kind === 'release' ? 'releases' : 'patches';
   const group = new Command(name).description(
     kind === 'release'
-      ? 'Manage base releases (list, info, kill-switch, rollout, mandatory)'
+      ? 'Manage base releases (list, info, get-apks, kill-switch, rollout, mandatory)'
       : 'Manage patches (list, info, kill-switch, rollout, mandatory)',
   );
   group.addCommand(buildList(kind));
   group.addCommand(buildInfo(kind));
+  if (kind === 'release') group.addCommand(buildGetApks());
   group.addCommand(buildUpdate(kind, 'rollout'));
   group.addCommand(buildUpdate(kind, 'mandatory'));
   group.addCommand(buildUpdate(kind, 'kill'));
