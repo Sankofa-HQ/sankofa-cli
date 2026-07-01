@@ -27,6 +27,8 @@ import { catchCommand } from './commands/catch.js';
 import { demoCommand } from './commands/demo.js';
 import { patchToolsCommand } from './commands/patchTools.js';
 import { keysCommand } from './commands/keys.js';
+import { cacheCommand } from './commands/cache.js';
+import { flutterCommand } from './commands/flutter.js';
 import { maybePrintUpdateNotices } from './utils/updateCheck.js';
 
 // Single source of truth for the CLI version: the package's own package.json,
@@ -83,6 +85,9 @@ program.addCommand(demoCommand);
 program.addCommand(patchToolsCommand, { hidden: true });
 // Signing key management.
 program.addCommand(keysCommand);
+// Cache + Flutter-toolchain management (Dart-fork parity).
+program.addCommand(cacheCommand);
+program.addCommand(flutterCommand);
 
 program.parse();
 
