@@ -420,6 +420,39 @@ export async function getRelease(releaseId: string): Promise<any> {
   return res.json();
 }
 
+// ── Account (CLI-compat: whoami / orgs / apps) ──────────────────────
+// These hit the account-level CLI-compat endpoints (no projectId needed):
+// GET /api/v1/users/me, /api/v1/organizations, /api/v1/apps.
+
+export async function getMe(): Promise<any> {
+  const { endpoint } = resolveAuth();
+  const res = await fetch(`${endpoint}/api/v1/users/me`, { headers: getAuthHeaders() });
+  if (!res.ok) {
+    throw await readAPIError(res, `Not authenticated (${res.status}) — run \`sankofa login\``);
+  }
+  return res.json();
+}
+
+export async function listOrganizations(): Promise<any[]> {
+  const { endpoint } = resolveAuth();
+  const res = await fetch(`${endpoint}/api/v1/organizations`, { headers: getAuthHeaders() });
+  if (!res.ok) {
+    throw await readAPIError(res, `Failed to list organizations (${res.status})`);
+  }
+  const body = await res.json();
+  return Array.isArray(body) ? body : (body.organizations ?? body.orgs ?? []);
+}
+
+export async function listApps(): Promise<any[]> {
+  const { endpoint } = resolveAuth();
+  const res = await fetch(`${endpoint}/api/v1/apps`, { headers: getAuthHeaders() });
+  if (!res.ok) {
+    throw await readAPIError(res, `Failed to list apps (${res.status})`);
+  }
+  const body = await res.json();
+  return Array.isArray(body) ? body : (body.apps ?? body.projects ?? []);
+}
+
 // ── Rules / Schedule / Defaults ─────────────────────────────────────
 
 function requireProjectId(): { endpoint: string; projectId: string } {

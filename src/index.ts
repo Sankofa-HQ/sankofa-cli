@@ -30,6 +30,7 @@ import { keysCommand } from './commands/keys.js';
 import { cacheCommand } from './commands/cache.js';
 import { flutterCommand } from './commands/flutter.js';
 import { createCommand } from './commands/create.js';
+import { accountCommand } from './commands/account.js';
 import { maybePrintUpdateNotices } from './utils/updateCheck.js';
 
 // Single source of truth for the CLI version: the package's own package.json,
@@ -90,6 +91,7 @@ program.addCommand(keysCommand);
 program.addCommand(cacheCommand);
 program.addCommand(flutterCommand);
 program.addCommand(createCommand);
+program.addCommand(accountCommand);
 
 program.parse();
 
