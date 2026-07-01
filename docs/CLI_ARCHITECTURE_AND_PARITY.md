@@ -10,6 +10,38 @@ drive the right engine per project, forever, without rework. Do it right once.
 This doc is the authoritative contract. It is the source of truth for what the
 CLI must do; implementation tracks it.
 
+## ⭐ CRITICAL-PATH DEPENDENCY (2026-07-01): ship `analyze_snapshot` in the toolchain
+
+`sankofa patch ios` auto-diff (the Shorebird-parity flow) is **built and proven**
+end-to-end on host: `computeChangedSet` (diff base vs patch snapshot →
+changed methods + `_sankofaManifest`) → `buildFlutterPatch` (compile changed
+source + embed manifest → module) → boot-hook transplant+reroute (proven on
+device). BUT it has ONE unmet toolchain dependency:
+
+- **`analyze_snapshot` is a HOST tool the developer's machine must run** (it emits
+  the `--shorebird` subgraph_hash JSON the diff consumes; `aot_tools` drives it).
+- **It is NOT shipped anywhere today.** The engine CI
+  (`sankofa-flutter/.github/workflows/sankofa-engine-build-*`) publishes only
+  `libflutter.so` / `Flutter.framework` to B2. The bundled flutter has
+  `gen_snapshot` + `dart2bytecode` but **no `analyze_snapshot`**
+  (`find ~/.sankofa -name analyze_snapshot*` → nothing).
+- So the CLI cannot run the diff until `analyze_snapshot` is on the dev machine.
+
+**Enabling work (the gate for CLI auto-diff), same class as how `gen_snapshot` is
+already bundled / how Shorebird distributes aot-tools:**
+1. Engine CI builds `analyze_snapshot` for each DEV HOST platform
+   (mac-arm64, mac-x64, linux-x64, win-x64) per engine version — `ninja
+   analyze_snapshot` in the host out dir — and uploads to B2 under the engine's
+   version key (alongside the existing libflutter upload). Founder-run CI.
+2. CLI `engineCache` downloads `analyze_snapshot` for the host platform into
+   `~/.sankofa/…/<engine_version>/` when resolving the engine.
+3. CLI resolves it via `resolveAnalyzeSnapshot()` (see utils) and passes it to
+   `computeChangedSet`; clear actionable error if absent.
+
+Until step 1+2 land, `sankofa patch ios --auto-diff` errors with "analyze_snapshot
+not found in the engine bundle" — the honest gate, not a silent failure. All the
+patch-side logic (diff, compile, package) is ready and waits only on this tool.
+
 ---
 
 ## 1. Principles (non-negotiable)

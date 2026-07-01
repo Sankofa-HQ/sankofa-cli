@@ -1,8 +1,34 @@
 import { execFileSync } from 'child_process';
 import { existsSync, readFileSync, mkdtempSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
+import { tmpdir, homedir } from 'os';
 import { buildFlutterPatch } from './flutterPatchCompiler.js';
+
+/**
+ * Resolve the host `analyze_snapshot` for a given engine version. It emits the
+ * `--shorebird` subgraph_hash JSON the diff consumes, so it must be present on
+ * the DEV machine. It ships in the Sankofa engine bundle (see
+ * docs/CLI_ARCHITECTURE_AND_PARITY.md "CRITICAL-PATH DEPENDENCY"); the engine CI
+ * must publish it per host platform. Throws an actionable error if absent rather
+ * than failing obscurely mid-patch.
+ */
+export function resolveAnalyzeSnapshot(engineVersion: string): string {
+  const home = process.env.SANKOFA_HOME || join(homedir(), '.sankofa');
+  const exe = process.platform === 'win32' ? 'analyze_snapshot.exe' : 'analyze_snapshot';
+  const candidates = [
+    join(home, 'engines', engineVersion, exe),
+    join(home, 'engines', engineVersion, 'bin', exe),
+    join(home, 'flutter', engineVersion, 'bin', 'cache', 'dart-sdk', 'bin', 'utils', exe),
+  ];
+  for (const c of candidates) if (existsSync(c)) return c;
+  throw new Error(
+    `analyze_snapshot not found for engine ${engineVersion}.\n` +
+      `  It is the host tool that computes the code diff for a patch. It ships in\n` +
+      `  the Sankofa engine bundle. Update via \`sankofa engine download ${engineVersion}\`,\n` +
+      `  or (if this is a new engine) the engine CI must publish analyze_snapshot for\n` +
+      `  this host platform — see docs/CLI_ARCHITECTURE_AND_PARITY.md.`,
+  );
+}
 
 /**
  * Auto-diff brain (TS port of research/fusion/cli_v0/diff_changed_set.sh).
