@@ -1,8 +1,9 @@
 import { execFileSync } from 'child_process';
-import { existsSync, readFileSync, mkdtempSync } from 'fs';
-import { join } from 'path';
+import { existsSync, readFileSync, mkdtempSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
+import { join, dirname } from 'path';
 import { tmpdir, homedir } from 'os';
 import { buildFlutterPatch } from './flutterPatchCompiler.js';
+import { SANKOFA_STORAGE_BASE_URL } from './engineVersion.js';
 
 /**
  * Resolve the host `analyze_snapshot` for a given engine version. It emits the
@@ -15,19 +16,73 @@ import { buildFlutterPatch } from './flutterPatchCompiler.js';
 export function resolveAnalyzeSnapshot(engineVersion: string): string {
   const home = process.env.SANKOFA_HOME || join(homedir(), '.sankofa');
   const exe = process.platform === 'win32' ? 'analyze_snapshot.exe' : 'analyze_snapshot';
+  const fRoot = join(home, 'flutter', engineVersion);
+  const artEngine = join(fRoot, 'bin', 'cache', 'artifacts', 'engine');
   const candidates = [
+    // Fetched alongside gen_snapshot (see ensureAnalyzeSnapshot).
+    join(artEngine, 'ios-release', 'analyze_snapshot_arm64'),
+    join(artEngine, 'ios-release', exe),
+    join(home, 'flutter', engineVersion, 'bin', 'cache', 'dart-sdk', 'bin', 'utils', exe),
     join(home, 'engines', engineVersion, exe),
     join(home, 'engines', engineVersion, 'bin', exe),
-    join(home, 'flutter', engineVersion, 'bin', 'cache', 'dart-sdk', 'bin', 'utils', exe),
   ];
   for (const c of candidates) if (existsSync(c)) return c;
   throw new Error(
     `analyze_snapshot not found for engine ${engineVersion}.\n` +
-      `  It is the host tool that computes the code diff for a patch. It ships in\n` +
-      `  the Sankofa engine bundle. Update via \`sankofa engine download ${engineVersion}\`,\n` +
-      `  or (if this is a new engine) the engine CI must publish analyze_snapshot for\n` +
-      `  this host platform — see docs/CLI_ARCHITECTURE_AND_PARITY.md.`,
+      `  It is the host tool that computes the code diff for a patch. Fetch it with\n` +
+      `  ensureAnalyzeSnapshot() (downloads from the engine mirror), or run\n` +
+      `  \`sankofa engine download ${engineVersion}\`. See docs/CLI_ARCHITECTURE_AND_PARITY.md.`,
   );
+}
+
+/**
+ * Ensure the host `analyze_snapshot` for `engineVersion` is present, downloading
+ * it from the engine mirror if needed. The mirror already carries it at
+ * flutter_infra_release/flutter/<rev>/ios-release/analyze_snapshot_arm64 (the
+ * mac-arm64 host binary) — it just isn't extracted by `flutter precache`
+ * (standard Flutter doesn't need it; code-push does). We drop it next to
+ * gen_snapshot so resolveAnalyzeSnapshot finds it. Returns the path.
+ *
+ * Note: today only the mac-arm64 host artifact is in the mirror. Linux/Windows
+ * dev hosts need their own analyze_snapshot published (engine CI follow-up).
+ */
+export async function ensureAnalyzeSnapshot(engineVersion: string): Promise<string> {
+  try {
+    return resolveAnalyzeSnapshot(engineVersion);
+  } catch {
+    /* not cached yet — fetch below */
+  }
+  if (process.platform !== 'darwin') {
+    throw new Error(
+      `analyze_snapshot auto-fetch currently supports macOS hosts only; ` +
+        `the mirror lacks a ${process.platform} host binary for ${engineVersion}. ` +
+        `Publish it via the engine CI (see docs/CLI_ARCHITECTURE_AND_PARITY.md).`,
+    );
+  }
+  const home = process.env.SANKOFA_HOME || join(homedir(), '.sankofa');
+  const fRoot = join(home, 'flutter', engineVersion);
+  const revFile = join(fRoot, 'bin', 'internal', 'engine.version');
+  if (!existsSync(revFile)) {
+    throw new Error(
+      `Bundled Flutter not installed for ${engineVersion} (no ${revFile}). ` +
+        `Run a build/patch once to install it, or \`sankofa engine download ${engineVersion}\`.`,
+    );
+  }
+  const rev = readFileSync(revFile, 'utf8').trim();
+  const url = `${SANKOFA_STORAGE_BASE_URL}/flutter_infra_release/flutter/${rev}/ios-release/analyze_snapshot_arm64`;
+  const dest = join(fRoot, 'bin', 'cache', 'artifacts', 'engine', 'ios-release', 'analyze_snapshot_arm64');
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(
+      `analyze_snapshot not found in the mirror for engine rev ${rev} (HTTP ${res.status}).\n  ${url}\n` +
+        `  The engine CI must publish it for this rev.`,
+    );
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, buf);
+  chmodSync(dest, 0o755);
+  return dest;
 }
 
 /**

@@ -10,7 +10,20 @@ drive the right engine per project, forever, without rework. Do it right once.
 This doc is the authoritative contract. It is the source of truth for what the
 CLI must do; implementation tracks it.
 
-## ⭐ CRITICAL-PATH DEPENDENCY (2026-07-01): ship `analyze_snapshot` in the toolchain
+## ✅ RESOLVED (2026-07-01): `analyze_snapshot` is in the mirror; CLI now fetches it
+
+Update to the note below: `analyze_snapshot` was **already published in the engine
+mirror** at `flutter_infra_release/flutter/<rev>/ios-release/analyze_snapshot_arm64`
+(confirmed for both published revs 809096b6 + 0b7370de) — it just wasn't extracted
+into `~/.sankofa` by `flutter precache`. `ensureAnalyzeSnapshot(engineVersion)`
+(utils/flutterPatchDiff.ts) now downloads it from `download.sankofa.dev` next to
+`gen_snapshot` and `resolveAnalyzeSnapshot()` finds it. **Verified: fetched a valid
+Mach-O arm64 binary for 3.44.1, runs.** So no engine-CI rebuild is needed for the
+mac-arm64 host — the gate is a CLI fetch, done.
+Residual: Linux/Windows dev hosts still need their `analyze_snapshot` published to
+the mirror (engine-CI follow-up); mac-arm64 works today.
+
+## (historical) CRITICAL-PATH DEPENDENCY (2026-07-01): ship `analyze_snapshot` in the toolchain
 
 `sankofa patch ios` auto-diff (the Shorebird-parity flow) is **built and proven**
 end-to-end on host: `computeChangedSet` (diff base vs patch snapshot →
