@@ -2,6 +2,7 @@ import { execFileSync } from 'child_process';
 import { existsSync, readFileSync, mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { buildFlutterPatch } from './flutterPatchCompiler.js';
 
 /**
  * Auto-diff brain (TS port of research/fusion/cli_v0/diff_changed_set.sh).
@@ -101,4 +102,50 @@ export function computeChangedSet(
     patchCount: patch.length,
     changedCount: changed.length,
   };
+}
+
+export interface AutoDiffResult extends ChangedSet {
+  /** Path to the built dispatch-funcreg module, or null if nothing changed. */
+  modulePath: string | null;
+  moduleSizeBytes: number;
+}
+
+/**
+ * End-to-end auto-diff patch build (Shorebird's model): given the base release's
+ * AOT snapshot and the freshly-built patch snapshot + the changed source,
+ *   1. computeChangedSet → the changed methods + manifest string,
+ *   2. compile the changed source with an embedded _sankofaManifest → module.
+ * Returns modulePath=null (a no-op patch) when nothing changed. The caller
+ * packages + uploads the module; the device boot hook transplants + reroutes.
+ *
+ * Inputs come from live builds: `baseAot` is downloaded from the base release,
+ * `patchAot` + `entryFile` + `importDill` come from rebuilding the patched app.
+ */
+export function buildAutoDiffPatch(opts: {
+  analyzeSnapshot: string;
+  baseAot: string;
+  patchAot: string;
+  /** App source to compile (contains the changed methods). */
+  entryFile: string;
+  /** Base app no-aot kernel for --import-dill. */
+  importDill: string;
+  /** Output module path. */
+  outputPath: string;
+  validateYaml?: string;
+  flutterDartSdk?: string;
+}): AutoDiffResult {
+  const changed = computeChangedSet(opts.analyzeSnapshot, opts.baseAot, opts.patchAot);
+  if (changed.changedCount === 0) {
+    return { ...changed, modulePath: null, moduleSizeBytes: 0 };
+  }
+  const built = buildFlutterPatch({
+    entryFile: opts.entryFile,
+    outputPath: opts.outputPath,
+    importDill: opts.importDill,
+    sankofaManifest: changed.sankofaManifest,
+    prefixLibraryUris: 'sankofa/patch',
+    validateYaml: opts.validateYaml,
+    flutterDartSdk: opts.flutterDartSdk,
+  });
+  return { ...changed, modulePath: built.outputPath, moduleSizeBytes: built.sizeBytes };
 }
