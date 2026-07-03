@@ -25,7 +25,7 @@ export const SANKOFA_STORAGE_BASE_URL = 'https://download.sankofa.dev';
  * Fallback when the CDN's latest.json is unreachable (offline install,
  * proxy). Bump on every engine release as part of the publish checklist.
  */
-export const DEFAULT_ENGINE_VERSION = '3.44.1+sankofa-1';
+export const DEFAULT_ENGINE_VERSION = '3.44.1+sankofa-2';
 
 /** `3.44.1+sankofa-1` → `3.44.1`. Returns null for malformed input. */
 export function flutterVersionOf(engineVersion: string): string | null {

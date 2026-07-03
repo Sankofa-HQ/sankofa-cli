@@ -3,7 +3,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, 
 import { createHash } from 'crypto';
 import { join, resolve } from 'path';
 import { resolveBundledFlutter, resolvePinnedEngineVersion } from './flutterBundleCache.js';
-import { SANKOFA_STORAGE_BASE_URL, flutterVersionOf } from './engineVersion.js';
+import { SANKOFA_STORAGE_BASE_URL, flutterVersionOf, DEFAULT_ENGINE_VERSION } from './engineVersion.js';
 
 export interface FlutterEngineInfo {
   flutterVersion: string;
@@ -93,14 +93,20 @@ export function detectFlutterEngineInfo(projectRoot?: string): FlutterEngineInfo
     flutterVersion = flutterVersionOf(pinned) ?? flutterVersion;
   }
 
+  // Resolution priority: explicit env override > the project's authoritative pin
+  // (sankofa.yaml / .sankofa/flutter-version) > the current default engine. The
+  // pin is honoured whenever it's set — NOT only when `flutter --version` is
+  // broken — so a project that pins sankofa-2 never silently falls back to an
+  // older engine. Last resort is DEFAULT_ENGINE_VERSION (the current release),
+  // never a hardcoded stale suffix.
   const override = process.env.SANKOFA_ENGINE_VERSION;
   let sankofaEngineVersion: string;
   if (override) {
     sankofaEngineVersion = override;
-  } else if (versionUnusable && pinned) {
+  } else if (pinned) {
     sankofaEngineVersion = pinned;
   } else {
-    sankofaEngineVersion = `${flutterVersion}+sankofa-1`;
+    sankofaEngineVersion = DEFAULT_ENGINE_VERSION;
   }
 
   return { flutterVersion, channel, engineRevision, sankofaEngineVersion };
