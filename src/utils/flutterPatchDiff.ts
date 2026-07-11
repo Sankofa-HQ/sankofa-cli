@@ -1,9 +1,15 @@
 import { execFileSync } from 'child_process';
 import { existsSync, readFileSync, mkdtempSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, resolve } from 'path';
 import { tmpdir, homedir } from 'os';
-import { buildFlutterPatch } from './flutterPatchCompiler.js';
+import { fileURLToPath } from 'url';
 import { SANKOFA_STORAGE_BASE_URL } from './engineVersion.js';
+import {
+  resolveAutoDiffTools,
+  runExtractor,
+  compileChangedUnit,
+  sourceDiffPairs,
+} from './flutterAutoDiffCompile.js';
 
 /**
  * Resolve the host `analyze_snapshot` for a given engine version. It emits the
@@ -113,8 +119,15 @@ export interface SnapshotFn {
 export interface ChangedSet {
   /** Ready-to-embed manifest string the boot hook parses (Class.method,...). */
   sankofaManifest: string;
-  /** Qualified transplant targets. */
+  /** Qualified transplant targets (the LEAF, body-changed app fns). */
   targets: string[];
+  /**
+   * The leaf app functions whose OWN body changed (self_hash differs) — the
+   * transplant/extract targets. Distinct from the wider subgraph-changed set
+   * (which also includes cascade callers that only changed because a callee did;
+   * those are handled by the dispatch reroute, not transplanted).
+   */
+  leafFns: SnapshotFn[];
   /** link% by function count (higher = smaller patch). */
   linkPct: number;
   baseCount: number;
@@ -135,15 +148,73 @@ function isAppFn(f: SnapshotFn): boolean {
   return true;
 }
 
+/**
+ * Error thrown when `analyze_snapshot` can't read an AOT because its Dart VM
+ * snapshot version differs from the `gen_snapshot` that built the app — i.e. the
+ * engine mirror shipped an `analyze_snapshot` that isn't coherent with the
+ * engine that built the release. Carries a distinct name so the caller can
+ * fail fast with guidance instead of a cryptic mid-diff crash.
+ */
+export class AnalyzeSnapshotIncoherentError extends Error {
+  constructor(public readonly detail: string) {
+    super(detail);
+    this.name = 'AnalyzeSnapshotIncoherentError';
+  }
+}
+
+function coherenceHelp(aot: string, extra: string): string {
+  return (
+    `analyze_snapshot could not read the AOT snapshot (${aot}).\n` +
+    `  ${extra}\n` +
+    `  This means the engine's host tool \`analyze_snapshot\` was built from a\n` +
+    `  different Dart revision than the \`gen_snapshot\` that compiled your app —\n` +
+    `  their VM snapshot-format versions must match. The engine mirror needs an\n` +
+    `  analyze_snapshot rebuilt from the SAME engine revision as gen_snapshot\n` +
+    `  (the engine CI must publish them together, like the dart-sdk tools).\n` +
+    `  Auto-diff code-push can't run until that coherent analyze_snapshot is on\n` +
+    `  the mirror. (Meanwhile, --legacy-patch-file still works.)`
+  );
+}
+
 function runAnalyzer(analyzeSnapshot: string, aot: string, outJson: string): SnapshotFn[] {
-  execFileSync(analyzeSnapshot, ['--shorebird', `--out=${outJson}`, aot], {
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
+  try {
+    execFileSync(analyzeSnapshot, ['--shorebird', `--out=${outJson}`, aot], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+  } catch (err: any) {
+    const stderr = (err.stderr?.toString() ?? '') + (err.stdout?.toString() ?? '');
+    // Version mismatch surfaces two ways depending on the engine build: a clean
+    // "Wrong full snapshot version" message, or a hard SIGKILL (the tool aborts
+    // before it can print). Treat both as an incoherent-toolchain error.
+    if (/Wrong full snapshot version/i.test(stderr)) {
+      const m = stderr.match(/expected '([a-f0-9]+)' found '([a-f0-9]+)'/i);
+      throw new AnalyzeSnapshotIncoherentError(
+        coherenceHelp(aot, m ? `VM snapshot version mismatch: tool expects '${m[1]}', app is '${m[2]}'.` : stderr.trim().split('\n')[0]),
+      );
+    }
+    if (err.signal === 'SIGKILL' || err.status === 137) {
+      throw new AnalyzeSnapshotIncoherentError(
+        coherenceHelp(aot, 'analyze_snapshot was killed (SIGKILL) while reading the snapshot — the hallmark of a VM snapshot-version mismatch.'),
+      );
+    }
+    throw new Error(`analyze_snapshot failed for ${aot} (exit ${err.status ?? err.signal ?? '?'}):\n${stderr}`);
+  }
   if (!existsSync(outJson)) {
     throw new Error(`analyze_snapshot produced no output for ${aot}`);
   }
   const parsed = JSON.parse(readFileSync(outJson, 'utf8'));
   return (parsed.functions ?? []) as SnapshotFn[];
+}
+
+/**
+ * Cheap coherence preflight: run `analyze_snapshot` on an already-built base AOT
+ * and throw AnalyzeSnapshotIncoherentError if the tool can't read it. Callers
+ * run this BEFORE the multi-minute app rebuild so a mismatched engine mirror
+ * fails in seconds with guidance, not after a wasted build.
+ */
+export function assertAnalyzeSnapshotCoherent(analyzeSnapshot: string, baseAot: string): void {
+  const probe = join(mkdtempSync(join(tmpdir(), 'sankofa-coh-')), 'probe.json');
+  runAnalyzer(analyzeSnapshot, baseAot, probe);
 }
 
 /**
@@ -168,16 +239,29 @@ export function computeChangedSet(
   const base = runAnalyzer(analyzeSnapshot, baseAot, join(work, 'base.json'));
   const patch = runAnalyzer(analyzeSnapshot, patchAot, join(work, 'patch.json'));
 
-  const baseHashes = new Set(base.map((f) => f.subgraph_hash));
-  const changedAll = patch.filter((f) => !baseHashes.has(f.subgraph_hash));
-  const changed = changedAll.filter(isAppFn);
-
-  const targets = Array.from(new Set(changed.map(qn))).sort();
+  // Subgraph-changed set (a fn + its static-caller cascade) drives link% —
+  // the fraction of the app that's reused/unshipped.
+  const baseSubgraph = new Set(base.map((f) => f.subgraph_hash));
+  const changed = patch.filter((f) => !baseSubgraph.has(f.subgraph_hash)).filter(isAppFn);
   const linkPct = patch.length > 0 ? +(100 * (patch.length - changed.length) / patch.length).toFixed(2) : 100;
+
+  // LEAF changes = app fns whose OWN body changed (self_hash new). These are what
+  // we transplant; cascade-only callers are rerouted, not transplanted. Fall back
+  // to the subgraph set if the analyzer build doesn't emit self_hash.
+  const anySelf = patch.some((f) => !!f.self_hash);
+  let leafFns: SnapshotFn[];
+  if (anySelf) {
+    const baseSelf = new Set(base.map((f) => f.self_hash).filter(Boolean) as string[]);
+    leafFns = patch.filter((f) => f.self_hash && !baseSelf.has(f.self_hash)).filter(isAppFn);
+  } else {
+    leafFns = changed;
+  }
+  const targets = Array.from(new Set(leafFns.map(qn))).sort();
 
   return {
     sankofaManifest: targets.join(','),
     targets,
+    leafFns,
     linkPct,
     baseCount: base.length,
     patchCount: patch.length,
@@ -185,48 +269,73 @@ export function computeChangedSet(
   };
 }
 
-export interface AutoDiffResult extends ChangedSet {
+export interface AutoDiffResult {
+  /** Comma-separated transplant targets embedded in the module. */
+  sankofaManifest: string;
+  /** The changed function names (Class.method or top-level). */
+  targets: string[];
+  /** Count of changed functions. */
+  changedCount: number;
   /** Path to the built dispatch-funcreg module, or null if nothing changed. */
   modulePath: string | null;
   moduleSizeBytes: number;
 }
 
 /**
- * End-to-end auto-diff patch build (Shorebird's model): given the base release's
- * AOT snapshot and the freshly-built patch snapshot + the changed source,
- *   1. computeChangedSet → the changed methods + manifest string,
- *   2. compile the changed source with an embedded _sankofaManifest → module.
- * Returns modulePath=null (a no-op patch) when nothing changed. The caller
- * packages + uploads the module; the device boot hook transplants + reroutes.
- *
- * Inputs come from live builds: `baseAot` is downloaded from the base release,
- * `patchAot` + `entryFile` + `importDill` come from rebuilding the patched app.
+ * THE DREAM, no patch file, no app rebuild:
+ *   1. AST-diff your edited source against the release snapshot (position-
+ *      independent — line shifts don't matter) → the functions whose body
+ *      actually changed. Precise, unlike the AOT hash diff which is drowned in
+ *      build non-determinism (edit one line → 9000+ spurious hash changes).
+ *   2. Emit a minimal unit lifting just those functions + their imports + a
+ *      self-describing manifest.
+ *   3. dart2bytecode the unit against --import-dill(base no-aot kernel) + the
+ *      flutter platform → a ~KB dispatch-funcreg module the device transplants
+ *      by name.
+ * Returns modulePath=null when nothing source-level changed.
  */
 export function buildAutoDiffPatch(opts: {
-  analyzeSnapshot: string;
-  baseAot: string;
-  patchAot: string;
-  /** App source to compile (contains the changed methods). */
-  entryFile: string;
-  /** Base app no-aot kernel for --import-dill. */
-  importDill: string;
+  projectRoot: string;
+  /** The app's .dart_tool/package_config.json — for the unit compile. */
+  packageConfig: string;
+  /** The release source snapshot dir (holds lib/) to diff the edited tree against. */
+  baseSrcDir: string;
+  /** Base app no-aot kernel (gen_kernel --no-aot), captured at release. */
+  baseNoAotKernel: string;
   /** Output module path. */
   outputPath: string;
-  validateYaml?: string;
-  flutterDartSdk?: string;
+  /** package_config that resolves package:analyzer for the extractor (dev/local). */
+  analyzerPackages?: string;
 }): AutoDiffResult {
-  const changed = computeChangedSet(opts.analyzeSnapshot, opts.baseAot, opts.patchAot);
-  if (changed.changedCount === 0) {
-    return { ...changed, modulePath: null, moduleSizeBytes: 0 };
-  }
-  const built = buildFlutterPatch({
-    entryFile: opts.entryFile,
-    outputPath: opts.outputPath,
-    importDill: opts.importDill,
-    sankofaManifest: changed.sankofaManifest,
-    prefixLibraryUris: 'sankofa/patch',
-    validateYaml: opts.validateYaml,
-    flutterDartSdk: opts.flutterDartSdk,
+  const tools = resolveAutoDiffTools(opts.projectRoot);
+  const files = sourceDiffPairs(opts.projectRoot, opts.baseSrcDir);
+  const work = mkdtempSync(join(tmpdir(), 'sankofa-unit-'));
+  const unitOut = join(work, 'sankofa_patch_unit.dart');
+  const manifest = runExtractor({
+    projectRoot: opts.projectRoot,
+    files,
+    unitOut,
+    tools,
+    analyzerPackages: opts.analyzerPackages,
   });
-  return { ...changed, modulePath: built.outputPath, moduleSizeBytes: built.sizeBytes };
+  const targets = manifest ? manifest.split(',').filter(Boolean) : [];
+  if (targets.length === 0) {
+    return { sankofaManifest: '', targets: [], changedCount: 0, modulePath: null, moduleSizeBytes: 0 };
+  }
+  const built = compileChangedUnit({
+    projectRoot: opts.projectRoot,
+    unitFile: unitOut,
+    baseNoAotKernel: opts.baseNoAotKernel,
+    packageConfig: opts.packageConfig,
+    outputPath: opts.outputPath,
+    tools,
+  });
+  return {
+    sankofaManifest: manifest,
+    targets,
+    changedCount: targets.length,
+    modulePath: built.modulePath,
+    moduleSizeBytes: built.sizeBytes,
+  };
 }
+

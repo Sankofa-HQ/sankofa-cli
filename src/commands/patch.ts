@@ -16,9 +16,11 @@ import { requireAuth, findProjectConfig } from '../utils/config.js';
 import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompts.js';
 import { resolveProjectRoot, type ProjectInfo } from '../utils/stack.js';
 import { escapeRegExp, parseRollout } from '../utils/validation.js';
-import { detectFlutterEngineInfo, resolveFlutterPlatform } from '../utils/flutterBundler.js';
+import { buildFlutterAOT, buildFlutterIPA, detectFlutterEngineInfo, resolveFlutterPlatform } from '../utils/flutterBundler.js';
 import { readBaselineManifest } from '../utils/baseline.js';
 import { buildFlutterPatch, resolveFlutterDartSdk } from '../utils/flutterPatchCompiler.js';
+import { buildAutoDiffPatch, ensureAnalyzeSnapshot, assertAnalyzeSnapshotCoherent, AnalyzeSnapshotIncoherentError } from '../utils/flutterPatchDiff.js';
+import { resolveAutoDiffBase } from '../utils/autodiffBase.js';
 import { packPatch, type PatchMetadata } from '../utils/flutterPatchPackage.js';
 import { loadSigningKey, signEd25519 } from './keys.js';
 
@@ -26,11 +28,34 @@ function isPatchRelease(release: any): boolean {
   return /-patch\.\d+$/.test(String(release.label || ''));
 }
 
+/**
+ * Locate a patch AOT from a prior build, for `--no-rebuild`. Mirrors where
+ * buildFlutterAOT / buildFlutterIPA drop the extracted base program:
+ *   Android: <outputDir>/libapp.<engine>.so
+ *   iOS:     build/ios/sankofa/App.<engine>.aot
+ * Returns null if absent (caller then requires a real rebuild).
+ */
+function locatePrebuiltPatchAot(
+  projectRoot: string,
+  platform: 'ios' | 'android',
+  engineVersion: string,
+  outputDir?: string,
+): string | null {
+  const candidate =
+    platform === 'android'
+      ? resolve(projectRoot, outputDir || './build', `libapp.${engineVersion}.so`)
+      : join(projectRoot, 'build', 'ios', 'sankofa', `App.${engineVersion}.aot`);
+  return existsSync(candidate) ? candidate : null;
+}
+
 export const patchCommand = new Command('patch')
   .description('Push an OTA patch to an existing release (Dart/JS code only — no native changes)')
   .argument('[platform]', 'Target platform: ios or android (prompts if omitted)')
-  .option('--entry-file <file>', 'RN: JS entry file. Flutter: patch entry-point (alias of -t/--target).')
-  .option('-t, --target <file>', "Flutter: patch entry-point file to compile (default lib/sankofa_patch.dart). Pick one when you keep several patch entries. The file must expose the @pragma('dyn-module:entry-point') function.")
+  .option('--entry-file <file>', 'RN: JS entry file. Flutter (auto-diff): app entry-point to rebuild + diff (alias of -t/--target).')
+  .option('-t, --target <file>', 'Flutter (auto-diff, default): app entry-point to rebuild + diff, default lib/main.dart — pass your flavored main (e.g. lib/main_prod.dart). You just edit your real code; Sankofa diffs the rebuild and ships only the changed functions. No patch file.')
+  .option('--legacy-patch-file [file]', "Flutter: opt into the legacy patch-FILE model — compile a single hand-written @pragma('dyn-module:entry-point') file (default lib/sankofa_patch.dart) instead of auto-diffing your real code. Limited; prefer the default auto-diff path.")
+  .option('--dart-define <keyval>', 'Flutter: --dart-define passed to the rebuild (repeatable), e.g. API_URL=https://…', (v: string, acc: string[]) => { acc.push(v); return acc; }, [])
+  .option('--no-rebuild', 'Flutter (auto-diff): skip the app rebuild and reuse the last build under --output-dir (advanced; only if you just built).')
   .option('--output-dir <dir>', 'Directory for built artifacts', './build')
   .option('--description <desc>', 'Patch description')
   .option('--mandatory', 'Mark this patch as mandatory (force-update)')
@@ -498,50 +523,8 @@ async function runFlutterPatch(
     label = opts.label || `patch-${platform}-${timestamp}`;
   }
 
-  // ── 3. Resolve patch entry + optional dynamic interface ─────────────
+  // ── 3. Resolve the dynamic interface (optional in auto-diff) + paths ─
   const projectRoot = project.root;
-  // -t/--target and --entry-file are aliases for the patch entry; -t wins
-  // when both are given. Lets you keep multiple patch entries and select one.
-  const entryFile = resolve(projectRoot, opts.target || opts.entryFile || 'lib/sankofa_patch.dart');
-  if (!existsSync(entryFile)) {
-    console.error(chalk.red(`  ✖ Patch entry not found: ${entryFile}`));
-    console.error(chalk.dim(
-      '     Create it with exactly one entry-point function:\n' +
-      '        @pragma(\'dyn-module:entry-point\')\n' +
-      '        Object? main() => \'sankofa patch v1\';\n' +
-      '     Or pass --entry-file <path>.'
-    ));
-    process.exit(2);
-  }
-
-  // Guard the common Shorebird reflex: passing the APP entry-point (e.g.
-  // `-t lib/main_prod.dart`) as the patch target. In Sankofa β.3 the patch
-  // is a SEPARATE file exposing @pragma('dyn-module:entry-point') — the app
-  // main is not one. Catch it here with a clear message instead of a
-  // downstream compile failure on a 10k-line app graph.
-  try {
-    const entrySrc = readFileSync(entryFile, 'utf8');
-    if (!entrySrc.includes('dyn-module:entry-point')) {
-      const looksLikeApp = /runApp\s*\(/.test(entrySrc) || /void\s+main\s*\(/.test(entrySrc);
-      console.error(chalk.red(`  ✖ ${entryFile} is not a Sankofa patch entry.`));
-      console.error(chalk.dim(
-        looksLikeApp
-          ? "     That looks like your app's entry-point. A Sankofa patch is a SEPARATE\n" +
-            "     file (default lib/sankofa_patch.dart) exposing:\n" +
-            "        @pragma('dyn-module:entry-point')\n" +
-            "        Object? main() => 'sankofa patch v1';\n" +
-            `     For a flavored app you don't pass -t — the flavor scopes the base\n` +
-            `     release, not the patch entry. Just run:\n` +
-            `        sankofa patch ${platform}${opts.flavor ? ` --flavor ${opts.flavor}` : ''}`
-          : "     The patch entry must expose exactly one\n" +
-            "        @pragma('dyn-module:entry-point') function."
-      ));
-      process.exit(2);
-    }
-  } catch {
-    /* unreadable file — let the compiler surface the real error */
-  }
-
   let dynamicInterface: string | undefined;
   const conventional = join(projectRoot, 'sankofa', 'dynamic_interface.yaml');
   if (opts.dynamicInterface) {
@@ -556,24 +539,113 @@ async function runFlutterPatch(
   const patchPath = join(buildDir, 'patch.skdp');
   mkdirSync(buildDir, { recursive: true });
 
-  // ── 4. Compile the patch entry-point ────────────────────────────────
-  console.log('');
-  const buildSpinner = ora(`Building patch from ${entryFile}…`).start();
-  let buildResult;
-  try {
-    buildResult = buildFlutterPatch({
-      entryFile,
-      outputPath: payloadPath,
-      validateYaml: dynamicInterface,
-      // Resolve the dart-sdk from the PROJECT root (where sankofa.yaml lives).
-      // buildFlutterPatch otherwise derives it from dirname(entryFile)=lib/,
-      // which misses sankofa.yaml → falls back to PATH flutter (absent on Windows).
-      flutterDartSdk: resolveFlutterDartSdk(projectRoot),
-    });
-    buildSpinner.succeed(`Patch compiled (${buildResult.sizeBytes} B).`);
-  } catch (err: any) {
-    buildSpinner.fail(`Patch compile failed: ${err.message}`);
-    process.exit(1);
+  // ── 4. Produce the patch module ─────────────────────────────────────
+  // DEFAULT = auto-diff (THE DREAM): you edit your REAL code, Sankofa rebuilds
+  // the app, diffs it against the baseline's AOT, and ships ONLY the changed
+  // functions — the engine reroutes to them live (dispatch-funcreg). No patch
+  // file. --legacy-patch-file opts into the old single-file model.
+  const useLegacyFile = opts.legacyPatchFile !== undefined;
+  // `entryFile` labels the patch's source in metadata/logs below.
+  let entryFile: string;
+
+  if (useLegacyFile) {
+    entryFile = resolve(
+      projectRoot,
+      (typeof opts.legacyPatchFile === 'string' ? opts.legacyPatchFile : null) || 'lib/sankofa_patch.dart',
+    );
+    if (!existsSync(entryFile)) {
+      console.error(chalk.red(`  ✖ Legacy patch file not found: ${entryFile}`));
+      console.error(chalk.dim(
+        "     The legacy model needs a file exposing exactly one entry-point:\n" +
+        "        @pragma('dyn-module:entry-point')\n" +
+        "        Object? main() => 'sankofa patch v1';\n" +
+        '     Or just drop --legacy-patch-file to use the default auto-diff path (edit your real code).'
+      ));
+      process.exit(2);
+    }
+    console.log('');
+    console.log(chalk.yellow('  ⚠ Legacy patch-file model — compiling a single hand-written file, not your real code.'));
+    const buildSpinner = ora(`Compiling ${entryFile}…`).start();
+    try {
+      const r = buildFlutterPatch({
+        entryFile,
+        outputPath: payloadPath,
+        validateYaml: dynamicInterface,
+        flutterDartSdk: resolveFlutterDartSdk(projectRoot),
+      });
+      buildSpinner.succeed(`Patch compiled (${r.sizeBytes} B).`);
+    } catch (err: any) {
+      buildSpinner.fail(`Patch compile failed: ${err.message}`);
+      process.exit(1);
+    }
+  } else {
+    // ── AUTO-DIFF (default): rebuild the edited app → diff vs base → module ──
+    if (!selectedRelease) {
+      console.error(chalk.red('  ✖ Auto-diff needs a baseline release to diff against.'));
+      console.error(chalk.dim(
+        `     Run ${chalk.cyan('sankofa release ' + platform)} first to create the baseline,\n` +
+        '     then edit your code and re-run this. (Or use --legacy-patch-file for the file model.)'
+      ));
+      process.exit(1);
+    }
+
+    // Resolve the base this patch diffs against: the baseline's exact AOT +
+    // kernel, captured by `sankofa release`. Local-first (same machine that
+    // released). Cross-machine/CI needs the server round-trip (pending).
+    const base = resolveAutoDiffBase(projectRoot, platform, selectedRelease.label);
+    if (!base) {
+      console.error(chalk.red(`  ✖ No local auto-diff base for ${chalk.bold(selectedRelease.label)} (${platform}).`));
+      console.error(chalk.dim(
+        `     The base AOT + kernel are captured by ${chalk.cyan('sankofa release ' + platform)} and stored under\n` +
+        '     .sankofa/baseline/autodiff/. Release this app version on THIS machine first, then patch.\n' +
+        '     (Cross-machine patching — fetching the base from the server — is coming; until then\n' +
+        '      release + patch happen on the same machine. Or use --legacy-patch-file.)'
+      ));
+      process.exit(1);
+    }
+    if (!base.baseNoAotPath) {
+      console.error(chalk.red(`  ✖ The base for ${selectedRelease.label} was captured without its program kernel (base_noaot.dill).`));
+      console.error(chalk.dim(`     Re-run ${chalk.cyan('sankofa release ' + platform)} to recapture it, then patch again.`));
+      process.exit(1);
+    }
+    const baseNoAotKernel: string = base.baseNoAotPath;
+    if (base.meta.engineVersion !== engineVersion) {
+      console.error(chalk.red('  ✖ Engine mismatch between the base and your local toolchain.'));
+      console.error(chalk.dim(`     Base built with ${base.meta.engineVersion}; local is ${engineVersion}.`));
+      process.exit(1);
+    }
+
+    // Source-diff → extract → compile. No app rebuild, no AOT diff: AST-diff your
+    // edited working tree against the release source snapshot to find exactly the
+    // functions whose body changed, lift them into a minimal unit, and compile
+    // that to a tiny dispatch-funcreg module against the base kernel. Seconds.
+    entryFile = 'your edited lib/ (auto-diff)';
+    console.log('');
+    const diffSpinner = ora('Diffing your edited code against the baseline + building the patch module…').start();
+    let diff;
+    try {
+      diff = buildAutoDiffPatch({
+        projectRoot,
+        packageConfig: resolve(projectRoot, '.dart_tool', 'package_config.json'),
+        baseSrcDir: base.baseSrcDir,
+        baseNoAotKernel,
+        outputPath: payloadPath,
+      });
+    } catch (err: any) {
+      diffSpinner.fail(`Auto-diff failed: ${err.message}`);
+      process.exit(1);
+    }
+
+    if (diff.changedCount === 0 || !diff.modulePath) {
+      diffSpinner.info(`No code changes detected vs ${selectedRelease.label} — nothing to ship.`);
+      console.log(chalk.dim('     Edit a function body in your Dart code, then re-run to ship the change.'));
+      return;
+    }
+    diffSpinner.succeed(
+      `Patch module built — ${diff.changedCount} changed function(s) (${diff.moduleSizeBytes} B).`,
+    );
+    const preview = diff.targets.slice(0, 8);
+    console.log(chalk.dim('     Changed: ' + preview.join(', ') + (diff.targets.length > preview.length ? `, +${diff.targets.length - preview.length} more` : '')));
   }
 
   // ── 5. Package (+ sign if a project key exists) ─────────────────────

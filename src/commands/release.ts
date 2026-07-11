@@ -37,6 +37,8 @@ import { resolveProjectRoot, type ProjectInfo } from '../utils/stack.js';
 import { parseRollout } from '../utils/validation.js';
 import { buildFlutterAOT, buildFlutterIPA, detectFlutterAppVersion, detectFlutterEngineInfo, resolveFlutterPlatform, type BuildIpaResult } from '../utils/flutterBundler.js';
 import { captureFlutterBaseline, type BaselineManifest } from '../utils/baseline.js';
+import { writeAutoDiffBase, autoDiffBaseSize } from '../utils/autodiffBase.js';
+import { captureBaseNoAotKernel } from '../utils/flutterAutoDiffCompile.js';
 import { buildFlutterPatch, resolveFlutterDartSdk } from '../utils/flutterPatchCompiler.js';
 import { packPatch, type PatchMetadata } from '../utils/flutterPatchPackage.js';
 import { loadSigningKey, signEd25519 } from './keys.js';
@@ -512,6 +514,25 @@ export const releaseCommand = new Command('release')
 
 // ── Flutter release ───────────────────────────────────────────────────────────
 
+/**
+ * Produce the base program's `--no-aot` kernel (gen_kernel --no-aot) — the
+ * `--import-dill` reference a later `sankofa patch` compiles the changed unit
+ * against. NOT flutter's app.dill (that's the --aot kernel; it crashes
+ * dart2bytecode). Best-effort: returns null if it can't run, so a release still
+ * succeeds (real-code patches then need a re-release on this machine).
+ */
+function produceBaseNoAotKernel(projectRoot: string, targetOpt: string | undefined): string | null {
+  try {
+    const appEntry = resolve(projectRoot, targetOpt || 'lib/main.dart');
+    const packageConfig = resolve(projectRoot, '.dart_tool', 'package_config.json');
+    if (!fs.existsSync(appEntry) || !fs.existsSync(packageConfig)) return null;
+    const out = resolve(projectRoot, '.sankofa', 'build', 'base_noaot.dill');
+    return captureBaseNoAotKernel({ projectRoot, appEntry, packageConfig, outputPath: out });
+  } catch {
+    return null;
+  }
+}
+
 export async function flutterRelease(
   project: ProjectInfo,
   platformArg: string | undefined,
@@ -710,6 +731,27 @@ export async function flutterRelease(
   } catch (err: any) {
     baselineSpinner.fail(`Baseline capture failed: ${err.message}`);
     process.exit(1);
+  }
+
+  // Persist the auto-diff base: this release's exact AOT (libapp.so) + program
+  // kernel (app.dill). A later `sankofa patch` diffs the rebuilt, edited app
+  // against these to ship only the changed functions (dispatch-funcreg) — the
+  // real-code code-push path, no patch file. Best-effort: if the kernel wasn't
+  // captured, patches fall back to the legacy file model with a heads-up.
+  const autodiffDir = writeAutoDiffBase({
+    projectRoot: project.root,
+    label,
+    engineVersion,
+    targetBinaryVersion: appVersion,
+    platform,
+    abi: built.abi,
+    baseAotPath: built.libappPath,
+    baseNoAotPath: produceBaseNoAotKernel(project.root, opts.target),
+  });
+  if (autodiffDir) {
+    console.log(
+      chalk.dim(`  · Auto-diff base saved (${formatBytes(autoDiffBaseSize(autodiffDir))})`),
+    );
   }
 
   const libappSize = getFileSize(built.libappPath);
@@ -928,6 +970,32 @@ async function flutterReleaseIOS(
   } else if (built.xcarchivePath) {
     console.log(
       chalk.yellow('  ⚠ No .ipa produced (likely --no-codesign). The .xcarchive is ready to sign in Xcode.'),
+    );
+  }
+
+  // Persist the auto-diff base — the App.framework Mach-O AOT + program kernel
+  // captured from this build. This is what makes iOS real-code code-push work:
+  // `sankofa patch ios` diffs the rebuilt, edited app against these to ship only
+  // the changed functions (dispatch-funcreg, proven on iPhone), no patch file.
+  // Unlike the KBC baseline envelope below, this stays on the dev machine — it's
+  // a diff input, never downloaded by devices.
+  const autodiffDir = writeAutoDiffBase({
+    projectRoot: project.root,
+    label,
+    engineVersion,
+    targetBinaryVersion: appVersion,
+    platform: 'ios',
+    abi: 'device-arm64',
+    baseAotPath: built.baseAotPath,
+    baseNoAotPath: produceBaseNoAotKernel(project.root, opts.target),
+  });
+  if (autodiffDir) {
+    console.log(
+      chalk.dim(`  · Auto-diff base saved (${formatBytes(autoDiffBaseSize(autodiffDir))})`),
+    );
+  } else {
+    console.log(
+      chalk.dim('  · Auto-diff base not captured (App.framework/App not found) — real-code patches unavailable for this build'),
     );
   }
 
