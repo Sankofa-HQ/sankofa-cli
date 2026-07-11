@@ -1,7 +1,7 @@
 import { execSync } from 'child_process';
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync } from 'fs';
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync } from 'fs';
 import { createHash } from 'crypto';
-import { join, resolve } from 'path';
+import { dirname, join, resolve } from 'path';
 import { resolveBundledFlutter, resolvePinnedEngineVersion } from './flutterBundleCache.js';
 import { SANKOFA_STORAGE_BASE_URL, flutterVersionOf, DEFAULT_ENGINE_VERSION } from './engineVersion.js';
 
@@ -50,6 +50,85 @@ function flutterCmd(projectRoot: string | undefined, args: string): string {
   // Quote if path has spaces (uncommon, but homedir on macOS can have spaces).
   const quoted = /\s/.test(bin) ? `"${bin}"` : bin;
   return `${quoted} ${args}`;
+}
+
+/**
+ * Resolve the `--dynamic-interface` build flags. The base app MUST be compiled
+ * with `--extra-front-end-options=--dynamic-interface=<yaml>` so the AOT
+ * precompiler RETAINS the functions a code-push patch may call (dart:core: ==,
+ * ~/, +, toString, List, string-interp, …) instead of tree-shaking them. Without
+ * it, a patch's bytecode can't resolve those references at transplant time on
+ * device (proven: transplant then "Unable to find function == / toString").
+ *
+ * We ALSO pass `--dynamic-interface-annotate-privates`, without which only the
+ * PUBLIC declaring-class member is retained (e.g. `Object.==`) but the concrete
+ * private implementation the receiver actually dispatches to is tree-shaken
+ * (`_IntegerImplementation.==`, `_StringBase`, `_GrowableList`, `_Smi`, …). A
+ * patch's `a == b` bakes an InterfaceCall on `Object.==`; at runtime the
+ * interpreter dispatches by NAME against the receiver's real class, so the
+ * private impl must survive or `int == int` silently degrades to identity /
+ * noSuchMethod. Retaining privates is what makes ARBITRARY core code correct,
+ * not just non-crashing.
+ * Convention: `<root>/sankofa_dynamic_interface.yaml` or
+ * `<root>/sankofa/dynamic_interface.yaml`. Returns the flags or ''.
+ */
+function dynamicInterfaceFlag(projectRoot: string): string {
+  const yaml = [
+    join(projectRoot, 'sankofa_dynamic_interface.yaml'),
+    join(projectRoot, 'sankofa', 'dynamic_interface.yaml'),
+  ].find((p) => existsSync(p));
+  if (!yaml) {
+    console.warn(
+      '  ⚠ No sankofa_dynamic_interface.yaml — building WITHOUT --dynamic-interface. ' +
+        'Code-push patches may fail to resolve dart:core/app calls at apply time. ' +
+        'Add one declaring your patchable surface (callable/extendable).',
+    );
+    return '';
+  }
+  // NOTE: `--dynamic-interface-annotate-privates` (retains _IntegerImplementation.==,
+  // _StringBase, _GrowableList, … so int/string/list ops are FULLY correct for a
+  // patch, not just Smi-correct) exists in the engine's Dart 3.12 source but the
+  // CURRENTLY BUNDLED frontend_server rejects it ("Could not find an option named
+  // …"). Re-add it here once the bundle's frontend_server snapshot is rebuilt from
+  // the engine's dart-sdk. Public `--dynamic-interface` alone retains Object.== so
+  // the patch LOADS and Smi==Smi (canonical) is correct.
+  return `--extra-front-end-options=--dynamic-interface=${yaml}`;
+}
+
+/**
+ * Decide whether to pass `--no-tree-shake-icons`. Icon tree-shaking needs the
+ * host `const_finder.dart.snapshot`, which the Sankofa engine bundle currently
+ * doesn't ship — so a clean build fails in IconTreeShaker (`ConstFinder
+ * failure`). Icon tree-shaking only subsets the icon FONT asset; it never
+ * changes the Dart AOT. So we skip it (a) when the caller asks
+ * (`treeShakeIcons:false`, e.g. the auto-diff patch rebuild), or (b)
+ * transparently when const_finder is absent from the bundle — builds then
+ * succeed and the OTA base/patch AOTs stay byte-identical. Once the engine
+ * bundle ships const_finder, tree-shaking re-enables automatically. Returns the
+ * flag (`--no-tree-shake-icons`) or '' .
+ */
+function resolveIconTreeShakeFlag(projectRoot: string, explicit?: boolean): string {
+  if (explicit === false) return '--no-tree-shake-icons';
+  try {
+    const bundled = resolveBundledFlutter(projectRoot);
+    if (bundled?.exists) {
+      const root = dirname(dirname(bundled.bin)); // <root>/bin/flutter → <root>
+      const engArt = join(root, 'bin', 'cache', 'artifacts', 'engine');
+      const present =
+        existsSync(join(engArt, 'darwin-x64', 'const_finder.dart.snapshot')) ||
+        existsSync(join(engArt, 'darwin-arm64', 'const_finder.dart.snapshot'));
+      if (!present) {
+        console.warn(
+          '  ⚠ const_finder not in the Sankofa engine bundle — building with --no-tree-shake-icons ' +
+            '(icon font not subsetted; the OTA AOT is unaffected).',
+        );
+        return '--no-tree-shake-icons';
+      }
+    }
+  } catch {
+    /* couldn't resolve the bundle — let flutter tree-shake and surface its own error */
+  }
+  return '';
 }
 
 /**
@@ -158,6 +237,17 @@ export interface BuildAndExtractResult {
   libflutterPath: string;
   /** Byte size of the libflutter.so we hashed. */
   libflutterSizeBytes: number;
+  /**
+   * Absolute path to the base program kernel (`app.dill`) captured from this
+   * release build, or null if it couldn't be found. This is the no-AOT kernel
+   * the auto-diff patch flow compiles a *changed* app against (`--import-dill`)
+   * so it can diff the rebuilt AOT against the exact base program and ship only
+   * the changed functions (dispatch-funcreg). It's the base half of the
+   * "edit real code → auto-diff → live" pipeline; without it we fall back to
+   * the limited patch-file model. Flutter writes it under
+   * `.dart_tool/flutter_build/<hash>/app.dill` and discards it; we snapshot it.
+   */
+  appDillPath: string | null;
 }
 
 export type FlutterBuildFormat = 'aab' | 'apk';
@@ -251,6 +341,16 @@ export function buildFlutterAOT(
      * `main()` (or fail when there is no `lib/main.dart`).
      */
     target?: string;
+    /**
+     * Icon tree-shaking. Default true (matches `flutter build`). Pass false to
+     * add `--no-tree-shake-icons` — used by the auto-diff patch rebuild, which
+     * only needs the AOT (`libapp.so`). Icon tree-shaking merely subsets the
+     * icon FONT asset; it never changes the Dart AOT, so disabling it leaves the
+     * base↔patch code diff identical while avoiding the `const_finder` host tool
+     * (absent from the Sankofa engine bundle — a clean tree-shake build fails on
+     * it). Not for store artifacts, where the smaller font is worth keeping.
+     */
+    treeShakeIcons?: boolean;
   } = { outputDir: 'build' },
 ): BuildAndExtractResult {
   const cwd = resolve(projectRoot);
@@ -277,7 +377,14 @@ export function buildFlutterAOT(
   // libapp.so we extract come from the same variant.
   const flavorFlag = opts.flavor ? ` --flavor ${opts.flavor}` : '';
   const targetFlag = opts.target ? ` --target "${opts.target}"` : '';
-  const variantFlags = `${defineFlags}${flavorFlag}${targetFlag}`;
+  // Skip icon tree-shaking when the caller asks or when const_finder is absent
+  // from the bundle (AOT is unaffected, so the base↔patch diff is unchanged).
+  const isf = resolveIconTreeShakeFlag(cwd, opts.treeShakeIcons);
+  const iconFlag = isf ? ` ${isf}` : '';
+  // Retain the code-push patchable surface so patches resolve their refs on device.
+  const di = dynamicInterfaceFlag(cwd);
+  const diFlag = di ? ` ${di}` : '';
+  const variantFlags = `${defineFlags}${flavorFlag}${targetFlag}${iconFlag}${diFlag}`;
 
   // Always build the APK (cheap when AAB build is also queued — Flutter
   // shares the build graph). We need it to extract libapp.so +
@@ -361,6 +468,14 @@ export function buildFlutterAOT(
   // assets/flutter_assets/.
   rmSync(join(extractDir, 'lib'), { recursive: true, force: true });
 
+  // Snapshot the base program kernel (`app.dill`) this build produced. It's
+  // the `--import-dill` input the auto-diff patch flow compiles the changed
+  // source against, so `sankofa patch` can diff a rebuilt app vs the exact
+  // base program and ship only the changed functions. Flutter leaves it in
+  // `.dart_tool/flutter_build/<hash>/app.dill` (multiple hashes accumulate
+  // across builds); we take the freshest one — the release build we just ran.
+  const appDillPath = captureBaseAppDill(projectRoot, outputDir, engine.sankofaEngineVersion);
+
   return {
     libappPath: finalLibapp,
     abi: 'arm64-v8a',
@@ -372,7 +487,44 @@ export function buildFlutterAOT(
     libflutterSha256,
     libflutterPath: finalLibflutter,
     libflutterSizeBytes: libflutterSize,
+    appDillPath,
   };
+}
+
+/**
+ * Find the freshest `app.dill` Flutter wrote under
+ * `<projectRoot>/.dart_tool/flutter_build/<hash>/app.dill` and copy it to
+ * `<outputDir>/app.<engineVersion>.dill`. Returns the copied path, or null if
+ * no kernel was found (best-effort — the auto-diff flow degrades gracefully).
+ *
+ * `.dart_tool/flutter_build/` accumulates one directory per build config hash;
+ * the release build we just ran leaves the newest `app.dill`, so we pick by
+ * mtime rather than guessing the hash.
+ */
+function captureBaseAppDill(
+  projectRoot: string,
+  outputDir: string,
+  engineVersion: string,
+): string | null {
+  try {
+    const fbRoot = join(projectRoot, '.dart_tool', 'flutter_build');
+    if (!existsSync(fbRoot)) return null;
+    let newest: { path: string; mtime: number } | null = null;
+    for (const entry of readdirSync(fbRoot)) {
+      const cand = join(fbRoot, entry, 'app.dill');
+      if (!existsSync(cand)) continue;
+      const mtime = statSync(cand).mtimeMs;
+      if (!newest || mtime > newest.mtime) newest = { path: cand, mtime };
+    }
+    if (!newest) return null;
+    const finalDill = join(outputDir, `app.${engineVersion}.dill`);
+    if (existsSync(finalDill)) rmSync(finalDill, { force: true });
+    copyFileSync(newest.path, finalDill);
+    return finalDill;
+  } catch {
+    // Best-effort: a missing base kernel just forces the patch-file fallback.
+    return null;
+  }
 }
 
 export interface BuildIpaResult {
@@ -384,6 +536,21 @@ export interface BuildIpaResult {
   appVersion: string;
   /** Engine info captured at build time. */
   engine: FlutterEngineInfo;
+  /**
+   * Absolute path to the base program AOT snapshot (the `App` Mach-O inside
+   * `App.framework`), copied out of the archive, or null if not found. This is
+   * the iOS equivalent of Android's `libapp.so` — the base half of the auto-diff
+   * pipeline: `sankofa patch` runs `analyze_snapshot` on it and the rebuilt
+   * patch AOT to compute the changed-function set (dispatch-funcreg). Stored so
+   * a later patch can diff against the exact base program.
+   */
+  baseAotPath: string | null;
+  /**
+   * Absolute path to the base program kernel (`app.dill`) captured from this
+   * build, or null. The `--import-dill` input the auto-diff patch compiles the
+   * changed source against. See BuildAndExtractResult.appDillPath.
+   */
+  appDillPath: string | null;
 }
 
 /**
@@ -415,6 +582,8 @@ export function buildFlutterIPA(
     codesign?: boolean;
     /** Path to an ExportOptions.plist forwarded to `flutter build ipa`. */
     exportOptionsPlist?: string;
+    /** Icon tree-shaking (default true). false → `--no-tree-shake-icons`; see buildFlutterAOT. */
+    treeShakeIcons?: boolean;
     verbose?: boolean;
   } = {},
 ): BuildIpaResult {
@@ -424,6 +593,11 @@ export function buildFlutterIPA(
 
   const flags = ['build', 'ipa', '--release'];
   if (opts.codesign === false) flags.push('--no-codesign');
+  const isf = resolveIconTreeShakeFlag(cwd, opts.treeShakeIcons);
+  if (isf) flags.push(isf);
+  // Retain the code-push patchable surface so patches resolve their refs on device.
+  const di = dynamicInterfaceFlag(cwd);
+  if (di) flags.push(di);
   if (opts.flavor) flags.push(`--flavor ${opts.flavor}`);
   if (opts.target) flags.push(`--target "${opts.target}"`);
   const iosDefines = [...(opts.dartDefines ?? [])];
@@ -443,7 +617,55 @@ export function buildFlutterIPA(
 
   const ipaPath = findIpa(join(cwd, 'build', 'ios', 'ipa'));
   const xcarchivePath = findXcarchive(join(cwd, 'build', 'ios', 'archive'));
-  return { ipaPath, xcarchivePath, appVersion, engine };
+
+  // Capture the base AOT (App.framework/App Mach-O) + kernel (app.dill) so a
+  // later `sankofa patch` can auto-diff the rebuilt app against this exact base
+  // program and ship only the changed functions (dispatch-funcreg) — no patch
+  // file. Best-effort: absence forces the limited patch-file fallback.
+  const outDir = join(cwd, 'build', 'ios', 'sankofa');
+  mkdirSync(outDir, { recursive: true });
+  const baseAotPath = captureIosBaseAot(cwd, xcarchivePath, outDir, engine.sankofaEngineVersion);
+  const appDillPath = captureBaseAppDill(cwd, outDir, engine.sankofaEngineVersion);
+  return { ipaPath, xcarchivePath, appVersion, engine, baseAotPath, appDillPath };
+}
+
+/**
+ * Locate the base program AOT — the `App` Mach-O inside `App.framework` — from
+ * an iOS release build and copy it to `<outDir>/App.<engineVersion>.aot`.
+ * Returns the copied path, or null if not found (best-effort).
+ *
+ * The archive is the reliable source: `<xcarchive>/Products/Applications/
+ * <name>.app/Frameworks/App.framework/App`. Falls back to the intermediate
+ * `build/ios/Release-iphoneos/App.framework/App` (present pre-archive/export).
+ */
+function captureIosBaseAot(
+  cwd: string,
+  xcarchivePath: string | null,
+  outDir: string,
+  engineVersion: string,
+): string | null {
+  try {
+    const candidates: string[] = [];
+    if (xcarchivePath) {
+      const appsDir = join(xcarchivePath, 'Products', 'Applications');
+      if (existsSync(appsDir)) {
+        for (const app of readdirSync(appsDir)) {
+          if (app.endsWith('.app')) {
+            candidates.push(join(appsDir, app, 'Frameworks', 'App.framework', 'App'));
+          }
+        }
+      }
+    }
+    candidates.push(join(cwd, 'build', 'ios', 'Release-iphoneos', 'App.framework', 'App'));
+    const src = candidates.find((c) => existsSync(c));
+    if (!src) return null;
+    const dest = join(outDir, `App.${engineVersion}.aot`);
+    if (existsSync(dest)) rmSync(dest, { force: true });
+    copyFileSync(src, dest);
+    return dest;
+  } catch {
+    return null;
+  }
 }
 
 function findIpa(dir: string): string | null {
