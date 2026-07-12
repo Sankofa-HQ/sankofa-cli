@@ -70,9 +70,9 @@ The command-line tool for [Sankofa](https://sankofa.dev) — **OTA updates** for
 
 | Command | Purpose |
 |---|---|
-| `sankofa login` | Browser-based auth; creates a Deploy Token for the selected project and persists a session JWT for later `switch`es. |
+| `sankofa login` | Browser-based sign-in for the selected project. |
 | `sankofa logout` | Remove stored credentials (project-scoped, global, or both). |
-| `sankofa switch` | Switch to a different project on the same server. Reuses the stored JWT — no browser round-trip. |
+| `sankofa switch` | Switch to a different project on the same server — no browser round-trip. |
 
 ### Deploy (Flutter + React Native)
 
@@ -246,38 +246,28 @@ sankofa check
 
 ## Authentication & config
 
-> **Two different config files — don't confuse them:**
-> - **`.sankofa.json`** / `~/.sankofa/credentials.json` — **CLI credentials** (deploy token, endpoint, project id). Written by `sankofa login`. Covered here.
-> - **`sankofa.yaml`** — the **Flutter project's** deploy keys (`api_key`, `app_id`, `endpoint`) read by the Flutter SDK + `sankofa release`/`patch`. Written by `sankofa init --deploy`. Flutter-only.
+There are two kinds of config — don't confuse them:
 
-Credentials live in two places:
+- **CLI credentials** — how the `sankofa` CLI authenticates to your account. Created by `sankofa login` and cached locally; you never edit them by hand.
+- **`sankofa.yaml`** — your **Flutter project's** Sankofa keys (`app_id`, `api_key`, `endpoint`), read by the Flutter SDK and by `sankofa release`/`patch`. Created by `sankofa init --deploy`. Flutter-only.
 
-| File | Scope | Populated by |
-|---|---|---|
-| `~/.sankofa/credentials.json` | Global (any cwd) | `sankofa login` (default) |
-| `<project>/.sankofa.json`     | Per-project | `sankofa login --project` |
+### Log in
 
-Both can contain:
-
-```json
-{
-  "token": "sk_deploy_…",
-  "authType": "deploy_token",
-  "apiKey": "sk_deploy_…",
-  "endpoint": "https://api.sankofa.dev",
-  "projectId": "proj_…",
-  "environment": "live",
-  "sessionJwt": "<short-lived JWT from browser login>"
-}
+```bash
+sankofa login              # opens a browser, authenticates, caches credentials locally
+sankofa login --project    # scope this login to the current project
 ```
 
-Resolution order (highest wins):
+### CI / headless
 
-1. Environment variables (`SANKOFA_DEPLOY_TOKEN`, `SANKOFA_ENDPOINT`, `SANKOFA_PROJECT_ID`, `SANKOFA_ENVIRONMENT`).
-2. `.sankofa.json` found by walking up from `cwd`.
-3. `~/.sankofa/credentials.json`.
+Create a **Deploy Token** in your Sankofa dashboard and pass it as an environment variable — no browser needed:
 
-**Deploy Tokens are project-scoped** on the server. Switching projects mints a new token. `sessionJwt` is persisted so `sankofa switch` doesn't need another browser round-trip until it expires.
+```bash
+export SANKOFA_DEPLOY_TOKEN=…        # from your dashboard (Project → Settings)
+sankofa release android --publish
+```
+
+Credentials resolve in this order: environment variables → project login → global login. Deploy Tokens are project-scoped, so switching projects re-authenticates.
 
 ---
 
@@ -383,12 +373,12 @@ sankofa login --endpoint https://sankofa.your-company.com     # self-hosted
 
 ```bash
 sankofa logout             # removes BOTH scopes (default)
-sankofa logout --project   # only ./.sankofa.json  (also clears token+projectId from the global file)
-sankofa logout --global    # only ~/.sankofa/credentials.json
+sankofa logout --project   # clear the project-scoped login only
+sankofa logout --global    # clear the global (account) login only
 sankofa logout --all       # explicit alias for the default; safe to use in scripts
 ```
 
-- `--project` intentionally also strips `token`, `projectId`, and `environment` from the global file. Keeping a project-scoped token without a project id would silently reuse the old project on the next command. `sessionJwt` is left intact so a follow-up `switch` stays frictionless.
+- `--project` also clears the account token + project selection so the next command doesn't silently reuse the old project. Your browser sign-in is left intact so a follow-up `switch` stays frictionless.
 - A reminder prints about `SANKOFA_DEPLOY_TOKEN` / `SANKOFA_API_KEY` env vars — those still authenticate the CLI until you unset them in your shell.
 
 ### `switch`
@@ -397,7 +387,7 @@ sankofa logout --all       # explicit alias for the default; safe to use in scri
 sankofa switch
 ```
 
-Uses the stored `sessionJwt` to `GET /api/auth/me`, lists your orgs + projects, prompts, mints a new Deploy Token for the selection, saves it. Falls back to the full browser login flow when the JWT is missing or expired. No args.
+Reuses your account sign-in to list your orgs + projects, prompts, and switches to the selection. Falls back to a full browser login when your sign-in has expired. No args.
 
 ### `status`
 
@@ -776,7 +766,7 @@ Use `--publish` to skip confirmation prompts in non-interactive shells. `--rollo
 ## Troubleshooting
 
 **"You are not logged in."** *(all platforms)*  
-Run `sankofa login`. If you're sure you have a token, check `echo $SANKOFA_DEPLOY_TOKEN` and `cat ~/.sankofa/credentials.json`.
+Run `sankofa login`. If you're using a Deploy Token in CI, check that `$SANKOFA_DEPLOY_TOKEN` is set.
 
 ### Flutter
 
