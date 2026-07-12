@@ -3,6 +3,22 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.13 — docs: stop publishing credential-storage internals
+
+### Changed
+- The public README no longer documents on-disk credential paths, the credential
+  JSON schema, session/JWT auth mechanics, or the patch-signing private-key path.
+  Auth docs are now task-oriented (`sankofa login` + Deploy Token for CI). Keeps
+  the "safe to commit vs protect" guidance.
+- Stopped shipping a stray `.bak` in the published tarball (`*.bak` ignored).
+
+## 0.1.12 — Flutter auto-diff code-push
+
+### Added
+- Flutter auto-diff `sankofa patch`: edit real Dart, ship only changed functions.
+- Base built with `--dynamic-interface` so patches resolve `dart:core` members.
+- Default engine `3.44.1+sankofa-2`, honoring the project's `sankofa.yaml` pin.
+
 ## 0.1.11 — clean, customer-facing output (no implementation jargon)
 
 ### Changed
