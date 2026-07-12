@@ -464,6 +464,15 @@ async function runFlutterPatch(
       } else if (baseReleases.length === 1) {
         selectedRelease = baseReleases[0];
         console.log(chalk.dim(`  Patching against ${selectedRelease.label} (target ${selectedRelease.target_binary_version})`));
+      } else if (!process.stdin.isTTY) {
+        // Finding 3: multiple baselines + a non-interactive shell (CI / scripted /
+        // piped stdin) can't show the picker. inquirer would crash with a raw
+        // `ERR_USE_AFTER_CLOSE: readline was closed`. Fail with an actionable error.
+        spinner.stop?.();
+        console.error(chalk.red(`  ✖ ${baseReleases.length} baseline releases exist and no --release was given.`));
+        console.error(chalk.dim(`     This shell is non-interactive, so the picker can't run.`));
+        console.error(chalk.dim(`     Re-run with ${chalk.cyan('--release <label|id>')}. Available: ${baseReleases.map((r: any) => r.label).join(', ')}`));
+        process.exit(1);
       } else {
         const answer = await inquirer.prompt([
           {

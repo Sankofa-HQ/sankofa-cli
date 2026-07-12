@@ -155,6 +155,39 @@ function warmDartSdkCache(root: string, onProgress?: (msg: string) => void): voi
 }
 
 /**
+ * Best-effort drift check for Finding 1: does the on-disk bundle pin a different
+ * engine rev than the manifest currently maps this label to? The bundle records
+ * its rev at `bin/internal/engine.version`; the manifest's `engine_rev` is the
+ * authoritative rev for the label. Returns {cached, expected} (12-char) when they
+ * disagree, else null. Fails OPEN (returns null) when either side can't be read —
+ * a network blip or an unforked bundle must never block a release; the release's
+ * own engine-identity guard is the real backstop.
+ */
+function bundleRevDriftsFromManifest(
+  root: string,
+  sankofaEngineVersion: string,
+): { cached: string; expected: string } | null {
+  let cached: string;
+  try {
+    cached = readFileSync(join(root, 'bin', 'internal', 'engine.version'), 'utf-8').trim();
+  } catch {
+    return null; // no local rev to compare — leave the reuse decision alone
+  }
+  if (!cached) return null;
+  let expected: string | undefined;
+  try {
+    const url = `${SANKOFA_STORAGE_BASE_URL}/engines/sankofa/by-version/${encodeURIComponent(sankofaEngineVersion)}.json?cb=${Date.now()}`;
+    expected = (JSON.parse(httpGetText(url, 15)) as { engine_rev?: string }).engine_rev;
+  } catch {
+    return null; // manifest unreachable — fail open, keep the cache
+  }
+  if (expected && expected !== cached) {
+    return { cached: cached.slice(0, 12), expected: expected.slice(0, 12) };
+  }
+  return null;
+}
+
+/**
  * Remove every artifact the dart-sdk download writes, so the next warm-up
  * fully redownloads instead of trusting a stale stamp.
  */
@@ -196,12 +229,27 @@ export function installBundledFlutter(
   const info = bundledFlutterInfo(sankofaEngineVersion);
 
   if (reuse && info.exists) {
-    opts.onProgress?.(`Bundled flutter already present at ${info.root}`);
-    // Even on a cache hit, force the dart-sdk warm-up if the previous
-    // run's bootstrap didn't complete (interrupted download, manual
-    // cleanup, etc). Idempotent: no-op when dart-sdk is already usable.
-    warmDartSdkCache(info.root, opts.onProgress);
-    return info;
+    // Finding 1: the bundle is cached by LABEL, but an in-place engine roll
+    // repoints that label to a NEW rev. Blindly reusing the stale bundle builds
+    // the OLD libflutter → the release engine-identity guard then hard-refuses
+    // ("not a known Sankofa engine"). Detect cached-rev ≠ manifest-rev drift and
+    // re-fetch instead of trusting the label. Fail-open: a network hiccup keeps
+    // the cache (the identity guard is the real backstop).
+    const drift = bundleRevDriftsFromManifest(info.root, sankofaEngineVersion);
+    if (drift) {
+      opts.onProgress?.(
+        `Cached bundle is stale (pins ${drift.cached}, manifest now ${drift.expected}) — re-fetching ${sankofaEngineVersion}`,
+      );
+      try { rmSync(info.root, { recursive: true, force: true }); } catch { /* reinstall below */ }
+      // fall through to a fresh install
+    } else {
+      opts.onProgress?.(`Bundled flutter already present at ${info.root}`);
+      // Even on a cache hit, force the dart-sdk warm-up if the previous
+      // run's bootstrap didn't complete (interrupted download, manual
+      // cleanup, etc). Idempotent: no-op when dart-sdk is already usable.
+      warmDartSdkCache(info.root, opts.onProgress);
+      return info;
+    }
   }
 
   const root = info.root;
@@ -466,7 +514,60 @@ function installFromTarball(
   } finally {
     try { unlinkSync(tarPath); } catch { /* ignore */ }
   }
+  ensureBundleGitRepo(root, version, onProgress);
   return `tarball:${manifest.sdk_url}`;
+}
+
+/**
+ * Finding (dogfood 2026-07-12): the Sankofa Flutter tool refuses to run — and
+ * therefore never bootstraps its dart-sdk — unless FLUTTER_ROOT is a git repo
+ * with a resolvable HEAD. See flutter's `bin/internal/shared.sh`:
+ *
+ *     if [[ ! -e "$FLUTTER_ROOT/.git" ]]; then
+ *       Error: The Flutter directory is not a clone of the GitHub project.
+ *
+ * A tarball is a plain extraction with no `.git`, so a bundle installed from a
+ * `.git`-less tarball is permanently un-runnable: the dart-sdk never downloads,
+ * `gen_kernel`/`dartaotruntime` are absent, `base_noaot.dill` never captures, and
+ * `sankofa release` silently falls back to the customer's vanilla Flutter (whose
+ * engine fails the identity guard). Some engine tarballs DO ship `.git` and some
+ * don't — rather than depend on that, reconstruct a minimal repo (empty commit +
+ * version tag) so the tool is always satisfied. Idempotent: a tarball that
+ * already shipped `.git` is left untouched.
+ */
+function ensureBundleGitRepo(root: string, version: string, onProgress?: (msg: string) => void): void {
+  if (existsSync(join(root, '.git'))) return;
+  if (!hasCmd('git')) {
+    onProgress?.('git not found — flutter cannot bootstrap without it; install git and re-run.');
+    return;
+  }
+  const fv = version.split('+')[0];
+  onProgress?.('Reconstructing bundle git metadata (tarball shipped no .git)…');
+  const q = shellQuote(root);
+  try {
+    execSync(`git -C ${q} init -q`, { stdio: 'ignore' });
+    // CRITICAL: `bin/internal/engine.version` must be a TRACKED file. The fork's
+    // update_engine_version.sh uses the pinned engine.version ONLY when
+    // `git ls-files bin/internal/engine.version` is non-empty; otherwise it falls
+    // back to a content-aware hash of the tree — which, on a freshly-init'd repo,
+    // resolves to the wrong engine and misdirects the gradle Maven lookup (the
+    // build then pulls the wrong/no engine and the identity guard refuses). An
+    // empty commit is NOT enough; the pin file has to be committed.
+    execSync(`git -C ${q} add -f bin/internal/engine.version`, { stdio: 'ignore' });
+    execSync(
+      `git -C ${q} -c user.email=deploy@sankofa.dev -c user.name=Sankofa commit -qm ${shellQuote('sankofa bundle ' + version)}`,
+      { stdio: 'ignore' },
+    );
+    // flutter derives its framework version from `git describe`; a depth-1
+    // tarball has no tags, so stamp the Flutter version like the clone path does.
+    if (/^\d+\.\d+\.\d+$/.test(fv)) {
+      execSync(`git -C ${q} tag -f ${shellQuote(fv)}`, { stdio: 'ignore' });
+    }
+  } catch (err: any) {
+    // Non-fatal here — warmDartSdkCache surfaces a clear, actionable error if the
+    // tool still can't run.
+    onProgress?.(`bundle git init failed (${err?.message ?? err}) — flutter may refuse to bootstrap`);
+  }
 }
 
 function shellQuote(s: string): string {

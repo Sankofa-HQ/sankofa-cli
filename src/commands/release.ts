@@ -522,13 +522,34 @@ export const releaseCommand = new Command('release')
  * succeeds (real-code patches then need a re-release on this machine).
  */
 function produceBaseNoAotKernel(projectRoot: string, targetOpt: string | undefined): string | null {
+  const appEntry = resolve(projectRoot, targetOpt || 'lib/main.dart');
+  const packageConfig = resolve(projectRoot, '.dart_tool', 'package_config.json');
+  // Loud-but-non-fatal: the release still succeeds, but WITHOUT base_noaot.dill a
+  // real-code `sankofa patch` will refuse ("base captured without its program
+  // kernel"). Silently returning null here was Finding 4 — a broken base shipped
+  // with no signal. Always tell the user why + how to recover.
+  if (!fs.existsSync(appEntry) || !fs.existsSync(packageConfig)) {
+    const why = !fs.existsSync(appEntry)
+      ? `entrypoint not found: ${appEntry}`
+      : `.dart_tool/package_config.json missing — run \`flutter pub get\` first`;
+    console.warn(
+      `\n  ⚠  Auto-diff base kernel SKIPPED (${why}).\n` +
+      `     This release ships WITHOUT base_noaot.dill, so real-code \`sankofa patch\`\n` +
+      `     will refuse until you re-release once this is resolved.\n`,
+    );
+    return null;
+  }
+  const out = resolve(projectRoot, '.sankofa', 'build', 'base_noaot.dill');
   try {
-    const appEntry = resolve(projectRoot, targetOpt || 'lib/main.dart');
-    const packageConfig = resolve(projectRoot, '.dart_tool', 'package_config.json');
-    if (!fs.existsSync(appEntry) || !fs.existsSync(packageConfig)) return null;
-    const out = resolve(projectRoot, '.sankofa', 'build', 'base_noaot.dill');
     return captureBaseNoAotKernel({ projectRoot, appEntry, packageConfig, outputPath: out });
-  } catch {
+  } catch (err: any) {
+    console.warn(
+      `\n  ⚠  Auto-diff base kernel capture FAILED — this release ships WITHOUT\n` +
+      `     base_noaot.dill, so real-code \`sankofa patch\` will refuse until you re-release.\n` +
+      `     Reason: ${err?.message || err}\n` +
+      `     (Most often the bundled Flutter dart-sdk tools weren't provisioned —\n` +
+      `      re-run the release, or reinstall the engine bundle, then retry.)\n`,
+    );
     return null;
   }
 }
