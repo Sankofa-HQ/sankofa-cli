@@ -201,7 +201,7 @@ sankofa patch ios                      # App Store compliant
 - `lib/main.dart`: initializes Sankofa in your `main()`.
 - Android (`AndroidManifest.xml`, `MainActivity.kt`) + iOS (`AppDelegate.swift`, `Info.plist`): the native wiring + your `app_id` / endpoint.
 
-You write your patch code in `lib/sankofa_patch.dart`; `sankofa patch` ships it.
+You just edit your real Dart code — `sankofa patch` rebuilds, diffs against the base, and ships only the functions that changed. No separate patch file to maintain.
 
 ### React Native (Analytics + Deploy)
 
@@ -447,7 +447,7 @@ sankofa release android --preview-artifact
 - `--ios-export-method <app-store|ad-hoc|development|enterprise>` — default `app-store`.
 - `--ios-team-id <TEAMID>` — auto-detected from the archive when omitted.
 - `--ios-export-options <path>` — a hand-rolled `ExportOptions.plist` (overrides `--ios-export-method` / `--ios-team-id`).
-- `--android-format <aab|apk>` — default `aab` (Play Store). `apk` for sideload/legacy.
+- `--android-format <aab|apk>` — default `aab` (Play Store). `apk` for sideload / internal distribution.
 
 **Flutter options**
 
@@ -471,7 +471,7 @@ The CLI errors out (by design — OTA is immutable once published) and prints th
 
 ### `patch`
 
-Ship a **code-only** update against an existing base release — no native rebuild. **Flutter** ships a signed code patch built from `lib/sankofa_patch.dart`; **React Native** bundles JS + assets. Both apply on the next launch and are App Store + Play Store compliant.
+Ship a **code-only** update against an existing base release — no native rebuild. **Flutter** rebuilds your app, diffs it against the base, and ships only the Dart functions that changed — you just edit your real code, no patch file. **React Native** bundles JS + assets. Both apply on the next launch and are App Store + Play Store compliant.
 
 ```bash
 sankofa patch android                                  # Flutter or RN — auto-detected
@@ -488,9 +488,9 @@ sankofa patch ios -t lib/patch_staging.dart            # pick a specific patch e
 
 - `--output-dir <dir>`, `--description <desc>`, `--mandatory`, `--rollout <percent>`, `--publish`, `--env <env>`, `--project <path>` — same semantics as `release`.
 - `--release <label>` — target base release (otherwise you're prompted to pick).
-- `-t, --target <file>` — **Flutter**: the patch entry-point to compile (default `lib/sankofa_patch.dart`). Use it when you keep several patch entries and want to ship one. `--entry-file` is an alias. (For React Native, `--entry-file` is the JS entry.)
+- `-t, --target <file>` — **Flutter**: the app entry-point to rebuild + diff (default `lib/main.dart`). Pass your flavored main (e.g. `lib/main_prod.dart`) when you use flavors. `--entry-file` is an alias. (For React Native, `--entry-file` is the JS entry.)
 
-`patch` prompts you to pick the base release it targets (unless `--release`). Labels are auto-generated as `<base>-patch.<n>` where `<n>` is the next integer. A Flutter patch ships Dart code changes from your patch entry-point — adding a brand-new asset or native dependency needs a new `sankofa release`.
+`patch` prompts you to pick the base release it targets (unless `--release`). Labels are auto-generated as `<base>-patch.<n>` where `<n>` is the next integer. A Flutter patch ships the Dart changes Sankofa detects by diffing your rebuilt app against the base — adding a brand-new asset or native dependency needs a new `sankofa release`.
 
 ### `preview`
 
