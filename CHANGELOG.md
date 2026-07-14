@@ -3,6 +3,28 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.14 — Flutter engine-bundle robustness
+
+### Fixed
+- **Stale bundle after an engine roll**: on a cache hit the bundler now compares
+  the cached bundle's `bin/internal/engine.version` against the manifest's
+  `engine_rev` and re-fetches on drift (fail-open — a network blip keeps the
+  cache; the release engine-identity guard is the backstop). Previously a bundle
+  cached by label was reused even after the label pointed at a new engine.
+- **Tarball bundles that ship no `.git`**: `flutter` refuses to run (and never
+  bootstraps its dart-sdk) unless `FLUTTER_ROOT` is a git repo with a tracked
+  `bin/internal/engine.version`. The tarball installer now reconstructs a minimal
+  git repo (commit that tracks `engine.version` + a version tag) so the bundle is
+  always runnable — otherwise `base_noaot.dill` never captures and real-code
+  `sankofa patch` silently can't work.
+- **`sankofa patch` in a non-interactive shell** with multiple baselines and no
+  `--release`: now errors with an actionable message instead of crashing with a
+  raw `ERR_USE_AFTER_CLOSE: readline was closed`.
+- **Silent base-kernel capture failure**: `sankofa release` no longer swallows a
+  failed `base_noaot.dill` capture — it prints a loud warning explaining the
+  release shipped without it and that real-code patches will refuse until a
+  re-release.
+
 ## 0.1.13 — docs: stop publishing credential-storage internals
 
 ### Changed

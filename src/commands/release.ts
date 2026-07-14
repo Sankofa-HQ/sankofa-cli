@@ -243,6 +243,13 @@ export const releaseCommand = new Command('release')
 
     // 7. Confirm publish
     let shouldPublish = opts.publish;
+    if (!shouldPublish && !process.stdin.isTTY) {
+      // Finding 7: non-interactive shell can't answer the prompt (inquirer would
+      // crash with ERR_USE_AFTER_CLOSE). Fail with an actionable message.
+      console.error(chalk.red('  ✖ Non-interactive shell: cannot prompt to publish.'));
+      console.error(chalk.dim(`     Re-run with ${chalk.cyan('--publish')} to publish ${label} without prompting.`));
+      process.exit(1);
+    }
     if (!shouldPublish) {
       const inquirer = (await import('inquirer')).default;
       const { confirm } = await inquirer.prompt([
@@ -809,6 +816,14 @@ export async function flutterRelease(
 
   // 5. Confirm publish.
   let shouldPublish = opts.publish;
+  if (!shouldPublish && !process.stdin.isTTY) {
+    // Finding 7: a non-interactive shell (CI / scripted / piped stdin) can't
+    // answer the confirm prompt; inquirer crashes with a raw
+    // `ERR_USE_AFTER_CLOSE: readline was closed`. Fail with an actionable error.
+    console.error(chalk.red('  ✖ Non-interactive shell: cannot prompt to publish.'));
+    console.error(chalk.dim(`     Re-run with ${chalk.cyan('--publish')} to publish ${label} without prompting.`));
+    process.exit(1);
+  }
   if (!shouldPublish) {
     const { confirm } = await inquirer.prompt([
       {
@@ -1089,6 +1104,12 @@ async function flutterReleaseIOS(
 
   // 5. Confirm.
   let shouldPublish = opts.publish;
+  if (!shouldPublish && !process.stdin.isTTY) {
+    // Finding 7: non-interactive shell can't answer the prompt.
+    console.error(chalk.red('  ✖ Non-interactive shell: cannot prompt to publish.'));
+    console.error(chalk.dim(`     Re-run with ${chalk.cyan('--publish')} to register ${label} without prompting.`));
+    process.exit(1);
+  }
   if (!shouldPublish) {
     const { confirm } = await inquirer.prompt([
       {
