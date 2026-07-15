@@ -566,6 +566,38 @@ function shellQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+/** The vendored-trampoline override, written as the first child of the block. */
+const SANKOFA_OVERRIDES_ENTRIES =
+  `  # Sankofa-managed — do not edit by hand. Re-run \`sankofa init\` to regenerate.\n` +
+  `  dynamic_modules:\n` +
+  `    path: .sankofa/dynamic_modules\n`;
+
+/**
+ * TEMPORARY (2026-07-15) — Android build fix, remove when the engine catches up.
+ *
+ * shared_preferences_android 2.4.24+ migrated to Flutter's "Built-in Kotlin":
+ * its android/build.gradle.kts declares only `com.android.library` and then
+ * calls `kotlin { compilerOptions { … } }`, expecting the Flutter Gradle plugin
+ * to apply KGP for it. Flutter 3.44.1's tooling doesn't apply it in time for
+ * that script's compilation, so a FRESH `pub get` (which resolves the newest
+ * plugin) fails the Android build with:
+ *   Unresolved reference: compilerOptions / jvmTarget
+ * A warm machine never sees it — its pub-cache still holds 2.4.23, which
+ * applies `kotlin-android` itself.
+ *
+ * This is upstream drift, not a Sankofa divergence: our Android template comes
+ * from upstream 3.44.1 untouched, so stock Flutter 3.44.1 fails identically.
+ * DROP THIS PIN when the engine moves to a stable whose tooling applies KGP to
+ * plugin projects (verify with scripts/ship/pristine-rehearsal.sh, which is the
+ * only harness that can see this class of bug).
+ */
+const SANKOFA_ANDROID_PLUGIN_PIN =
+  `  # Sankofa-managed, TEMPORARY: 2.4.24+ needs Flutter's Built-in Kotlin, which\n` +
+  `  # the current Sankofa engine doesn't apply to plugin projects yet (the\n` +
+  `  # Android build fails with "Unresolved reference: compilerOptions").\n` +
+  `  # Safe to remove once your engine is on a newer Flutter stable.\n` +
+  `  shared_preferences_android: 2.4.23\n`;
+
 async function tryAddSankofaFlutterToPubspec(pubspecPath: string, chalk: any): Promise<boolean> {
   try {
     let text = readFileSync(pubspecPath, 'utf-8');
@@ -604,11 +636,7 @@ async function tryAddSankofaFlutterToPubspec(pubspecPath: string, chalk: any): P
       // Merge: insert our entry as the first child of the existing block.
       text = text.replace(
         overridesHeaderRe,
-        (header) =>
-          header +
-          `  # Sankofa-managed — do not edit by hand. Re-run \`sankofa init\` to regenerate.\n` +
-          `  dynamic_modules:\n` +
-          `    path: .sankofa/dynamic_modules\n`,
+        (header) => header + SANKOFA_OVERRIDES_ENTRIES,
       );
       touched = true;
       console.log(chalk.green('     ✓ Merged dynamic_modules into existing dependency_overrides'));
@@ -618,12 +646,24 @@ async function tryAddSankofaFlutterToPubspec(pubspecPath: string, chalk: any): P
         `\n# Sankofa-managed — do not edit by hand. Re-run \`sankofa init\` if\n` +
         `# you need to regenerate the vendored package.\n` +
         `dependency_overrides:\n` +
-        `  dynamic_modules:\n` +
-        `    path: .sankofa/dynamic_modules\n`;
+        SANKOFA_OVERRIDES_ENTRIES;
       if (!text.endsWith('\n')) text += '\n';
       text += block;
       touched = true;
       console.log(chalk.green('     ✓ Wired dependency_overrides → .sankofa/dynamic_modules'));
+    }
+
+    // The Android plugin pin is independent of the trampoline entry: a project
+    // wired before this pin existed still needs it.
+    if (!/^[ \t]+shared_preferences_android:/m.test(text) && overridesHeaderRe.test(text)) {
+      text = text.replace(
+        overridesHeaderRe,
+        (header) => header + SANKOFA_ANDROID_PLUGIN_PIN,
+      );
+      touched = true;
+      console.log(
+        chalk.green('     ✓ Pinned shared_preferences_android (Android Built-in Kotlin workaround)'),
+      );
     }
 
     // ── 3. Ensure sankofa.yaml is in flutter.assets ──

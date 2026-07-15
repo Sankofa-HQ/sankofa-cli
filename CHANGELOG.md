@@ -3,6 +3,25 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.15 — Android: unblock fresh installs (Built-in Kotlin pin)
+
+### Fixed
+- **A fresh `pub get` broke the Android build.** `shared_preferences_android`
+  2.4.24+ migrated to Flutter's Built-in Kotlin: its `android/build.gradle.kts`
+  declares only `com.android.library` and then calls
+  `kotlin { compilerOptions { … } }`, expecting the Flutter Gradle plugin to
+  apply KGP on its behalf. The engine's Flutter 3.44.1 tooling doesn't apply it
+  in time for that script's compilation, so a NEW project failed with
+  `Unresolved reference: compilerOptions / jvmTarget`. Existing machines were
+  immune only because their pub-cache still held 2.4.23, which applies
+  `kotlin-android` itself — so this hit new users exclusively.
+  `sankofa init` now pins `shared_preferences_android: 2.4.23` in
+  `dependency_overrides` (merged into any existing block, never a duplicate
+  key), with inline notes on why and when to remove it. This is upstream drift,
+  not a Sankofa divergence — our Android template is upstream 3.44.1's,
+  untouched, so stock Flutter 3.44.1 fails identically. Drop the pin once the
+  engine tracks a newer stable.
+
 ## 0.1.14 — Flutter engine-bundle robustness + fresh-machine patching
 
 ### Added
