@@ -419,6 +419,33 @@ export function resolveBundledFlutter(
 }
 
 /**
+ * Ensure <projectRoot>/sankofa.yaml carries the project's pinned
+ * `engine_version` BEFORE `flutter build` packs the yaml into the asset
+ * bundle. The SDK reads the key at runtime to report engine identity on
+ * `/api/deploy/check`; historically only `sankofa engine install /
+ * upgrade` wrote it, so a project pinned via .sankofa/flutter-version
+ * shipped a yaml without it. No-op when the yaml already has the key,
+ * when nothing pins a version, or when the yaml doesn't exist.
+ */
+export function ensureEngineVersionStampedInYaml(projectRoot: string): void {
+  const yamlPath = join(projectRoot, 'sankofa.yaml');
+  if (!existsSync(yamlPath)) return;
+  const version = resolvePinnedEngineVersion(projectRoot);
+  if (!version) return;
+  try {
+    const text = readFileSync(yamlPath, 'utf-8');
+    if (/^\s*engine_version:/m.test(text)) return;
+    writeFileSync(
+      yamlPath,
+      `${text.replace(/\n*$/, '\n')}engine_version: ${version}\n`,
+    );
+    console.log(`  sankofa.yaml: stamped engine_version ${version}`);
+  } catch {
+    // Best-effort — an unreadable/read-only yaml must not break the build.
+  }
+}
+
+/**
  * Download + verify + unpack the SDK tarball for `version` into `root`.
  * Returns a provenance string on success; throws when the manifest has
  * no sdk_url (pre-tarball release) or any download/verify step fails.

@@ -3,9 +3,37 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
-## 0.1.14 — Flutter engine-bundle robustness
+## 0.1.14 — Flutter engine-bundle robustness + fresh-machine patching
+
+### Added
+- **`sankofa patch` now works on any machine** — the changed-function extractor
+  is compiled on first use with the bundled engine's own `dart compile
+  aot-snapshot` (analyzer resolved from the bundle's flutter_tools
+  package_config), so the snapshot is version-coherent with `dartaotruntime` by
+  construction. One-time ~10s per engine version, cached inside the bundle,
+  keyed on the extractor-source hash so a CLI upgrade can never reuse a stale
+  snapshot. Previously the CLI-shipped snapshot only ran when its Dart snapshot
+  format happened to match the customer's engine — otherwise patching required
+  an internal dev checkout.
+- **Patches can use the app's own types.** The generated patch unit now
+  self-imports each source file by its `package:` URI, so a lifted method body
+  can reference the classes and top-level functions its own library declares
+  (previously: `Error: Type 'Summary' not found` — only core/Flutter types
+  worked).
+- **`sankofa init` scaffolds `sankofa_dynamic_interface.yaml`** (the app's
+  patchable surface) and **stamps `engine_version` into `sankofa.yaml`**;
+  every Flutter build path stamps it too before assets are packed. Builds now
+  actually pass `--dynamic-interface`, and the SDK can report engine identity
+  at runtime.
+- **Patchable-seam diagnostic.** A changed method that uses `this` or calls a
+  sibling method now fails `sankofa patch` with an error naming the method and
+  the offending construct — instead of a CFE error pointing at a generated
+  temp file the customer never wrote.
 
 ### Fixed
+- **`--dry-run` honors `--release <label>`** — it resolves that release's local
+  auto-diff base instead of whichever release last wrote the top-level
+  baseline manifest.
 - **Stale bundle after an engine roll**: on a cache hit the bundler now compares
   the cached bundle's `bin/internal/engine.version` against the manifest's
   `engine_rev` and re-fetches on drift (fail-open — a network blip keeps the

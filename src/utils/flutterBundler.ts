@@ -2,7 +2,7 @@ import { execSync } from 'child_process';
 import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync } from 'fs';
 import { createHash } from 'crypto';
 import { dirname, join, resolve } from 'path';
-import { resolveBundledFlutter, resolvePinnedEngineVersion } from './flutterBundleCache.js';
+import { ensureEngineVersionStampedInYaml, resolveBundledFlutter, resolvePinnedEngineVersion } from './flutterBundleCache.js';
 import { SANKOFA_STORAGE_BASE_URL, flutterVersionOf, DEFAULT_ENGINE_VERSION } from './engineVersion.js';
 
 export interface FlutterEngineInfo {
@@ -357,6 +357,9 @@ export function buildFlutterAOT(
   const outputDir = resolve(opts.outputDir);
   const format: FlutterBuildFormat = opts.format ?? 'aab';
   mkdirSync(outputDir, { recursive: true });
+  // Stamp engine_version into sankofa.yaml before the build packs it —
+  // the SDK reports it on /api/deploy/check at runtime.
+  ensureEngineVersionStampedInYaml(cwd);
 
   const appVersion = detectFlutterAppVersion(cwd);
   const engine = detectFlutterEngineInfo(cwd);
@@ -590,6 +593,9 @@ export function buildFlutterIPA(
   const cwd = resolve(projectRoot);
   const appVersion = detectFlutterAppVersion(cwd);
   const engine = detectFlutterEngineInfo(cwd);
+  // Stamp engine_version into sankofa.yaml before the build packs it —
+  // the SDK reports it on /api/deploy/check at runtime.
+  ensureEngineVersionStampedInYaml(cwd);
 
   const flags = ['build', 'ipa', '--release'];
   if (opts.codesign === false) flags.push('--no-codesign');
@@ -691,6 +697,9 @@ export function buildFlutterIOSSimulatorApp(
   const cwd = resolve(projectRoot);
   const outDir = resolve(opts.outputDir);
   mkdirSync(outDir, { recursive: true });
+  // Stamp engine_version into sankofa.yaml before the build packs it —
+  // the SDK reports it on /api/deploy/check at runtime.
+  ensureEngineVersionStampedInYaml(cwd);
 
   // `flutter build ios --simulator` produces a debug simulator build at
   // build/ios/iphonesimulator/Runner.app (no codesign needed for sims).

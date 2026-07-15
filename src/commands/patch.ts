@@ -402,14 +402,32 @@ async function runFlutterPatch(
   let selectedRelease: any = null;
 
   if (opts.dryRun) {
-    const localBaseline = readBaselineManifest(project.root);
-    if (localBaseline) {
+    // Honor an explicit --release first — the per-release auto-diff base dir
+    // carries its own meta, so a dry-run can target any locally-captured
+    // baseline, not just whichever release wrote the top-level manifest last.
+    if (opts.release) {
+      const base = resolveAutoDiffBase(project.root, platform as 'ios' | 'android', String(opts.release));
+      if (!base) {
+        console.error(chalk.red(`  ✖ No local auto-diff base for ${chalk.bold(String(opts.release))} (${platform}).`));
+        console.log(chalk.dim(`     Captured bases live in .sankofa/baseline/autodiff/${platform}/ — run \`sankofa release ${platform}\` first.`));
+        process.exit(1);
+      }
       selectedRelease = {
-        label: localBaseline.releaseLabel,
-        target_binary_version: localBaseline.targetBinaryVersion,
-        engine_version: localBaseline.engineVersion,
+        label: base.meta.label,
+        target_binary_version: base.meta.targetBinaryVersion,
+        engine_version: base.meta.engineVersion,
       };
       console.log(chalk.dim(`  · Using local baseline ${selectedRelease.label} (--dry-run, no server)`));
+    } else {
+      const localBaseline = readBaselineManifest(project.root);
+      if (localBaseline) {
+        selectedRelease = {
+          label: localBaseline.releaseLabel,
+          target_binary_version: localBaseline.targetBinaryVersion,
+          engine_version: localBaseline.engineVersion,
+        };
+        console.log(chalk.dim(`  · Using local baseline ${selectedRelease.label} (--dry-run, no server)`));
+      }
     }
   } else {
     const spinner = ora('Fetching Flutter releases...').start();

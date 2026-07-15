@@ -48,6 +48,16 @@ void main(List<String> args) {
     for (final d in unit.directives) {
       if (d is ImportDirective) imports.add(d.toSource());
     }
+    // SELF-IMPORT: a lifted body still refers to the types/functions its own
+    // library declares (`return Summary(...)`), which resolve implicitly in
+    // the original file but not in the generated unit. Import the source
+    // library by its PACKAGE uri — the same URI the base dill uses, so the CFE
+    // resolves against --import-dill instead of loading a second copy of the
+    // library under a file:// URI (that collision is what breaks the build).
+    final selfUri = f['uri'] as String?;
+    if (selfUri != null && selfUri.isNotEmpty) {
+      imports.add("import '$selfUri';");
+    }
     importsByFile[currentPath] = imports;
     final c = _DeclCollector(currentPath);
     unit.accept(c);
@@ -123,6 +133,31 @@ void main(List<String> args) {
       // (no class → no ctor → references zero base-SDK callables). Works for the
       // reroutable seams (method bodies that use only params/constants, not
       // `this`); those are exactly the polymorphic-dispatch targets we patch.
+      // PATCHABLE-SEAM GATE. The body is about to be lifted to a top-level
+      // fn, where nothing of the enclosing class exists. Refuse the two
+      // constructs we can detect precisely — `this` and receiver-less calls
+      // to sibling methods — with an error naming the method, instead of
+      // letting dart2bytecode fail on a generated temp file the customer
+      // never wrote. (Instance-field reads still surface as CFE errors.)
+      final siblings = decls.values
+          .where((s) => s.className == d.className && s.simpleName != d.simpleName)
+          .map((s) => s.simpleName)
+          .toSet();
+      final siblingCalls = d.unqualifiedInvokes.intersection(siblings);
+      if (d.usesThis || siblingCalls.isNotEmpty) {
+        final reason = d.usesThis
+            ? 'uses `this`'
+            : 'calls sibling method(s): ${siblingCalls.join(', ')}';
+        stderr.writeln(
+          "sankofa patch: '${d.className}.${d.simpleName}' is outside the patchable seam — it $reason.\n"
+          '  A patched method body is transplanted as a standalone function. It can use its\n'
+          '  parameters, local variables, constants, top-level functions, and imported or\n'
+          '  own-library declarations — but not `this`, sibling methods, or instance fields.\n'
+          '  Fix: move the shared logic into a top-level function (patchable), or ship this\n'
+          '  change as a store release instead.',
+        );
+        exit(64);
+      }
       final topName = '_sankofaPatch_${d.className}_${d.simpleName}';
       var src = d.source.replaceAll('@override', '');
       src = src.replaceFirst(
@@ -155,12 +190,19 @@ void main(List<String> args) {
 }
 
 class _Decl {
-  _Decl(this.simpleName, this.className, this.source, this.file, this.invokes);
+  _Decl(this.simpleName, this.className, this.source, this.file, this.invokes,
+      {this.usesThis = false, Set<String>? unqualifiedInvokes})
+      : unqualifiedInvokes = unqualifiedInvokes ?? const {};
   final String simpleName;
   final String? className;
   final String source;
   final String file;
   final Set<String> invokes; // simple names this decl invokes
+  /// True when the body mentions `this` (explicitly or via a closure).
+  final bool usesThis;
+  /// Receiver-less invocations only — the ones that would resolve against the
+  /// enclosing class and therefore break when the body is lifted top-level.
+  final Set<String> unqualifiedInvokes;
   String get qname => className == null ? simpleName : '$className.$simpleName';
 }
 
@@ -197,7 +239,10 @@ class _DeclCollector extends RecursiveAstVisitor<void> {
   @override
   void visitMethodDeclaration(MethodDeclaration node) {
     if (!node.isGetter && !node.isSetter && !node.isOperator && _classStack.isNotEmpty) {
-      decls.add(_Decl(node.name.lexeme, _classStack.last, node.toSource(), file, _invokesIn(node)));
+      final v = _InvokeCollector();
+      node.accept(v);
+      decls.add(_Decl(node.name.lexeme, _classStack.last, node.toSource(), file, v.names,
+          usesThis: v.usesThis, unqualifiedInvokes: v.unqualified));
     }
     super.visitMethodDeclaration(node);
   }
@@ -212,10 +257,19 @@ Set<String> _invokesIn(AstNode node) {
 
 class _InvokeCollector extends RecursiveAstVisitor<void> {
   final Set<String> names = {};
+  final Set<String> unqualified = {};
+  bool usesThis = false;
   @override
   void visitMethodInvocation(MethodInvocation node) {
     names.add(node.methodName.name);
+    if (node.realTarget == null) unqualified.add(node.methodName.name);
     super.visitMethodInvocation(node);
+  }
+
+  @override
+  void visitThisExpression(ThisExpression node) {
+    usesThis = true;
+    super.visitThisExpression(node);
   }
 }
 

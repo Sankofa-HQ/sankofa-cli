@@ -10,7 +10,8 @@ import {
   writeFileSync,
 } from 'fs';
 import { EOL } from 'os';
-import { join, relative } from 'path';
+import { dirname, join, relative, resolve as resolvePath } from 'path';
+import { fileURLToPath } from 'url';
 import { loadGlobalConfig } from '../utils/config.js';
 import {
   resolveProjectRoot,
@@ -345,6 +346,26 @@ async function installDeployFlutter(project: ProjectInfo, endpoint: string, chal
       : '';
   tryCreateSankofaYaml(project.root, projectId, apiKey, endpoint, chalk);
 
+  // 5b. Stamp the engine pin into sankofa.yaml right away. The SDK reports
+  //     engine identity to /api/deploy/check from this key, and builds stamp
+  //     it too — but writing it at init means the yaml is never missing it,
+  //     including for anyone reading the file to understand their setup.
+  {
+    const { ensureEngineVersionStampedInYaml } = await import(
+      '../utils/flutterBundleCache.js'
+    );
+    ensureEngineVersionStampedInYaml(project.root);
+  }
+
+  // 5c. Scaffold the patchable-surface declaration. Without this file the
+  //     build silently drops `--dynamic-interface`, and gen_snapshot is then
+  //     free to tree-shake the core-library callables a patch needs (==,
+  //     toString, list ops) — the patch loads but the transplant fails on
+  //     device with "Unable to find function ==". Passing the flag at all is
+  //     what makes the front end retain them (it discovers the core libs'
+  //     language-impl pragmas), so every project wants this file from day one.
+  tryCreateDynamicInterfaceYaml(project.root, project.flutterPackageName, chalk);
+
   // 6. Inject the startup wiring into the app's entrypoint.
   tryWireFlutterMainDart(project.root, chalk);
 
@@ -452,6 +473,20 @@ async function ensureBundledFlutterForInit(project: ProjectInfo, chalk: any): Pr
  * `dependency_overrides` mechanism — no GitHub URL exposed in the
  * file customer normally reads.
  */
+/**
+ * The `dynamic_modules` trampoline shipped inside this CLI package
+ * (`tools/dynamic_modules`), or undefined when running from a tree that
+ * doesn't have it. `dist/commands/init.js` → `../../tools/dynamic_modules`.
+ */
+function shippedDynamicModulesDir(): string | undefined {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const dir = resolvePath(here, '..', '..', 'tools', 'dynamic_modules');
+  return existsSync(join(dir, 'lib', 'dynamic_modules.dart')) &&
+    existsSync(join(dir, 'pubspec.yaml'))
+    ? dir
+    : undefined;
+}
+
 async function ensureVendoredDynamicModules(projectRoot: string, chalk: any): Promise<boolean> {
   const { execSync } = await import('child_process');
   const ora = (await import('ora')).default;
@@ -464,6 +499,27 @@ async function ensureVendoredDynamicModules(projectRoot: string, chalk: any): Pr
   if (existsSync(join(target, 'pubspec.yaml')) &&
       existsSync(join(target, 'lib', 'dynamic_modules.dart'))) {
     needFetch = false; // already vendored — leave alone
+  }
+
+  // Preferred source: the copy shipped INSIDE this CLI package. The trampoline
+  // is ~8 KB of BSD-licensed Dart that every project commits into
+  // .sankofa/dynamic_modules anyway, so shipping it here discloses nothing —
+  // and it removes the hard dependency on cloning a PRIVATE repo, which no
+  // customer can do (`git clone` prompts for credentials and fails). The git
+  // path below stays as a dev fallback for a CLI running from source.
+  if (needFetch) {
+    const shipped = shippedDynamicModulesDir();
+    if (shipped) {
+      try {
+        rmSync(target, { recursive: true, force: true });
+        mkdirSync(target, { recursive: true });
+        cpSync(shipped, target, { recursive: true });
+        console.log(chalk.dim('     ✓ Vendored dynamic_modules → .sankofa/dynamic_modules/'));
+        needFetch = false;
+      } catch {
+        // Fall through to the git path.
+      }
+    }
   }
 
   if (needFetch) {
@@ -680,6 +736,72 @@ function readProjectId(projectRoot: string): string | undefined {
       : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Write `sankofa_dynamic_interface.yaml` — the app's patchable surface —
+ * unless the project already has one.
+ *
+ * The build passes it as `--dynamic-interface=<yaml>`; that flag is what makes
+ * the front end annotate the core libraries' language-impl pragmas, so
+ * gen_snapshot RETAINS the members a patch may call (`Object.==`, `toString`,
+ * list/string helpers) instead of tree-shaking them out of the AOT. Without the
+ * file the CLI warns and builds without the flag, and patches that touch those
+ * members fail to resolve at transplant time on device.
+ *
+ * The default declares the app's OWN entry library. `baseUri.resolve()` passes
+ * `package:` URIs through unchanged, and an unresolvable library is a HARD
+ * build error (LibraryIndex throws) — so only a library we know exists goes in.
+ * Customers extend the lists as their patchable surface grows.
+ */
+function tryCreateDynamicInterfaceYaml(
+  projectRoot: string,
+  packageName: string | undefined,
+  chalk: any,
+): void {
+  const path = join(projectRoot, 'sankofa_dynamic_interface.yaml');
+  if (existsSync(path)) {
+    console.log(chalk.dim('     ✓ sankofa_dynamic_interface.yaml already present'));
+    return;
+  }
+  if (!packageName) {
+    // No pubspec name → we cannot name a library that provably exists, and a
+    // wrong entry fails the build. Better to skip than to scaffold a landmine.
+    console.log(
+      chalk.yellow('     ⚠ Could not read the package name — skipped sankofa_dynamic_interface.yaml.'),
+    );
+    return;
+  }
+  const lib = `package:${packageName}/main.dart`;
+  const body =
+    `# Sankofa Deploy — your app's PATCHABLE SURFACE.\n` +
+    `#\n` +
+    `# Passed to the compiler as --dynamic-interface. It keeps the code an OTA\n` +
+    `# patch may call from being tree-shaken out of the release build, so a\n` +
+    `# patch can resolve those references on device.\n` +
+    `#\n` +
+    `# Entries are { library, class?, member? }; 'library' accepts a package:\n` +
+    `# URI. A library listed here that does not exist FAILS the build, so keep\n` +
+    `# this in sync with your code. Add the libraries you intend to patch.\n` +
+    `#\n` +
+    `#   callable:          may be CALLED from a patch\n` +
+    `#   extendable:        may be SUBCLASSED by a patch\n` +
+    `#   can-be-overridden: its methods may be OVERRIDDEN by a patch\n` +
+    `\n` +
+    `callable:\n` +
+    `  - library: '${lib}'\n` +
+    `\n` +
+    `extendable:\n` +
+    `  - library: '${lib}'\n` +
+    `\n` +
+    `can-be-overridden:\n` +
+    `  - library: '${lib}'\n`;
+  try {
+    writeFileSync(path, body);
+    console.log(chalk.dim('     ✓ Created sankofa_dynamic_interface.yaml (patchable surface)'));
+  } catch (err: any) {
+    console.log(chalk.yellow(`     ⚠ Could not write sankofa_dynamic_interface.yaml: ${err.message}`));
   }
 }
 

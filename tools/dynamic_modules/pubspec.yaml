@@ -1,0 +1,22 @@
+name: dynamic_modules
+description: >-
+  Standalone trampoline for the Sankofa-fork Dart SDK's
+  loadDynamicModule binding. Pulled in as a transitive dep by
+  package:sankofa_flutter so customers don't add it manually.
+version: 0.1.0
+homepage: https://sankofa.dev
+
+# Pure-Dart Sankofa-internal package; never published to pub.dev (the
+# `dart:_internal` import is restricted there).  Consumed exclusively
+# via a git ref from package:sankofa_flutter.
+publish_to: none
+
+environment:
+  sdk: ^3.8.0
+
+# Intentionally NO `resolution: workspace` here. The version inside
+# `pkg/dynamic_modules` uses workspace resolution which inherits the
+# Dart SDK monorepo's path deps (devtools_shared, vm, etc.) and
+# breaks `flutter pub get` for any consumer outside that monorepo.
+# Keep this standalone copy free of those internal dependencies so a
+# fresh customer machine can resolve it via a plain git checkout.
