@@ -74,10 +74,41 @@ export interface EngineManifest {
   engine_rev: string;
   uploaded_at_unix?: number;
   targets?: string[];
-  /** CDN URL of the customer-distributable SDK tarball (the repo is private). */
+  /** CDN URL of the customer-distributable SDK tarball (the repo is private).
+   *  Historically the macOS-arm64 host build; treated as the default host. */
   sdk_url?: string;
   /** SHA-256 of sdk.tar.gz — verified before unpacking. */
   sdk_sha256?: string;
+  /** Per-host SDK tarballs keyed `<os>-<arch>` (e.g. `windows-x64`, `linux-x64`,
+   *  `macos-arm64`). When the current host isn't present, the top-level
+   *  sdk_url/sdk_sha256 are used — so a single-host (macOS) manifest keeps
+   *  working unchanged, and adding `hosts` later opens Windows/Linux with no
+   *  CLI change. */
+  hosts?: Record<string, { sdk_url?: string; sdk_sha256?: string }>;
+}
+
+/** `<os>-<arch>` key for the current host — e.g. `windows-x64`, `macos-arm64`,
+ *  `linux-x64`. Matches the per-host key layout in EngineManifest.hosts. */
+export function currentHostKey(): string {
+  const os =
+    process.platform === 'win32'
+      ? 'windows'
+      : process.platform === 'darwin'
+        ? 'macos'
+        : process.platform; // 'linux', …
+  return `${os}-${process.arch}`;
+}
+
+/** The SDK tarball {url, sha256} for the current host: a per-host `hosts` entry
+ *  when present, else the top-level sdk_url (macOS-arm64 default). */
+export function resolveHostSdk(
+  manifest: EngineManifest,
+): { sdk_url?: string; sdk_sha256?: string } {
+  const perHost = manifest.hosts?.[currentHostKey()];
+  if (perHost?.sdk_url) {
+    return { sdk_url: perHost.sdk_url, sdk_sha256: perHost.sdk_sha256 };
+  }
+  return { sdk_url: manifest.sdk_url, sdk_sha256: manifest.sdk_sha256 };
 }
 
 /**

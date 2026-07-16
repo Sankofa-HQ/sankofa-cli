@@ -3,6 +3,18 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.18 — Per-host engine tarball selection
+
+### Added
+- **The engine installer now picks the tarball for the current host.** The
+  engine manifest gains an optional `hosts` map keyed `<os>-<arch>` (e.g.
+  `windows-x64`, `linux-x64`, `macos-arm64`); the CLI downloads the matching
+  entry, falling back to the top-level `sdk_url` (the macOS-arm64 default) when
+  the host isn't listed. A single-host manifest keeps working unchanged, so this
+  is the last CLI piece needed to open Windows/Linux hosts — publish a per-host
+  tarball and it's selected automatically, no CLI change. (Paired with 0.1.17's
+  `.exe`-aware toolchain, which proved release + patch on Windows.)
+
 ## 0.1.17 — Windows host support (release + patch proven on Windows)
 
 ### Fixed

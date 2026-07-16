@@ -7,6 +7,9 @@ import {
   branchForEngineVersion,
   legacyBranchForEngineVersion,
   SANKOFA_STORAGE_BASE_URL,
+  currentHostKey,
+  resolveHostSdk,
+  type EngineManifest,
 } from './engineVersion.js';
 
 /**
@@ -536,14 +539,20 @@ function installFromTarball(
 ): string {
   // ?cb= forces edge revalidation — manifests are mutable pointers.
   const manifestUrl = `${SANKOFA_STORAGE_BASE_URL}/engines/sankofa/by-version/${encodeURIComponent(version)}.json?cb=${Date.now()}`;
-  let manifest: { sdk_url?: string; sdk_sha256?: string };
+  let raw: EngineManifest;
   try {
-    manifest = JSON.parse(httpGetText(manifestUrl, 30));
+    raw = JSON.parse(httpGetText(manifestUrl, 30));
   } catch (err: any) {
     throw new Error(`manifest fetch failed for ${version}: ${err.message}`);
   }
+  // Pick the tarball for THIS host (Windows/Linux/macOS). Falls back to the
+  // top-level sdk_url (macOS-arm64 default) when no per-host entry exists.
+  const manifest = resolveHostSdk(raw);
   if (!manifest.sdk_url || !manifest.sdk_sha256) {
-    throw new Error(`no sdk tarball published for ${version}`);
+    throw new Error(
+      `no sdk tarball published for ${version} on host ${currentHostKey()}` +
+        (raw.hosts ? '' : ' (manifest has no per-host tarballs; only the default host is available)'),
+    );
   }
 
   const tarPath = join(tmpdir(), `sankofa-sdk-${version.replace(/[^\w.-]/g, '_')}.tar.gz`);
