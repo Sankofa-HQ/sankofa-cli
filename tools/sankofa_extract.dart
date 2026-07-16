@@ -44,9 +44,26 @@ void main(List<String> args) {
     final currentPath = f['current'] as String;
     if (!File(currentPath).existsSync()) continue;
     final unit = parseFile(path: currentPath, featureSet: FeatureSet.latestLanguageVersion()).unit;
+    // The source file's PACKAGE uri (e.g. package:app/main_prod.dart), used to
+    // resolve the file's own relative imports (below) and to self-import.
+    final selfUri = f['uri'] as String?;
     final imports = <String>{};
     for (final d in unit.directives) {
-      if (d is ImportDirective) imports.add(d.toSource());
+      if (d is! ImportDirective) continue;
+      final rawUri = d.uri.stringValue;
+      final isAbsolute =
+          rawUri == null || rawUri.startsWith('dart:') || rawUri.startsWith('package:');
+      if (isAbsolute || selfUri == null || selfUri.isEmpty) {
+        imports.add(d.toSource());
+      } else {
+        // RELATIVE import (e.g. a flavored `main_prod.dart` doing
+        // `import 'main.dart'`). Copied verbatim it can't resolve — the
+        // generated unit lives in a temp dir, not next to the source. Rewrite
+        // it against the file's package uri so it resolves through --import-dill,
+        // keeping any `show`/`hide`/`as` combinators.
+        final resolved = Uri.parse(selfUri).resolve(rawUri).toString();
+        imports.add(d.toSource().replaceFirst(d.uri.toSource(), "'$resolved'"));
+      }
     }
     // SELF-IMPORT: a lifted body still refers to the types/functions its own
     // library declares (`return Summary(...)`), which resolve implicitly in
@@ -54,7 +71,6 @@ void main(List<String> args) {
     // library by its PACKAGE uri — the same URI the base dill uses, so the CFE
     // resolves against --import-dill instead of loading a second copy of the
     // library under a file:// URI (that collision is what breaks the build).
-    final selfUri = f['uri'] as String?;
     if (selfUri != null && selfUri.isNotEmpty) {
       imports.add("import '$selfUri';");
     }

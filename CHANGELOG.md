@@ -3,6 +3,26 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.16 — Patch apps with relative imports (flavored entrypoints)
+
+### Fixed
+- **`sankofa patch` failed on any file that used a relative import.** The
+  generated patch unit copied the source file's imports verbatim, including
+  relative ones like `import 'main.dart'`. A relative import can't resolve from
+  the unit's temporary build location, so the patch failed to compile. This bit
+  **flavored apps hardest**: a per-flavor entrypoint such as
+  `lib/main_production.dart` almost always imports shared code relatively. The
+  extractor now rewrites a file's relative imports to `package:` URIs (resolved
+  against the file's own package URI), so they resolve through `--import-dill`,
+  while `dart:`/`package:` imports are still copied verbatim. Found by testing a
+  real two-flavor app end-to-end.
+- **`sankofa keys generate` now wires the public key into `sankofa.yaml`.** The
+  SDK reads `signing_pubkey` from the bundled yaml to verify every patch, but
+  nothing wrote it there — you had to paste it by hand or the SDK couldn't
+  verify. `keys generate` now stamps `signing_pubkey` into `sankofa.yaml`
+  (updating in place on rotation); the printed `Sankofa.initialize(
+  deploySigningPubkey: …)` snippet remains an equivalent alternative.
+
 ## 0.1.15 — Android: unblock fresh installs (Built-in Kotlin pin)
 
 ### Fixed

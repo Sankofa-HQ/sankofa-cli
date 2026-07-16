@@ -47,6 +47,7 @@ import {
   sign as cryptoSign,
 } from 'crypto';
 import { findProjectConfig, resolveAuth, requireAuth } from '../utils/config.js';
+import { stampSigningPubkeyInYaml } from '../utils/flutterBundleCache.js';
 
 const SANKOFA_KEYS_DIR = join(homedir(), '.config', 'sankofa', 'keys');
 
@@ -172,6 +173,10 @@ keysCommand
     chmodSync(privatePath, 0o600);
     writeFileSync(publicPath, rawPubB64 + '\n', { mode: 0o644 });
 
+    // Wire the public key into sankofa.yaml so the SDK verifies patches with
+    // nothing to paste (Flutter projects). No-op outside a project with a yaml.
+    const stampedYaml = stampSigningPubkeyInYaml(process.cwd(), rawPubB64);
+
     console.log('');
     console.log(chalk.green('  ✔ Signing keypair generated'));
     console.log(`     Private:    ${chalk.dim(privatePath)}`);
@@ -182,7 +187,12 @@ keysCommand
     console.log(chalk.bold('  Public key (base64):'));
     console.log(`     ${chalk.cyan(rawPubB64)}`);
     console.log('');
-    console.log(chalk.bold('  Paste into your app initialization:'));
+    if (stampedYaml) {
+      console.log(chalk.green('  ✔ Wired into sankofa.yaml (signing_pubkey) — the SDK will verify patches automatically.'));
+      console.log(chalk.dim('     Or, equivalently, pass it explicitly at init:'));
+    } else {
+      console.log(chalk.bold('  Paste into your app initialization:'));
+    }
     console.log(chalk.dim(`     // sdks/sankofa_sdk_flutter`));
     console.log(`     ${chalk.cyan(`Sankofa.initialize(`)}`);
     console.log(`       ${chalk.cyan(`apiKey: '...',`)}`);

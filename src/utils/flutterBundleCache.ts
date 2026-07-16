@@ -446,6 +446,36 @@ export function ensureEngineVersionStampedInYaml(projectRoot: string): void {
 }
 
 /**
+ * Write the patch-signing PUBLIC key into `sankofa.yaml`'s `signing_pubkey`.
+ * The SDK's bootstrap reads `signing_pubkey` from the bundled yaml to verify
+ * every patch, so `sankofa keys generate` wiring it here means the app is
+ * signature-ready with nothing to paste (the printed
+ * `Sankofa.initialize(deploySigningPubkey: …)` snippet remains an alternative).
+ * Updates an existing key in place; appends when absent. No-op when the yaml
+ * doesn't exist (non-Flutter projects sign via the printed snippet instead).
+ */
+export function stampSigningPubkeyInYaml(projectRoot: string, pubkeyB64: string): boolean {
+  const yamlPath = join(projectRoot, 'sankofa.yaml');
+  if (!existsSync(yamlPath) || !pubkeyB64) return false;
+  try {
+    const text = readFileSync(yamlPath, 'utf-8');
+    const line = `signing_pubkey: ${pubkeyB64}`;
+    // Replace an existing key (commented or not) or append.
+    let updated: string;
+    if (/^\s*#?\s*signing_pubkey:.*$/m.test(text)) {
+      updated = text.replace(/^\s*#?\s*signing_pubkey:.*$/m, line);
+    } else {
+      updated = `${text.replace(/\n*$/, '\n')}${line}\n`;
+    }
+    if (updated === text) return true; // already exactly this key
+    writeFileSync(yamlPath, updated);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Download + verify + unpack the SDK tarball for `version` into `root`.
  * Returns a provenance string on success; throws when the manifest has
  * no sdk_url (pre-tarball release) or any download/verify step fails.
