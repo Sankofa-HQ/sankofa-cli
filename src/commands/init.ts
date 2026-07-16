@@ -601,6 +601,11 @@ const SANKOFA_ANDROID_PLUGIN_PIN =
 async function tryAddSankofaFlutterToPubspec(pubspecPath: string, chalk: any): Promise<boolean> {
   try {
     let text = readFileSync(pubspecPath, 'utf-8');
+    // Normalize CRLF → LF before matching. On Windows `flutter create` writes a
+    // CRLF pubspec, and the `dependencies:[ \t]*\n` anchors below don't match
+    // `dependencies:\r\n` (\r isn't [ \t]) — which silently dropped the
+    // sankofa_flutter dependency and broke the build. LF is fine for pubspec.
+    text = text.replace(/\r\n/g, '\n');
     let touched = false;
 
     // ── 1. Add sankofa_flutter under `dependencies:` ──

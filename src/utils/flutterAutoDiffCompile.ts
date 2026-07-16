@@ -65,11 +65,15 @@ export function resolveAutoDiffTools(projectRoot: string): AutoDiffTools {
   const root = dirname(dirname(bundled.bin)); // <root>/bin/flutter → <root>
   const dartSdk = join(root, 'bin', 'cache', 'dart-sdk');
   const engArt = join(root, 'bin', 'cache', 'artifacts', 'engine');
+  // Windows executables carry a `.exe` suffix. execFileSync does NOT auto-append
+  // it for a full path, and the existence checks below would otherwise fail —
+  // silently killing the base_noaot.dill capture (so `sankofa patch` refuses).
+  const exe = process.platform === 'win32' ? '.exe' : '';
   const tools: AutoDiffTools = {
     flutterRoot: root,
     dartSdk,
-    dart: join(dartSdk, 'bin', 'dart'),
-    dartaotruntime: join(dartSdk, 'bin', 'dartaotruntime'),
+    dart: join(dartSdk, 'bin', `dart${exe}`),
+    dartaotruntime: join(dartSdk, 'bin', `dartaotruntime${exe}`),
     genKernel: join(dartSdk, 'bin', 'snapshots', 'gen_kernel_aot.dart.snapshot'),
     dart2bytecode: join(dartSdk, 'bin', 'snapshots', 'dart2bytecode.dart.snapshot'),
     // Product platform (release). Fall back to the non-product one if absent.

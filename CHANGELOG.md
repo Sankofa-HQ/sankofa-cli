@@ -3,6 +3,25 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.17 — Windows host support (release + patch proven on Windows)
+
+### Fixed
+- **Auto-diff `release`/`patch` now work on Windows.** Two Windows-only bugs:
+  - The auto-diff toolchain built `dart` / `dartaotruntime` paths without the
+    `.exe` suffix. `execFileSync` doesn't auto-append it on Windows, so the
+    tool-existence check threw and the `base_noaot.dill` capture failed silently
+    (a release then shipped without its program kernel, and `sankofa patch`
+    refused). The toolchain now appends `.exe` on `win32`.
+  - `sankofa init` dropped the `sankofa_flutter` dependency on Windows: the
+    `dependencies:` insertion regex anchored on `\n`, which doesn't match a
+    CRLF pubspec (`\r` isn't whitespace), so the dep was silently skipped and
+    the build failed resolving `package:sankofa_flutter`. The pubspec is now
+    normalized to LF before editing.
+
+  Verified end-to-end on a real Windows 11 box: `sankofa release android`
+  builds the AAB + captures the auto-diff base, and `sankofa patch android`
+  builds + signs a patch module. (iOS still requires macOS — Xcode.)
+
 ## 0.1.16 — Patch apps with relative imports (flavored entrypoints)
 
 ### Fixed
