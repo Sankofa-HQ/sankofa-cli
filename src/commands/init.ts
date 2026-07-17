@@ -562,7 +562,13 @@ async function ensureVendoredDynamicModules(projectRoot: string, chalk: any): Pr
   return true;
 }
 
+// cmd.exe (what execSync uses on Windows) does NOT understand POSIX single
+// quotes — it passes them through literally, so the quoted arg reaches the
+// program still wrapped in quotes and fails. Use cmd's double quotes there.
 function shellQuote(s: string): string {
+  if (process.platform === 'win32') {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 

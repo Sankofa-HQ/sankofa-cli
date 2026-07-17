@@ -636,6 +636,21 @@ function ensureBundleGitRepo(root: string, version: string, onProgress?: (msg: s
   }
 }
 
+/**
+ * Quote an argument for the shell `execSync` will actually use.
+ *
+ * WINDOWS (found 2026-07-16 on a real box): execSync runs through `cmd.exe`,
+ * which does NOT understand POSIX single quotes — it passes them through
+ * literally. So `curl -o 'C:\…' 'https://…'` handed curl an argument that still
+ * had quotes in it and failed. That silently broke EVERY shell-out here on
+ * Windows — the manifest fetch, the SDK tarball download, the tar extraction,
+ * the git fallback — surfacing only as the catch-all "the CDN tarball was
+ * unavailable", so a fresh Windows machine could never install the engine.
+ * cmd.exe uses double quotes; an embedded `"` is escaped by doubling it.
+ */
 function shellQuote(s: string): string {
+  if (process.platform === 'win32') {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
   return `'${s.replace(/'/g, "'\\''")}'`;
 }

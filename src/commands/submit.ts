@@ -314,6 +314,11 @@ function extractGoogleError(err: any): string {
   return apiErr || err?.message || String(err);
 }
 
+// cmd.exe (what execSync uses on Windows) does NOT understand POSIX single
+// quotes — it passes them through literally. Use cmd's double quotes there.
 function shellQuote(value: string): string {
+  if (process.platform === 'win32') {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }

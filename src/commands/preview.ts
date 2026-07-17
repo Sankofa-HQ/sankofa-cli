@@ -4,7 +4,12 @@ import { createHash } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
+// cmd.exe (what execSync uses on Windows) does NOT understand POSIX single
+// quotes — it passes them through literally. Use cmd's double quotes there.
 function shellQuoteLocal(value: string): string {
+  if (process.platform === 'win32') {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 import {

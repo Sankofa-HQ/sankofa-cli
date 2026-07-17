@@ -3,6 +3,28 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.19 — Windows: the engine can actually install (shell quoting)
+
+### Fixed
+- **A fresh Windows machine could never install the Sankofa engine.** Every
+  shell-out here quoted its arguments POSIX-style (single quotes), but
+  `execSync` runs through `cmd.exe` on Windows, which does not interpret single
+  quotes — it passes them through literally, so `curl -o 'C:\...' 'https://...'`
+  handed curl arguments still wrapped in quotes. That broke the manifest fetch,
+  the SDK tarball download, the tar extraction and the git fallback — all of
+  which surfaced only as the catch-all *"the CDN tarball was unavailable"*.
+  `shellQuote` is now cmd-aware on Windows (double quotes, `""` escaping) in
+  every copy (engine cache, init, bundler, submit, preview).
+
+  Verified on a real Windows 11 box: with a bundle present the failure is
+  invisible (nothing is downloaded) — it only appears on a genuinely fresh
+  machine, where `sankofa engine install` now downloads + unpacks the SDK and
+  bootstraps the Dart SDK from the CDN.
+
+  Note: no new engine artifacts were needed — the published SDK tarball is
+  host-independent framework source, and the Windows host artifacts were already
+  on the CDN. Windows support was gated on this bug, not on the engine.
+
 ## 0.1.18 — Per-host engine tarball selection
 
 ### Added
