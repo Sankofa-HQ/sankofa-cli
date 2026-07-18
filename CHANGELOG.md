@@ -3,6 +3,20 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## Unreleased
+
+### Added
+- **Actionable diagnostic for the Android "Built-in Kotlin" build wall.** A
+  plugin whose newest version migrated to Flutter's Built-in Kotlin fails the
+  Android build on Flutter 3.44.1 with a cryptic Gradle `Unresolved reference:
+  compilerOptions` — a fresh-machine-only failure (a warm pub-cache still holds
+  the pre-migration version). This is upstream 3.44.1 drift (stock Flutter fails
+  identically), and Sankofa already pins the one such plugin the SDK itself pulls
+  (`shared_preferences_android`). Now, if any OTHER customer-added plugin hits
+  it, the build error names the plugin and prints the exact one-line
+  `dependency_overrides` pin to add, instead of leaving the customer to decode
+  raw Gradle output.
+
 ## 0.1.19 — Windows: the engine can actually install (shell quoting)
 
 ### Fixed

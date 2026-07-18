@@ -5,6 +5,49 @@ import { dirname, join, resolve } from 'path';
 import { ensureEngineVersionStampedInYaml, resolveBundledFlutter, resolvePinnedEngineVersion } from './flutterBundleCache.js';
 import { SANKOFA_STORAGE_BASE_URL, flutterVersionOf, DEFAULT_ENGINE_VERSION } from './engineVersion.js';
 
+/**
+ * Run a `flutter build …`, adding an actionable diagnostic for the one class of
+ * failure a FRESH machine hits that a warm one never does: a plugin whose newest
+ * version migrated to Flutter's "Built-in Kotlin". Flutter 3.44.1's Gradle
+ * tooling doesn't apply KGP to such plugin projects, so the build dies with
+ * `Unresolved reference: compilerOptions` (or `jvmTarget`) deep in Gradle output.
+ * This is upstream 3.44.1 drift — stock Flutter fails identically — but the raw
+ * error names nothing the customer can act on. We name the plugin and the
+ * one-line `dependency_overrides` pin that fixes it. Sankofa already pins the one
+ * such plugin the SDK itself pulls (shared_preferences_android); this covers any
+ * OTHER plugin a customer adds.
+ *
+ * Only fires on the default (piped) path; verbose streams to the terminal, so
+ * the caller already sees the raw error and `err` carries no captured output.
+ */
+function execFlutterBuild(cmd: string, cwd: string, verbose: boolean): void {
+  try {
+    execSync(cmd, { cwd, stdio: verbose ? 'inherit' : 'pipe' });
+  } catch (err: any) {
+    if (verbose) throw err;
+    const out = `${err?.stdout?.toString?.() ?? ''}\n${err?.stderr?.toString?.() ?? ''}`;
+    if (!/Unresolved reference:\s*(compilerOptions|jvmTarget)/.test(out)) throw err;
+    const plugin =
+      out.match(/hosted[/\\]pub\.dev[/\\]([a-z0-9_]+)-\d+\.\d+\.\d+[/\\]/)?.[1] ??
+      out.match(/Task :([a-z0-9_]+):compile\w*Kotlin/)?.[1] ??
+      out.match(/([a-z0-9_]+)[/\\]android[/\\]build\.gradle/)?.[1] ??
+      null;
+    const name = plugin ?? '<the plugin named in the Gradle error above>';
+    const lastGood = plugin === 'shared_preferences_android' ? '2.4.23' : '<its last pre-migration version>';
+    throw new Error(
+      `Android build failed: the plugin "${name}" uses Flutter's "Built-in Kotlin", which the\n` +
+        `current Sankofa engine (Flutter 3.44.1) doesn't apply to plugin projects yet\n` +
+        `(Gradle: "Unresolved reference: compilerOptions"). Stock Flutter 3.44.1 fails the same way.\n\n` +
+        `Fix — pin the plugin to its last pre-migration version in pubspec.yaml, then\n` +
+        `re-run \`flutter pub get\` and retry:\n` +
+        `  dependency_overrides:\n` +
+        `    ${name}: ${lastGood}\n\n` +
+        `Remove the pin once your engine moves to a newer Flutter stable. (Sankofa already\n` +
+        `pins shared_preferences_android for you.)`,
+    );
+  }
+}
+
 export interface FlutterEngineInfo {
   flutterVersion: string;
   channel: string;
@@ -394,7 +437,7 @@ export function buildFlutterAOT(
   // AndroidManifest + flutter_assets for Diff Guard.
   const apkCmd = flutterCmd(cwd, `build apk --release --target-platform android-arm64${variantFlags}`);
   if (opts.verbose) console.log(`  $ ${apkCmd}`);
-  execSync(apkCmd, { cwd, stdio: opts.verbose ? 'inherit' : 'pipe' });
+  execFlutterBuild(apkCmd, cwd, !!opts.verbose);
 
   // For 'aab' format, also build the AAB. This is the actual store
   // artifact for Play Console.
@@ -402,7 +445,7 @@ export function buildFlutterAOT(
   if (format === 'aab') {
     const aabCmd = flutterCmd(cwd, `build appbundle --release --target-platform android-arm64${variantFlags}`);
     if (opts.verbose) console.log(`  $ ${aabCmd}`);
-    execSync(aabCmd, { cwd, stdio: opts.verbose ? 'inherit' : 'pipe' });
+    execFlutterBuild(aabCmd, cwd, !!opts.verbose);
     aabPath = findAab(cwd, opts.flavor);
   }
 
