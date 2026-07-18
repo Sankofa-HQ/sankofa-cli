@@ -3,7 +3,7 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
-## Unreleased
+## 0.1.20 — Actionable diagnostic for the Android "Built-in Kotlin" build wall
 
 ### Added
 - **Actionable diagnostic for the Android "Built-in Kotlin" build wall.** A
