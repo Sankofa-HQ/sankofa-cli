@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { execFileSync } from 'child_process';
+import { execSync } from 'child_process';
 import { existsSync } from 'fs';
 import { resolve as pathResolve } from 'path';
 import { resolveFlutterBinary } from '../utils/flutterBundler.js';
@@ -56,7 +56,16 @@ export const createCommand = new Command('create')
 
       console.log(chalk.dim(`$ flutter ${args.join(' ')}`));
       try {
-        execFileSync(flutter, args, { stdio: 'inherit' });
+        // Run through a shell so Windows resolves `flutter` → flutter.bat:
+        // execFileSync neither appends .bat/.cmd nor — since Node's
+        // CVE-2024-27980 fix — will spawn a .bat/.cmd without a shell at all, so
+        // `execFileSync('flutter', …)` throws on Windows and `sankofa create`
+        // dies with "flutter create failed". execSync always uses a shell (this
+        // is also how release/patch invoke flutter). Quote whitespace args; the
+        // values here (org, package name) are shell-safe by Dart's own rules.
+        const quote = (s: string) => (/\s/.test(s) ? `"${s}"` : s);
+        const cmd = [flutter, ...args].map(quote).join(' ');
+        execSync(cmd, { stdio: 'inherit' });
       } catch {
         console.error(chalk.red('`flutter create` failed.'));
         process.exit(1);
