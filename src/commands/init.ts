@@ -1470,6 +1470,7 @@ function patchFlutterNativeFiles(
     try {
       patchFlutterAndroidManifest(androidApp, endpoint, chalk);
       patchFlutterMainActivity(androidApp, chalk);
+      normalizeAndroidGradlePins(cwd, chalk);
       out.androidPatched = true;
     } catch (err: any) {
       console.log(chalk.yellow(`     ⚠ Android patch failed: ${err.message}`));
@@ -1495,6 +1496,83 @@ function patchFlutterNativeFiles(
   // touches platform channels before binding init. That call is removed.
 
   return out;
+}
+
+// TEMPORARY (2026-07-19) — remove once the fork engine ships good template pins.
+// Planned for the 3.44.2 engine build (see project-fork-flutter-template-agp-blocker).
+//
+// The Sankofa fork's flutter_tools scaffolds Android with AGP 9.0.1 / Kotlin
+// 2.3.20 / Gradle 9.1.0. Against those, federated plugins that migrated to
+// Flutter's "Built-in Kotlin" (e.g. path_provider_android) fail to build
+// ("Unresolved reference 'compilerOptions'" / "'jvmTarget'"). Stock flutter
+// scaffolds AGP 8.11.1 / Kotlin 2.2.20 / Gradle 8.14, where they build fine — so
+// on a machine WITHOUT stock flutter (a build box, or a fresh Windows box), where
+// `sankofa create` scaffolds with the fork's template, the app won't build.
+// Normalize the scaffolded pins down to the known-good set. No-op when the pins
+// are already good (a stock/Mac scaffold), keyed off the fork's AGP 9.x marker.
+const GOOD_AGP = '8.11.1';
+const GOOD_KOTLIN = '2.2.20';
+const GOOD_GRADLE = '8.14';
+
+function normalizeAndroidGradlePins(cwd: string, chalk: any): void {
+  let did = false;
+
+  // (1) THE ACTUAL BUILD-BREAKER. The fork's app template uses the Kotlin Gradle
+  // Plugin DSL `kotlin { compilerOptions { jvmTarget = … } }` but forgets to
+  // APPLY the plugin in its `plugins {}` block, so `compilerOptions` is an
+  // unresolved reference and the app module won't compile. (The stock template
+  // ships `id("org.jetbrains.kotlin.android")` there.) Add it back.
+  const appBuild = join(cwd, 'android', 'app', 'build.gradle.kts');
+  if (existsSync(appBuild)) {
+    const a = readFileSync(appBuild, 'utf-8');
+    if (/kotlin\s*\{[\s\S]*?compilerOptions/.test(a) && !/org\.jetbrains\.kotlin\.android/.test(a)) {
+      const patched = a.replace(
+        /(id\(["']com\.android\.application["']\)[^\n]*\n)/,
+        `$1    id("org.jetbrains.kotlin.android")\n`,
+      );
+      if (patched !== a) {
+        writeFileSync(appBuild, patched);
+        did = true;
+      }
+    }
+  }
+
+  // (2) Match the stock scaffold's pin set. The fork ships AGP 9.0.1 / Kotlin
+  // 2.3.20 / Gradle 9.1.0 (AGP-9-only breakage: removed jcenter(), Gradle-9
+  // strict output tracking). No-op on a good (stock/Mac) scaffold, keyed off the
+  // fork's AGP 9.x marker.
+  const settingsPath = ['settings.gradle.kts', 'settings.gradle']
+    .map((f) => join(cwd, 'android', f))
+    .find((p) => existsSync(p));
+  if (settingsPath) {
+    let text = readFileSync(settingsPath, 'utf-8');
+    const agpRe = /(id\(["']com\.android\.application["']\)\s*version\s*["'])9\.\d+\.\d+(["'])/;
+    if (agpRe.test(text)) {
+      text = text.replace(agpRe, (_m, p1, p2) => `${p1}${GOOD_AGP}${p2}`);
+      text = text.replace(
+        /(id\(["']org\.jetbrains\.kotlin\.android["']\)\s*version\s*["'])2\.\d+\.\d+(["'])/,
+        (_m, p1, p2) => `${p1}${GOOD_KOTLIN}${p2}`,
+      );
+      writeFileSync(settingsPath, text);
+
+      // AGP 8.11.1 needs Gradle 8.13+; the fork ships 9.1.0. Move the wrapper too.
+      const wrapper = join(cwd, 'android', 'gradle', 'wrapper', 'gradle-wrapper.properties');
+      if (existsSync(wrapper)) {
+        const w = readFileSync(wrapper, 'utf-8');
+        const gRe = /(distributionUrl=.*gradle-)9\.\d+(?:\.\d+)?(-(?:all|bin)\.zip)/;
+        if (gRe.test(w)) writeFileSync(wrapper, w.replace(gRe, (_m, p1, p2) => `${p1}${GOOD_GRADLE}${p2}`));
+      }
+      did = true;
+    }
+  }
+
+  if (did) {
+    console.log(
+      chalk.green(
+        `     ✓ Normalized Android build for the Sankofa engine (apply kotlin-android · AGP ${GOOD_AGP} / Kotlin ${GOOD_KOTLIN} / Gradle ${GOOD_GRADLE})`,
+      ),
+    );
+  }
 }
 
 function patchFlutterAndroidManifest(androidApp: string, endpoint: string, chalk: any) {

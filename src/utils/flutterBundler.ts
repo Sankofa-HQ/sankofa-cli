@@ -26,7 +26,9 @@ function execFlutterBuild(cmd: string, cwd: string, verbose: boolean): void {
   } catch (err: any) {
     if (verbose) throw err;
     const out = `${err?.stdout?.toString?.() ?? ''}\n${err?.stderr?.toString?.() ?? ''}`;
-    if (!/Unresolved reference:\s*(compilerOptions|jvmTarget)/.test(out)) throw err;
+    // Gradle/Kotlin phrase this two ways depending on version:
+    //   "Unresolved reference: compilerOptions"   and   "Unresolved reference 'compilerOptions'"
+    if (!/Unresolved reference:?\s*['"]?(compilerOptions|jvmTarget)/.test(out)) throw err;
     const plugin =
       out.match(/hosted[/\\]pub\.dev[/\\]([a-z0-9_]+)-\d+\.\d+\.\d+[/\\]/)?.[1] ??
       out.match(/Task :([a-z0-9_]+):compile\w*Kotlin/)?.[1] ??

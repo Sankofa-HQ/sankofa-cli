@@ -3,6 +3,28 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.21 — Windows fresh-machine onboarding (create + Android build)
+
+Certified end-to-end by the Windows pristine-rehearsal gate (fresh HOME, empty
+pub-cache, real CDN): install → `create` → `release` → `patch`.
+
+### Fixed
+- **`sankofa create` on Windows.** It invoked `flutter` via `execFileSync`, which
+  on Windows neither appends `.bat` nor — since Node's CVE-2024-27980 fix — will
+  spawn a `.bat`/`.cmd` without a shell, so create died with "flutter create
+  failed". Now runs through a shell (as `release`/`patch` already do).
+- **Android build failed for fork-scaffolded projects.** On a machine without
+  stock flutter (e.g. a fresh Windows box), `sankofa create` scaffolds with the
+  Sankofa fork, whose app template writes `kotlin { compilerOptions { … } }` but
+  never applies `id("org.jetbrains.kotlin.android")` in its `plugins {}` block —
+  so the app module fails to compile (`Unresolved reference: compilerOptions`).
+  `init` now applies the missing Kotlin plugin and normalizes the scaffolded
+  AGP/Kotlin/Gradle pins to the stock-matching set (AGP 8.11.1 / Kotlin 2.2.20 /
+  Gradle 8.14). No-op on a stock (macOS) scaffold. Temporary — the durable fix is
+  in the fork's flutter_tools template, planned for the 3.44.2 engine build.
+- **Built-in-Kotlin diagnostic** now also matches the `Unresolved reference
+  'compilerOptions'` (quoted) phrasing, not just the colon form.
+
 ## 0.1.20 — Actionable diagnostic for the Android "Built-in Kotlin" build wall
 
 ### Added
