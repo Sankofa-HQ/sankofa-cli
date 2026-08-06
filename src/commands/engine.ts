@@ -161,6 +161,10 @@ engineCommand
     console.log(chalk.bold(`  Downloading ${candidates.length} engine${candidates.length === 1 ? '' : 's'} (Flutter ${flutterVersion})`));
     console.log('');
 
+    // Keep going after a failure. One broken ABI used to abort the whole
+    // run, which hid the fact that the *other* ABIs were fine — a partial
+    // outage looked identical to a total one. Collect and report instead.
+    const failures: string[] = [];
     for (const engine of candidates) {
       const label = `${engine.target} ${engine.abi} (${formatBytesHuman(engine.size_bytes)})`;
       const cached = !opts.force && tryEngineCacheHit(engine);
@@ -186,12 +190,25 @@ engineCommand
         spinner.succeed(`  ${label} — downloaded`);
       } catch (err: any) {
         spinner.fail(`  ${label} — ${err.message}`);
-        process.exit(1);
+        failures.push(`${engine.target}/${engine.abi}`);
       }
     }
 
     console.log('');
     console.log(chalk.dim(`  Cache root: ${engineCacheRoot()}`));
+    if (failures.length > 0) {
+      console.log('');
+      console.error(
+        chalk.red(
+          `  ✖ ${failures.length} of ${candidates.length} engine(s) failed: ${failures.join(', ')}`,
+        ),
+      );
+      console.error(
+        chalk.dim('     The rest are cached and usable. Re-run to retry just the missing ones.'),
+      );
+      console.log('');
+      process.exit(1);
+    }
     console.log('');
   });
 
@@ -289,6 +306,7 @@ engineCommand
     console.log(chalk.bold(`  Downloading ${knownEngines.length} engine binar${knownEngines.length === 1 ? 'y' : 'ies'}`));
     console.log('');
 
+    const engineFailures: string[] = [];
     for (const engine of knownEngines) {
       const label = `${engine.target} ${engine.abi} (${formatBytesHuman(engine.size_bytes)})`;
       const cached = !opts.force && tryEngineCacheHit(engine);
@@ -311,11 +329,26 @@ engineCommand
         spinner.succeed(`  ${label} — downloaded`);
       } catch (err: any) {
         spinner.fail(`  ${label} — ${err.message}`);
-        process.exit(1);
+        engineFailures.push(`${engine.target}/${engine.abi}`);
       }
     }
 
     console.log('');
+    if (engineFailures.length > 0) {
+      // Never print "ready" over a partial install — that message is why
+      // a broken engine cache can go unnoticed until `sankofa release`.
+      console.error(
+        chalk.red(
+          `  ✖ Sankofa engine ${resolved} is INCOMPLETE — ` +
+            `${engineFailures.length} of ${knownEngines.length} binaries failed: ${engineFailures.join(', ')}`,
+        ),
+      );
+      console.error(chalk.dim(`    Bundled flutter:  ~/.sankofa/flutter/${resolved}/  (installed)`));
+      console.error(chalk.dim(`    Engine cache:     ${engineCacheRoot()}`));
+      console.error(chalk.dim('    Re-run `sankofa engine download` to retry the missing binaries.'));
+      console.log('');
+      process.exit(1);
+    }
     console.log(chalk.green(`  ✓ Sankofa engine ${resolved} ready.`));
     console.log(chalk.dim(`    Bundled flutter:  ~/.sankofa/flutter/${resolved}/`));
     console.log(chalk.dim(`    Engine cache:     ${engineCacheRoot()}`));
@@ -552,6 +585,7 @@ engineCommand
 
     console.log('');
     console.log(`  ${ok} ok, ${bad} ${bad === 1 ? 'issue' : 'issues'}`);
+
     if (bad > 0) process.exit(2);
   });
 
@@ -647,9 +681,38 @@ engineCommand
       console.error(chalk.red(`  ✖ --sha256 must be 64 lowercase hex chars; got ${sha256!.length} chars`));
       process.exit(1);
     }
+    // An abbreviated --source-commit registers a row whose engine can never
+    // be downloaded: the CLI composes its CDN URL from this rev and skips
+    // that path entirely when it is short, leaving only the presigned URL —
+    // which is signed without checking that the object exists. Registering
+    // `0b7370de61a8` instead of the full SHA is precisely how the
+    // 3.44.1+sankofa-2 Android engines became undownloadable.
+    if (opts.sourceCommit && !/^[0-9a-f]{40}$/i.test(opts.sourceCommit)) {
+      console.error(
+        chalk.red(
+          `  ✖ --source-commit must be a full 40-char git SHA; got ${opts.sourceCommit.length} chars ("${opts.sourceCommit}")`,
+        ),
+      );
+      console.error(chalk.dim('     Use `git rev-parse HEAD`, not an abbreviated rev.'));
+      process.exit(1);
+    }
     if (!Number.isFinite(sizeBytes!) || sizeBytes! <= 0) {
       console.error(chalk.red(`  ✖ --size-bytes must be a positive integer; got ${opts.sizeBytes}`));
       process.exit(1);
+    }
+
+    // Mirror the server's repair so a mis-keyed row can't originate here
+    // either. `upload-to-b2.sh` publishes under
+    // `flutter_infra_release/flutter/<rev>/…`; a bare `flutter/<rev>/…`
+    // key presigns fine and 404s at download.
+    let objectKey: string = opts.objectKey;
+    if (/^flutter\/[0-9a-f]{40}\//i.test(objectKey)) {
+      objectKey = `flutter_infra_release/${objectKey}`;
+      console.log(
+        chalk.yellow(
+          `  ⚠ object_key was missing the "flutter_infra_release/" prefix — registering the repaired key instead.`,
+        ),
+      );
     }
 
     const payload: RegisterEnginePayload = {
@@ -662,7 +725,7 @@ engineCommand
       sha256: sha256!,
       size_bytes: sizeBytes!,
       source_commit: opts.sourceCommit,
-      object_key: opts.objectKey,
+      object_key: objectKey,
       built_at: opts.builtAt,
     };
 

@@ -3,6 +3,7 @@ import { execSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { loadGlobalConfig } from '../utils/config.js';
+import { bundledFlutterInfo } from '../utils/flutterBundleCache.js';
 import { resolveBuildEnv } from '../utils/buildEnv.js';
 import {
   classifyProject,
@@ -408,9 +409,10 @@ function sankofaFlutterDeployChecks(cwd: string): CheckResult[] {
       return { status: 'skip', detail: 'no engine_version in sankofa.yaml' };
     }
     try {
-      // Dynamic require to keep doctor portable when CLI is invoked from CI.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { bundledFlutterInfo } = require('../utils/flutterBundleCache.js');
+      // Statically imported. This was a `require()`, which is not defined in
+      // an ESM build — so the check threw ReferenceError on EVERY run and the
+      // catch below reported it as a benign "check skipped". Doctor was
+      // structurally incapable of failing this check.
       const info = bundledFlutterInfo(engineVersion);
       if (info.exists) {
         return { status: 'ok', detail: info.root };
