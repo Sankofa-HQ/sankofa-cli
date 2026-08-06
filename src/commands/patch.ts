@@ -440,10 +440,10 @@ async function runFlutterPatch(
       );
       // Scope to the requested flavor. KBC patches are flavor-independent,
       // so this only picks WHICH base release / targeting band the patch
-      // lands in — mirroring `sankofa release --flavor`. Graceful: if no
-      // base release records a flavor (older server that drops it), keep
-      // them all and surface the heads-up below rather than filtering to
-      // zero.
+      // lands in — mirroring `sankofa release --flavor`. Graceful: releases
+      // published before the CLI started sending `flavor` have none recorded,
+      // so keep them all and surface the heads-up below rather than filtering
+      // to zero.
       if (opts.flavor && baseReleases.some((r: any) => r.flavor)) {
         baseReleases = baseReleases.filter((r: any) => r.flavor === opts.flavor);
       }
@@ -453,8 +453,13 @@ async function runFlutterPatch(
     }
     if (opts.flavor && !releases.some((r: any) => r.flavor)) {
       console.log(
-        `  · --flavor ${opts.flavor} noted; releases don't record a flavor server-side yet, ` +
-          `so all ${platform} base releases are eligible (KBC patches are flavor-independent).`,
+        `  · --flavor ${opts.flavor} noted, but none of your existing ${platform} releases ` +
+          `record a flavor, so all of them are eligible as the base.`,
+      );
+      console.log(
+        `    Those were published before the CLI sent --flavor to the server. An empty ` +
+          `flavor is a WILDCARD: such a release is served to every flavor's build. ` +
+          `Re-run \`sankofa release --flavor ${opts.flavor}\` to publish a scoped baseline.`,
       );
     }
 
@@ -779,6 +784,11 @@ async function runFlutterPatch(
       environment,
       runtime: 'flutter-code',
       engine_version: engineVersion,
+      // A patch must land in the same flavor band as the baseline it targets,
+      // otherwise gating.go's empty-flavor WILDCARD serves it to every flavor.
+      // Prefer the resolved base release's flavor over --flavor: the patch
+      // belongs to whatever band its base is in.
+      flavor: selectedRelease?.flavor || opts.flavor,
     });
     uploadSpinner.succeed('Patch uploaded.');
     console.log('');

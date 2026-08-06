@@ -228,6 +228,14 @@ export async function uploadRelease(
      * "3.41.9+sankofa-1"). Required when runtime === 'flutter-code'.
      */
     engine_version?: string;
+    /**
+     * Flutter product flavor the build was compiled with (staging/production).
+     * The server persists this (`handlers.go` → `DeployRelease.Flavor`) and
+     * `gating.go`'s applyFlavorFilter scopes candidates by it — where an EMPTY
+     * flavor is a wildcard that reaches every device. Omitting it is therefore
+     * not neutral: it publishes a release that every flavor's build will pull.
+     */
+    flavor?: string;
   },
   onProgress?: (uploaded: number, total: number) => void,
 ): Promise<any> {

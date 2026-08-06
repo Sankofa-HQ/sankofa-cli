@@ -5,6 +5,7 @@ import { hostname, userInfo } from 'os';
 import { join } from 'path';
 import { saveGlobalConfig, saveProjectConfig } from '../utils/config.js';
 import { createDeployToken } from '../utils/api.js';
+import { listOrgProjects } from '../utils/mfa.js';
 
 /**
  * After a successful login, link the project in the current directory to the
@@ -302,14 +303,38 @@ export const loginCommand = new Command('login')
         console.log(chalk.dim(`  Organization: ${selectedOrg.organization?.name || selectedOrg.organization_id}`));
       }
 
-      // Fetch projects for this org
-      const projRes = await fetch(`${endpoint}/api/projects?org_id=${selectedOrg.organization_id}`, {
-        headers: { 'Authorization': `Bearer ${receivedToken}` },
-      });
-      const projects = projRes.ok ? await projRes.json() as any[] : [];
+      // Fetch projects for this org.
+      //
+      // `sessionToken` (not `receivedToken`) is what the rest of the flow
+      // must use: if the org enforces MFA, listOrgProjects solves the
+      // challenge and hands back a REPLACEMENT JWT. The Deploy-Token mint
+      // below is org-scoped too and would hit the same 403 with the old one.
+      const orgLabel = selectedOrg.organization?.name || selectedOrg.organization_id;
+      let sessionToken = receivedToken;
+      let projects: any[];
+      try {
+        const listed = await listOrgProjects(
+          endpoint,
+          sessionToken,
+          selectedOrg.organization_id,
+          orgLabel,
+          chalk,
+        );
+        projects = listed.data;
+        sessionToken = listed.token;
+      } catch (err: any) {
+        // Surface the real reason. This used to collapse every failure
+        // (401 / 403 mfa_required / 5xx) into "No projects found", which
+        // sent people looking for a dashboard problem that didn't exist.
+        console.log('');
+        console.log(chalk.red(`  ${err.message}`));
+        console.log('');
+        saveGlobalConfig({ apiKey: receivedToken, endpoint });
+        process.exit(1);
+      }
 
-      if (!projects || projects.length === 0) {
-        console.log(chalk.yellow('  No projects found. Create one in the dashboard first.'));
+      if (projects.length === 0) {
+        console.log(chalk.yellow(`  No projects in ${orgLabel}. Create one in the dashboard first.`));
         saveGlobalConfig({ apiKey: receivedToken, endpoint });
         return;
       }
@@ -334,7 +359,7 @@ export const loginCommand = new Command('login')
 
       const tokenSpinner = ora('Creating local Deploy Token...').start();
       const tokenName = `local ${userInfo().username}@${hostname()}`;
-      const tokenResponse = await createDeployToken(endpoint, receivedToken, selectedProject.id, tokenName);
+      const tokenResponse = await createDeployToken(endpoint, sessionToken, selectedProject.id, tokenName);
       tokenSpinner.succeed('Deploy Token created');
 
       // Save deploy credentials with project ID and the session JWT so
@@ -357,7 +382,7 @@ export const loginCommand = new Command('login')
         projectId: selectedProject.id,
         environment,
         runtimeApiKey,
-        sessionJwt: receivedToken,
+        sessionJwt: sessionToken,
       };
 
       if (opts.project) {

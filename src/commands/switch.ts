@@ -3,6 +3,7 @@ import { existsSync, rmSync } from 'fs';
 import { join } from 'path';
 import { createDeployToken } from '../utils/api.js';
 import { loadGlobalConfig, saveGlobalConfig } from '../utils/config.js';
+import { listOrgProjects } from '../utils/mfa.js';
 
 const PROJECT_FILE = '.sankofa.json';
 
@@ -91,20 +92,37 @@ export const switchCommand = new Command('switch')
     }
 
     // 3. Pick project.
+    //
+    // `sessionJwt` may be replaced here: an org with an MFA policy 403s the
+    // project list until the challenge is solved, and the refreshed token is
+    // what the Deploy-Token mint (step 4) and the saved session must carry.
+    const orgLabel = selectedOrg.organization?.name || selectedOrg.organization_id;
     const projSpinner = ora('Loading projects...').start();
     let projects: any[];
+    let sessionJwt = jwt;
     try {
-      const res = await fetch(`${endpoint}/api/projects?org_id=${selectedOrg.organization_id}`, {
-        headers: { Authorization: `Bearer ${jwt}` },
-      });
-      projects = res.ok ? ((await res.json()) as any[]) : [];
+      // Stop the spinner before listing: an MFA challenge prompts on stdin,
+      // and a live spinner would fight the inquirer prompt for the terminal.
+      const listed = await listOrgProjects(
+        endpoint,
+        sessionJwt,
+        selectedOrg.organization_id,
+        orgLabel,
+        chalk,
+        () => projSpinner.stop(),
+      );
+      projects = listed.data;
+      sessionJwt = listed.token;
       projSpinner.succeed(`Found ${projects.length} project(s)`);
     } catch (err: any) {
-      projSpinner.fail(`Failed to list projects: ${err.message}`);
+      projSpinner.stop();
+      console.log('');
+      console.log(chalk.red(`  ${err.message}`));
+      console.log('');
       process.exit(1);
     }
-    if (!projects || projects.length === 0) {
-      console.log(chalk.yellow('  No projects in this organization.'));
+    if (projects.length === 0) {
+      console.log(chalk.yellow(`  No projects in ${orgLabel}.`));
       process.exit(1);
     }
 
@@ -132,7 +150,7 @@ export const switchCommand = new Command('switch')
     try {
       const { hostname, userInfo } = await import('os');
       const tokenName = `local ${userInfo().username}@${hostname()}`;
-      const tokenResponse = await createDeployToken(endpoint, jwt, selectedProject.id, tokenName);
+      const tokenResponse = await createDeployToken(endpoint, sessionJwt, selectedProject.id, tokenName);
       tokenSpinner.succeed('Deploy Token minted');
 
       saveGlobalConfig({
@@ -141,7 +159,7 @@ export const switchCommand = new Command('switch')
         endpoint,
         projectId: selectedProject.id,
         environment: selectedProject.environment === 'test' ? 'test' : 'live',
-        sessionJwt: jwt,
+        sessionJwt,
       });
 
       console.log('');
