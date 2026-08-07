@@ -160,17 +160,33 @@ void main(List<String> args) {
           .map((s) => s.simpleName)
           .toSet();
       final siblingCalls = d.unqualifiedInvokes.intersection(siblings);
-      if (d.usesThis || siblingCalls.isNotEmpty) {
+      // Third construct that cannot cross the seam: a PRIVATE top-level or
+      // static member of the source library. The unit is compiled as its own
+      // library (`--prefix-library-uris sankofa/patch`), so Dart privacy hides
+      // every `_name` in the library it came from, however the unit imports it.
+      // Without this gate the failure lands in dart2bytecode as
+      // `Method not found: '_foo'` against a generated temp file the customer
+      // never wrote — and the CLI discarded that stderr, so the operator saw a
+      // bare "Command failed" with no cause at all.
+      final privateRefs = d.unqualifiedInvokes
+          .where((n) => n.startsWith('_'))
+          .where((n) => !siblings.contains(n))
+          .toSet();
+      if (d.usesThis || siblingCalls.isNotEmpty || privateRefs.isNotEmpty) {
         final reason = d.usesThis
             ? 'uses `this`'
-            : 'calls sibling method(s): ${siblingCalls.join(', ')}';
+            : siblingCalls.isNotEmpty
+                ? 'calls sibling method(s): ${siblingCalls.join(', ')}'
+                : 'references private member(s) of its library: ${privateRefs.join(', ')}';
         stderr.writeln(
           "sankofa patch: '${d.className}.${d.simpleName}' is outside the patchable seam — it $reason.\n"
           '  A patched method body is transplanted as a standalone function. It can use its\n'
           '  parameters, local variables, constants, top-level functions, and imported or\n'
           '  own-library declarations — but not `this`, sibling methods, or instance fields.\n'
           '  Fix: move the shared logic into a top-level function (patchable), or ship this\n'
-          '  change as a store release instead.',
+          '  change as a store release instead.\n'
+          '  For a private member, making it public is usually enough — the patch unit is a\n'
+          '  separate library, so `_name` is invisible to it no matter how it is imported.',
         );
         exit(64);
       }
