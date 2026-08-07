@@ -218,7 +218,7 @@ export function captureBaseNoAotKernel(opts: {
 }): string {
   const t = opts.tools ?? resolveAutoDiffTools(opts.projectRoot);
   mkdirSync(dirname(opts.outputPath), { recursive: true });
-  execFileSync(
+  runTool(
     t.dartaotruntime,
     [
       t.genKernel,
@@ -231,12 +231,40 @@ export function captureBaseNoAotKernel(opts: {
       '--output', opts.outputPath,
       opts.appEntry,
     ],
-    { stdio: ['ignore', 'ignore', 'pipe'], maxBuffer: 64 * 1024 * 1024 },
+    'base kernel compile (gen_kernel)',
+    64 * 1024 * 1024,
   );
   if (!existsSync(opts.outputPath)) {
     throw new Error(`base no-aot kernel not produced at ${opts.outputPath}`);
   }
   return opts.outputPath;
+}
+
+
+/**
+ * `execFileSync` that surfaces the tool's own diagnostic.
+ *
+ * These calls already capture stderr (`stdio: [..., 'pipe']`), but a failure
+ * throws an Error whose `.message` is only `Command failed: <command>` — the
+ * CFE's actual reason ("Method not found: '_catchEnvironment'", "Unable to find
+ * library package:dio/src/dio.dart") sits unread on `.stderr`. Callers print
+ * the message, so the operator sees a 180-character command line and no cause.
+ * Attach it.
+ */
+function runTool(
+  bin: string,
+  args: string[],
+  label: string,
+  maxBuffer: number,
+): void {
+  try {
+    execFileSync(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], maxBuffer });
+  } catch (err: any) {
+    const stderr = String(err?.stderr ?? '').trim();
+    const stdout = String(err?.stdout ?? '').trim();
+    const detail = stderr || stdout;
+    throw new Error(detail ? `${label} failed:\n${detail}` : `${label} failed: ${err?.message ?? err}`);
+  }
 }
 
 /** A source file to diff: the current (edited) version vs the base snapshot. */
@@ -455,7 +483,7 @@ export function compileChangedUnit(opts: {
 }): { modulePath: string; sizeBytes: number } {
   const t = opts.tools ?? resolveAutoDiffTools(opts.projectRoot);
   mkdirSync(dirname(opts.outputPath), { recursive: true });
-  execFileSync(
+  runTool(
     t.dartaotruntime,
     [
       t.dart2bytecode,
@@ -468,7 +496,8 @@ export function compileChangedUnit(opts: {
       '--output', opts.outputPath,
       opts.unitFile,
     ],
-    { stdio: ['ignore', 'ignore', 'pipe'], maxBuffer: 32 * 1024 * 1024 },
+    'patch module compile (dart2bytecode)',
+    32 * 1024 * 1024,
   );
   if (!existsSync(opts.outputPath)) {
     throw new Error(`module not produced at ${opts.outputPath}`);

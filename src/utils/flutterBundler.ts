@@ -4,6 +4,7 @@ import { createHash } from 'crypto';
 import { dirname, join, resolve } from 'path';
 import { ensureEngineVersionStampedInYaml, resolveBundledFlutter, resolvePinnedEngineVersion } from './flutterBundleCache.js';
 import { SANKOFA_STORAGE_BASE_URL, flutterVersionOf, DEFAULT_ENGINE_VERSION } from './engineVersion.js';
+import { findStaleInterfaceEntries, scanPatchableLibraries } from './dartLibraryScan.js';
 
 /**
  * Run a `flutter build …`, adding an actionable diagnostic for the one class of
@@ -117,6 +118,17 @@ function flutterCmd(projectRoot: string | undefined, args: string): string {
  * Convention: `<root>/sankofa_dynamic_interface.yaml` or
  * `<root>/sankofa/dynamic_interface.yaml`. Returns the flags or ''.
  */
+
+/** `name:` from pubspec.yaml — the app's own package for the interface scan. */
+function pubspecPackageName(projectRoot: string): string | undefined {
+  try {
+    const m = /^name:\s*(\S+)/m.exec(readFileSync(join(projectRoot, 'pubspec.yaml'), 'utf-8'));
+    return m?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
 function dynamicInterfaceFlag(projectRoot: string): string {
   const yaml = [
     join(projectRoot, 'sankofa_dynamic_interface.yaml'),
@@ -130,6 +142,40 @@ function dynamicInterfaceFlag(projectRoot: string): string {
     );
     return '';
   }
+  // PRE-FLIGHT: a `library:` entry whose file no longer exists is a hard build
+  // failure, and the compiler blames the ENTRYPOINT, not the interface file:
+  //
+  //   lib/main_prod.dart: Error: Error when reading
+  //   'lib/presentation/screens/chat/chat_page.dart': No such file or directory
+  //
+  // Nothing in that message mentions sankofa_dynamic_interface.yaml, so deleting
+  // a screen silently breaks every subsequent Sankofa build with a diagnostic
+  // pointing at the wrong file. Say it plainly here instead.
+  try {
+    const pkgName = pubspecPackageName(projectRoot);
+    if (pkgName) {
+      const scan = scanPatchableLibraries(projectRoot, pkgName);
+      const stale = findStaleInterfaceEntries(readFileSync(yaml, 'utf-8'), pkgName, scan);
+      if (stale.length > 0) {
+        const lines = stale.map((u) => `      ${u}`).join('\n');
+        throw new Error(
+          `sankofa_dynamic_interface.yaml lists ${stale.length} librar${stale.length === 1 ? 'y' : 'ies'} that no longer exist:\n` +
+            `${lines}\n\n` +
+            `    Deleting or renaming a Dart file leaves the interface stale, and the\n` +
+            `    compiler reports it against your entrypoint rather than this file.\n` +
+            `    Remove those entries, or regenerate: delete ${yaml}\n` +
+            `    and re-run \`sankofa init --deploy\`.`,
+        );
+      }
+    }
+  } catch (err: any) {
+    // A genuine stale-entry error must surface; a scan that simply couldn't run
+    // must not block the build.
+    if (err instanceof Error && err.message.includes('sankofa_dynamic_interface.yaml lists')) {
+      throw err;
+    }
+  }
+
   // NOTE: `--dynamic-interface-annotate-privates` (retains _IntegerImplementation.==,
   // _StringBase, _GrowableList, … so int/string/list ops are FULLY correct for a
   // patch, not just Smi-correct) exists in the engine's Dart 3.12 source but the
