@@ -461,15 +461,46 @@ const CORE_CALLABLE_LIBRARIES = [
   'dart:ui',
 ];
 
+/**
+ * Concrete PRIVATE implementations behind the core interfaces a patch calls.
+ *
+ * Declaring `dart:core` retains its public surface — `List.add` is listed — but
+ * dispatch lands on `_GrowableList.add`, which is private and tree-shaken. The
+ * patch then aborts the process:
+ *
+ *   bytecode_reader.cc:1172: error: Unable to find function add
+ *   in Library:'dart:core' Class: List          → SIGABRT
+ *
+ * `--dynamic-interface-annotate-privates` exists to retain exactly these, but
+ * the bundled frontend_server rejects the flag
+ * ("Could not find an option named ..."), so they are named here instead. The
+ * interface parser accepts class/member granularity, which is what makes this
+ * possible without an engine rebuild.
+ *
+ * Members are DISAMBIGUATED names: plain for methods, `get:`/`set:` for
+ * accessors. (--dump-detailed-dynamic-interface emits undisambiguated names and
+ * therefore cannot be fed back in — that round-trip is broken upstream.)
+ */
+const CORE_PRIVATE_CALLABLE: { library: string; className: string; member: string }[] = [
+  ...['add', 'addAll', 'removeLast', 'removeAt', 'insert', 'clear', '[]', '[]=']
+      .map((m) => ({ library: 'dart:core', className: '_GrowableList', member: m })),
+  ...['[]', '[]=']
+      .map((m) => ({ library: 'dart:core', className: '_List', member: m })),
+];
+
 export function renderDynamicInterfaceYaml(scan: LibraryScanResult): string {
   const items = scan.libraries.map((l) => `  - library: '${l}'`).join('\n');
   // Dependencies are callable-only: a patch constructs a `Dio`, it does not
   // subclass one. Listing them under extendable/can-be-overridden would cost
   // far more tree-shaking for a case that essentially does not arise.
-  const callable = [...CORE_CALLABLE_LIBRARIES, ...scan.libraries, ...scan.externals]
-    .sort()
-    .map((l) => `  - library: '${l}'`)
-    .join('\n');
+  const callable = [
+    ...[...CORE_CALLABLE_LIBRARIES, ...scan.libraries, ...scan.externals]
+      .sort()
+      .map((l) => `  - library: '${l}'`),
+    ...CORE_PRIVATE_CALLABLE.map(
+      (e) => `  - library: '${e.library}'\n    class: '${e.className}'\n    member: '${e.member}'`,
+    ),
+  ].join('\n');
   const entryLines =
     scan.entrypoints.length > 0
       ? scan.entrypoints.map((e) => `#   lib/${e}\n`).join('')
