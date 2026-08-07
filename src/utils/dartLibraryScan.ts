@@ -435,12 +435,38 @@ export function scanPatchableLibraries(
 }
 
 /** Render the scan as a ready-to-write `sankofa_dynamic_interface.yaml`. */
+/**
+ * Core libraries a patch will reach for whatever it does.
+ *
+ * Without these the module loader aborts on the most ordinary code:
+ *
+ *   bytecode_reader.cc:1172: error: Unable to find function add
+ *   in Library:'dart:core' Class: List        → SIGABRT
+ *
+ * `--dynamic-interface` alone retains only Object.==, and the flag meant to
+ * cover the rest (--dynamic-interface-annotate-privates) is rejected by the
+ * bundled frontend_server. Declaring them explicitly is what actually works,
+ * and the validator accepts `dart:` URIs — verified against a real build.
+ *
+ * Costs roughly 2 MB of tree-shaking on a mid-sized app. A patch that cannot
+ * append to a list is not worth the saving.
+ */
+const CORE_CALLABLE_LIBRARIES = [
+  'dart:async',
+  'dart:collection',
+  'dart:convert',
+  'dart:core',
+  'dart:math',
+  'dart:typed_data',
+  'dart:ui',
+];
+
 export function renderDynamicInterfaceYaml(scan: LibraryScanResult): string {
   const items = scan.libraries.map((l) => `  - library: '${l}'`).join('\n');
   // Dependencies are callable-only: a patch constructs a `Dio`, it does not
   // subclass one. Listing them under extendable/can-be-overridden would cost
   // far more tree-shaking for a case that essentially does not arise.
-  const callable = [...scan.libraries, ...scan.externals]
+  const callable = [...CORE_CALLABLE_LIBRARIES, ...scan.libraries, ...scan.externals]
     .sort()
     .map((l) => `  - library: '${l}'`)
     .join('\n');
