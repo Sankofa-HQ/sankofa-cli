@@ -34,6 +34,8 @@ export interface LibraryScanResult {
   entrypoints: string[];
   /** `package:` URIs reachable from EVERY entrypoint — safe for any flavor. */
   libraries: string[];
+  /** Dependency libraries a patch may CALL (not redefine). callable-only. */
+  externals: string[];
   /** Reachable from some but not all entrypoints → unsafe to emit unconditionally. */
   flavorSpecific: { uri: string; reachableFrom: string[] }[];
   /** `part of` files skipped (they are not libraries). */
@@ -81,6 +83,91 @@ export function resolveOwnPackageUri(
   // A `../` that climbs above lib/ escapes the package — not addressable.
   if (joined.startsWith('..')) return null;
   return prefix + joined;
+}
+
+/**
+ * Map `package:<name>/` → that package's lib/ directory on disk, from
+ * `.dart_tool/package_config.json`.
+ *
+ * Dependencies are as provable as the app's own files: the file either exists
+ * in the pub cache or it does not, and if an app library imports it, it IS in
+ * the compiled component. So the "only emit what we can prove" rule holds for
+ * them too — we just have to look somewhere other than `lib/`.
+ *
+ * Returns an empty map when the file is missing or malformed; callers then
+ * degrade to own-package-only, which is the pre-existing behaviour.
+ */
+export function buildPackageLibMap(projectRoot: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const cfgPath = join(projectRoot, '.dart_tool', 'package_config.json');
+  if (!existsSync(cfgPath)) return out;
+  let cfg: { packages?: { name?: string; rootUri?: string; packageUri?: string }[] };
+  try {
+    cfg = JSON.parse(readFileSync(cfgPath, 'utf-8'));
+  } catch {
+    return out;
+  }
+  const base = join(projectRoot, '.dart_tool');
+  for (const p of cfg.packages ?? []) {
+    if (!p.name || !p.rootUri) continue;
+    let root = p.rootUri;
+    // rootUri is a file: URI, or a path relative to .dart_tool/.
+    if (root.startsWith('file://')) {
+      try {
+        root = decodeURIComponent(new URL(root).pathname);
+      } catch {
+        continue;
+      }
+    } else {
+      root = join(base, root);
+    }
+    out.set(p.name, join(root, (p.packageUri ?? 'lib/').replace(/\/$/, '')));
+  }
+  return out;
+}
+
+/**
+ * Resolve an import/export URI to a `package:` URI, for ANY package.
+ *
+ * `resolveOwnPackageUri` deliberately drops dependencies, because they are not
+ * part of the surface a patch may REDEFINE. But they are very much part of the
+ * surface a patch may CALL: a patched function that constructs a `Dio` needs
+ * `package:dio/src/dio.dart` resolvable on device, and without it the module
+ * loader aborts the process (`Unable to find library …`, SIGABRT inside
+ * `loadDynamicModule`). Those are two different questions and this answers the
+ * second.
+ */
+export function resolveAnyPackageUri(
+  selfUri: string,
+  rawUri: string,
+  ownPackage: string,
+): string | null {
+  if (rawUri.startsWith('dart:')) return null;
+  if (rawUri.startsWith('package:')) return rawUri;
+  // Relative — resolve against whichever package the importing library is in.
+  const m = /^package:([^/]+)\/(.*)$/.exec(selfUri);
+  if (!m) return null;
+  const [, selfPkg, selfPath] = m;
+  if (rawUri.startsWith('/')) return `package:${selfPkg}/${rawUri.slice(1)}`;
+  const dir = posix.dirname(selfPath);
+  const joined = posix.normalize(posix.join(dir === '.' ? '' : dir, rawUri));
+  if (joined.startsWith('..')) return null;
+  return `package:${selfPkg}/${joined}`;
+}
+
+/** Absolute path for a `package:` URI, or null when the package is unknown. */
+function packageUriToPath(
+  uri: string,
+  ownPackage: string,
+  libRoot: string,
+  pkgMap: Map<string, string>,
+): string | null {
+  const m = /^package:([^/]+)\/(.*)$/.exec(uri);
+  if (!m) return null;
+  const [, pkg, rel] = m;
+  if (pkg === ownPackage) return join(libRoot, rel);
+  const libDir = pkgMap.get(pkg);
+  return libDir ? join(libDir, rel) : null;
 }
 
 interface Directives {
@@ -159,12 +246,62 @@ export function findEntrypoints(projectRoot: string): string[] {
   return found;
 }
 
-/** Transitive own-package closure from one entrypoint. */
+/**
+ * Export-only closure from a dependency library.
+ *
+ * A patch references the DEFINING library, not the facade: `Dio` is declared in
+ * `package:dio/src/dio.dart` and merely re-exported by `package:dio/dio.dart`,
+ * and it is the defining URI the module loader looks up. Following `export`
+ * (not `import`) from each directly-imported dependency reaches those defining
+ * libraries without dragging in the dependency's own transitive imports — which
+ * would pull all of package:flutter in and gut tree-shaking.
+ */
+function exportClosure(
+  seed: string,
+  ownPackage: string,
+  libRoot: string,
+  pkgMap: Map<string, string>,
+  acc: { partFiles: Set<string>; conditional: Set<string>; missing: Set<string> },
+): Set<string> {
+  const out = new Set<string>();
+  const seen = new Set<string>();
+  const queue = [seed];
+  while (queue.length > 0) {
+    const uri = queue.shift()!;
+    if (seen.has(uri)) continue;
+    seen.add(uri);
+    const file = packageUriToPath(uri, ownPackage, libRoot, pkgMap);
+    if (!file || !existsSync(file)) continue; // unresolvable → prove nothing, emit nothing
+    let src: string;
+    try {
+      src = readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    const clean = stripComments(src);
+    if (/^\s*part\s+of\b/m.test(clean)) continue;
+    out.add(uri);
+    const re = /^\s*export\s+(['"])([^'"]+)\1([^;]*);/gm;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(clean)) !== null) {
+      const [, , raw, tail] = m;
+      if (/\bif\s*\(/.test(tail)) continue; // conditional → cannot prove the variant
+      const next = resolveAnyPackageUri(uri, raw, ownPackage);
+      if (next) queue.push(next);
+    }
+  }
+  return out;
+}
+
+/** Transitive own-package closure from one entrypoint, plus the dependency
+ *  libraries its code can reference. */
 function closureFrom(
   projectRoot: string,
   packageName: string,
   entryRel: string,
   acc: { partFiles: Set<string>; conditional: Set<string>; missing: Set<string> },
+  pkgMap: Map<string, string>,
+  external: Set<string>,
 ): Set<string> {
   const prefix = `package:${packageName}/`;
   const libRoot = join(projectRoot, 'lib');
@@ -197,7 +334,20 @@ function closureFrom(
 
     for (const imp of imports) {
       const resolved = resolveOwnPackageUri(uri, imp.uri, packageName);
-      if (!resolved) continue; // dart: / external package — not our surface
+      if (!resolved) {
+        // Not ours to redefine — but a patched body may still CALL into it, so
+        // the defining libraries must survive tree-shaking. Conditional imports
+        // are skipped for the same reason as below: we can't prove the variant.
+        if (!imp.conditional) {
+          const dep = resolveAnyPackageUri(uri, imp.uri, packageName);
+          if (dep && !dep.startsWith(prefix)) {
+            for (const lib of exportClosure(dep, packageName, libRoot, pkgMap, acc)) {
+              external.add(lib);
+            }
+          }
+        }
+        continue;
+      }
       if (imp.conditional) {
         // Exactly one variant survives compilation and we cannot tell which
         // from source alone. Skipping costs patchability; guessing costs the build.
@@ -228,6 +378,7 @@ export function scanPatchableLibraries(
   const empty: LibraryScanResult = {
     entrypoints,
     libraries: [],
+    externals: [],
     flavorSpecific: [],
     partFiles: 0,
     conditional: [],
@@ -235,9 +386,25 @@ export function scanPatchableLibraries(
   };
   if (entrypoints.length === 0) return empty;
 
+  const pkgMap = buildPackageLibMap(projectRoot);
   const perEntry = new Map<string, Set<string>>();
+  const perEntryExternal = new Map<string, Set<string>>();
   for (const entry of entrypoints) {
-    perEntry.set(entry, closureFrom(projectRoot, packageName, entry, acc));
+    const external = new Set<string>();
+    perEntry.set(entry, closureFrom(projectRoot, packageName, entry, acc, pkgMap, external));
+    perEntryExternal.set(entry, external);
+  }
+
+  // Same intersection rule as app libraries: a dependency reachable from only
+  // one entrypoint is absent from the other flavors' components, and naming it
+  // there is a hard build failure.
+  const externals: string[] = [];
+  if (perEntryExternal.size > 0) {
+    const [first, ...rest] = [...perEntryExternal.values()];
+    for (const uri of first) {
+      if (rest.every((s) => s.has(uri))) externals.push(uri);
+    }
+    externals.sort();
   }
 
   // Intersection = valid for EVERY flavor build. Anything reachable from only
@@ -259,6 +426,7 @@ export function scanPatchableLibraries(
   return {
     entrypoints,
     libraries: common,
+    externals,
     flavorSpecific,
     partFiles: acc.partFiles.size,
     conditional: [...acc.conditional].sort(),
@@ -269,6 +437,13 @@ export function scanPatchableLibraries(
 /** Render the scan as a ready-to-write `sankofa_dynamic_interface.yaml`. */
 export function renderDynamicInterfaceYaml(scan: LibraryScanResult): string {
   const items = scan.libraries.map((l) => `  - library: '${l}'`).join('\n');
+  // Dependencies are callable-only: a patch constructs a `Dio`, it does not
+  // subclass one. Listing them under extendable/can-be-overridden would cost
+  // far more tree-shaking for a case that essentially does not arise.
+  const callable = [...scan.libraries, ...scan.externals]
+    .sort()
+    .map((l) => `  - library: '${l}'`)
+    .join('\n');
   const entryLines =
     scan.entrypoints.length > 0
       ? scan.entrypoints.map((e) => `#   lib/${e}\n`).join('')
@@ -297,6 +472,10 @@ export function renderDynamicInterfaceYaml(scan: LibraryScanResult): string {
     `# public members out of tree-shaking, which grows the binary.\n` +
     `#\n` +
     `#   callable:          may be CALLED from a patch\n` +
+    `#                      (includes dependency libraries your code imports —\n` +
+    `#                      a patch that constructs e.g. a Dio needs the\n` +
+    `#                      DEFINING library resolvable on device, or the module\n` +
+    `#                      loader aborts with "Unable to find library ...")\n` +
     `#   extendable:        may be SUBCLASSED by a patch\n` +
     `#   can-be-overridden: its methods may be OVERRIDDEN by a patch\n`;
 
@@ -319,7 +498,7 @@ export function renderDynamicInterfaceYaml(scan: LibraryScanResult): string {
 
   return (
     `${header}\n` +
-    `callable:\n${items}\n\n` +
+    `callable:\n${callable}\n\n` +
     `extendable:\n${items}\n\n` +
     `can-be-overridden:\n${items}\n`
   );

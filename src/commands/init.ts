@@ -220,7 +220,7 @@ export const initCommand = new Command('init')
     for (const productId of products) {
       console.log('');
       console.log(chalk.cyan(`  ▸ ${PRODUCTS[productId].name}`));
-      await installProduct(productId, project, endpoint, chalk);
+      await installProduct(productId, project, endpoint, chalk, environment);
     }
 
     // 5. Final verify hint.
@@ -235,10 +235,11 @@ async function installProduct(
   project: ProjectInfo,
   endpoint: string,
   chalk: any,
+  environment: 'live' | 'test' = 'live',
 ): Promise<void> {
   switch (productId) {
     case 'deploy':
-      return installDeploy(project, endpoint, chalk);
+      return installDeploy(project, endpoint, chalk, environment);
     case 'switch':
       return installSwitch(project, endpoint, chalk);
     case 'config':
@@ -250,11 +251,16 @@ async function installProduct(
 
 // ── Deploy ────────────────────────────────────────────────────────────────────
 
-async function installDeploy(project: ProjectInfo, endpoint: string, chalk: any) {
+async function installDeploy(
+  project: ProjectInfo,
+  endpoint: string,
+  chalk: any,
+  environment: 'live' | 'test' = 'live',
+) {
   if (project.stack === 'react-native') {
     await installDeployRN(project, endpoint, chalk);
   } else if (project.stack === 'flutter') {
-    await installDeployFlutter(project, endpoint, chalk);
+    await installDeployFlutter(project, endpoint, chalk, environment);
   } else {
     console.log(chalk.yellow(`  ⚠ Deploy is not yet available for ${STACK_LABELS[project.stack]}`));
   }
@@ -317,7 +323,12 @@ async function installDeployRN(project: ProjectInfo, endpoint: string, chalk: an
        deploy.notifyAppReady();`));
 }
 
-async function installDeployFlutter(project: ProjectInfo, endpoint: string, chalk: any) {
+async function installDeployFlutter(
+  project: ProjectInfo,
+  endpoint: string,
+  chalk: any,
+  environment: 'live' | 'test' = 'live',
+) {
   const result = patchFlutterNativeFiles(project.root, endpoint, chalk);
   const pubspecPath = join(project.root, 'pubspec.yaml');
 
@@ -345,10 +356,40 @@ async function installDeployFlutter(project: ProjectInfo, endpoint: string, chal
   //    + a clear "run login to finish" next step (login backfills them).
   const projectId = readProjectId(project.root) ?? '';
   const globalCfg = loadGlobalConfig();
-  const apiKey =
-    globalCfg.runtimeApiKey && globalCfg.projectId === projectId
-      ? globalCfg.runtimeApiKey
-      : '';
+  // The key decides which ENVIRONMENT the device polls — the server resolves
+  // project AND environment from it (`api_key = ? OR test_api_key = ?`). So a
+  // `--env test` setup that ships the live key points the app at live while the
+  // CLI publishes to test, and every check comes back `no_matching_release`.
+  // Pick the key that matches the environment being set up.
+  const sameProject = globalCfg.projectId === projectId;
+  const wantsTest = environment === 'test';
+  let apiKey = '';
+  if (sameProject) {
+    apiKey = wantsTest
+      ? globalCfg.runtimeTestApiKey || ''
+      : globalCfg.runtimeApiKey || '';
+    if (wantsTest && !apiKey && globalCfg.runtimeApiKey) {
+      // Session predates test-key capture (or the project has none). Fall back
+      // rather than leave a placeholder, but say so — silently writing a live
+      // key here is the failure this comment exists to prevent.
+      apiKey = globalCfg.runtimeApiKey;
+      console.log(
+        chalk.yellow(
+          '     ⚠  No sk_test_ key in this session — wrote the live key to sankofa.yaml.',
+        ),
+      );
+      console.log(
+        chalk.dim(
+          '        The app will poll the LIVE environment. Re-run `sankofa login`,',
+        ),
+      );
+      console.log(
+        chalk.dim(
+          '        or paste the project\'s sk_test_ key into sankofa.yaml by hand.',
+        ),
+      );
+    }
+  }
   tryCreateSankofaYaml(project.root, projectId, apiKey, endpoint, chalk);
 
   // 5b. Stamp the engine pin into sankofa.yaml right away. The SDK reports

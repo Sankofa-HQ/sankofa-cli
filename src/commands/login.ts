@@ -374,6 +374,10 @@ export const loginCommand = new Command('login')
         environment === 'test'
           ? selectedProject.test_api_key || selectedProject.api_key
           : selectedProject.api_key;
+      // Keep the test key too: `init --env test` needs it, and the project's
+      // own environment says nothing about which environment the user is
+      // setting the app up for.
+      const runtimeTestApiKey: string | undefined = selectedProject.test_api_key;
 
       const config = {
         token: tokenResponse.token,
@@ -382,6 +386,7 @@ export const loginCommand = new Command('login')
         projectId: selectedProject.id,
         environment,
         runtimeApiKey,
+        runtimeTestApiKey,
         sessionJwt: sessionToken,
       };
 
