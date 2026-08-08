@@ -216,7 +216,7 @@ void main(List<String> args) {
     ..writeln("@pragma('vm:entry-point')")
     ..writeln("String _sankofaManifest() => '${manifest.replaceAll(r'\', r'\\').replaceAll("'", r"\'")}';")
     ..writeln("@pragma('dyn-module:entry-point')")
-    ..writeln("Object? _sankofaEntry() { _sankofaManifest(); return null; }");
+    ..writeln("Object? _sankofaEntry() { _sankofaManifest();${_topLevelInvocations(targets)} return null; }");
   File(out).writeAsStringSync(buf.toString());
   stdout.write(manifest);
 }
@@ -308,4 +308,20 @@ class _InvokeCollector extends RecursiveAstVisitor<void> {
 String _withEntryPoint(String src) {
   if (src.contains('vm:entry-point')) return src;
   return "@pragma('vm:entry-point')\n$src";
+}
+
+/// Direct calls to the transplanted TOP-LEVEL functions, emitted into the
+/// module entry point. The entry point runs at load (the dyn-module:entry-point
+/// contract), so this makes a patched top-level function actually execute —
+/// the manifest alone only registers it for dispatch reroute, which does not
+/// fire for a function the app has already bound. Method targets ("Class.m=fn")
+/// are left to the reroute; only bare top-level names are invoked here.
+String _topLevelInvocations(List<String> targets) {
+  final calls = <String>[];
+  for (final t in targets) {
+    if (t.contains('=')) continue; // method reroute, not a direct call
+    if (t == 'main') continue;
+    calls.add('try { $t(); } catch (_) {}');
+  }
+  return calls.isEmpty ? '' : ' ${calls.join(' ')}';
 }

@@ -486,8 +486,23 @@ const CORE_CALLABLE_LIBRARIES = [
 // "A member with disambiguated name '[]' was not found in class '_List'".
 // Entries here must be verified against a real build; the parser is exact.
 const CORE_PRIVATE_CALLABLE: { library: string; className: string; member: string }[] = [
+  // The concrete implementation dispatch lands on...
   ...['add', 'addAll', 'removeLast', 'removeAt', 'insert', 'clear', '[]', '[]=']
       .map((m) => ({ library: 'dart:core', className: '_GrowableList', member: m })),
+  // ...AND the abstract interface member the patch's constant pool names.
+  // Both are required: declaring `- library: 'dart:core'` retains the library's
+  // public surface as the compiler models it, but the patch references
+  // `List.add` as an interface method and the runtime lookup for it still
+  // failed —
+  //   bytecode_reader.cc:1172: Unable to find function add
+  //   in Library:'dart:core' Class: List
+  // — until the member was named explicitly at class/member granularity.
+  ...['add', 'addAll', 'removeLast', 'removeAt', 'insert', 'clear', '[]', '[]=']
+      .map((m) => ({ library: 'dart:core', className: 'List', member: m })),
+  ...['add', 'remove', 'contains', 'clear']
+      .map((m) => ({ library: 'dart:core', className: 'Set', member: m })),
+  ...['[]', '[]=', 'putIfAbsent', 'remove', 'containsKey']
+      .map((m) => ({ library: 'dart:core', className: 'Map', member: m })),
 ];
 
 export function renderDynamicInterfaceYaml(scan: LibraryScanResult): string {
