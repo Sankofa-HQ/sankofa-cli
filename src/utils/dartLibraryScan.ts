@@ -481,11 +481,13 @@ const CORE_CALLABLE_LIBRARIES = [
  * accessors. (--dump-detailed-dynamic-interface emits undisambiguated names and
  * therefore cannot be fed back in — that round-trip is broken upstream.)
  */
+// Only _GrowableList: `_List` (the fixed-length backing) exposes no `[]`
+// member under that name — declaring it fails the build with
+// "A member with disambiguated name '[]' was not found in class '_List'".
+// Entries here must be verified against a real build; the parser is exact.
 const CORE_PRIVATE_CALLABLE: { library: string; className: string; member: string }[] = [
   ...['add', 'addAll', 'removeLast', 'removeAt', 'insert', 'clear', '[]', '[]=']
       .map((m) => ({ library: 'dart:core', className: '_GrowableList', member: m })),
-  ...['[]', '[]=']
-      .map((m) => ({ library: 'dart:core', className: '_List', member: m })),
 ];
 
 export function renderDynamicInterfaceYaml(scan: LibraryScanResult): string {
