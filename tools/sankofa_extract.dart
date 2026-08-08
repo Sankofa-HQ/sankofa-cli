@@ -259,7 +259,7 @@ void main(List<String> args) {
     ..writeln("@pragma('vm:entry-point')")
     ..writeln("String _sankofaManifest() => '${manifest.replaceAll(r'\', r'\\').replaceAll("'", r"\'")}';")
     ..writeln("@pragma('dyn-module:entry-point')")
-    ..writeln("Object? _sankofaEntry() { _sankofaManifest();${_topLevelInvocations(targets)} return 'SANKOFA_ENTRY_RAN'; }");
+    ..writeln("Object? _sankofaEntry() { _sankofaManifest(); Object? _r;${_topLevelInvocations(targets)} return _r ?? 'SANKOFA_ENTRY_RAN'; }");
   File(out).writeAsStringSync(buf.toString());
   stdout.write(manifest);
 }
@@ -364,7 +364,9 @@ String _topLevelInvocations(List<String> targets) {
   for (final t in targets) {
     if (t.contains('=')) continue; // method reroute, not a direct call
     if (t == 'main') continue;
-    calls.add('try { $t(); } catch (_) {}');
+    // Capture the return value so a pure patched function's result reaches the
+    // host via applyKbcEnvelope's returnValue.
+    calls.add('try { _r = $t(); } catch (_) {}');
   }
   return calls.isEmpty ? '' : ' ${calls.join(' ')}';
 }
