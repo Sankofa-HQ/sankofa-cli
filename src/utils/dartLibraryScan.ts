@@ -456,6 +456,7 @@ const CORE_CALLABLE_LIBRARIES = [
   'dart:collection',
   'dart:convert',
   'dart:core',
+  'dart:io',
   'dart:math',
   'dart:typed_data',
   'dart:ui',

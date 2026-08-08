@@ -128,14 +128,21 @@ void main(List<String> args) {
     }
   }
 
-  // Emit the unit: changed + cascade decls, their files' imports, the manifest.
-  final imports = <String>{};
+  // Emit the unit: changed + cascade decls, the imports their bodies actually
+  // use, and the manifest. NOT the whole file's imports — a dynamic module's
+  // constant pool must resolve every referenced library against the base image,
+  // and carrying unused imports (flutter/material + every app library, for a
+  // function that touches none) makes the loader abort in ReadConstantPool.
+  final candidateImports = <String>{};
   final bodies = <String>[];
   final targets = <String>[];
+  final bodyText = StringBuffer();
   for (final q in transplant) {
     final d = decls[q];
     if (d == null) continue;
-    imports.addAll(importsByFile[d.file] ?? const <String>{});
+    candidateImports.addAll(importsByFile[d.file] ?? const <String>{});
+    bodyText.write(d.source);
+    bodyText.write('\n');
     if (d.className == null) {
       bodies.add(_withEntryPoint(d.source));
       targets.add(d.simpleName);
@@ -200,6 +207,42 @@ void main(List<String> args) {
     }
   }
 
+  // Keep an import only if a bare identifier it could provide appears in the
+  // transplant bodies. Conservative: on any doubt (show/hide combinators,
+  // prefixes) keep it. The win is dropping the dozens of app/framework imports
+  // a small patch never touches.
+  final body = bodyText.toString();
+  final imports = <String>{};
+  for (final imp in candidateImports) {
+    final m = RegExp(r"\bshow\s+([A-Za-z0-9_,\s]+)").firstMatch(imp);
+    if (m != null) {
+      final names = m.group(1)!.split(',').map((e) => e.trim());
+      if (names.any((n) => n.isNotEmpty && RegExp('\\b' + RegExp.escape(n) + '\\b').hasMatch(body))) {
+        imports.add(imp);
+      }
+      continue;
+    }
+    // Entry-point infrastructure — always keep.
+    if (imp.contains('dynamic_modules') || imp.contains('sankofa_flutter')) {
+      imports.add(imp); continue;
+    }
+    if (imp.contains(' as ')) {
+      // Prefixed: keep only if the prefix is used in the body.
+      final pm = RegExp(r"\bas\s+([A-Za-z0-9_]+)").firstMatch(imp);
+      final pfx = pm?.group(1);
+      if (pfx != null && RegExp('\\b' + RegExp.escape(pfx) + r'\.').hasMatch(body)) imports.add(imp);
+      continue;
+    }
+    // Plain `import 'uri';` — keep only if some Capitalized identifier from the
+    // body could plausibly come from it. We can't resolve its exports, so keep
+    // it when the body references ANY capitalized identifier or lowercase call
+    // that isn't obviously local. Aggressive: for a pure body (no external
+    // refs) this drops all of them, matching the baseline module's shape.
+    final hasExternalRef = RegExp(r'\b[A-Z][A-Za-z0-9_]*\b').hasMatch(
+        body.replaceAll(RegExp(r'//[^\n]*'), ''));
+    if (hasExternalRef) imports.add(imp);
+  }
+
   final manifest = targets.join(',');
   if (targets.isEmpty) {
     File(out).writeAsStringSync('// no changes\n');
@@ -216,7 +259,7 @@ void main(List<String> args) {
     ..writeln("@pragma('vm:entry-point')")
     ..writeln("String _sankofaManifest() => '${manifest.replaceAll(r'\', r'\\').replaceAll("'", r"\'")}';")
     ..writeln("@pragma('dyn-module:entry-point')")
-    ..writeln("Object? _sankofaEntry() { _sankofaManifest();${_topLevelInvocations(targets)} return null; }");
+    ..writeln("Object? _sankofaEntry() { _sankofaManifest();${_topLevelInvocations(targets)} return 'SANKOFA_ENTRY_RAN'; }");
   File(out).writeAsStringSync(buf.toString());
   stdout.write(manifest);
 }
