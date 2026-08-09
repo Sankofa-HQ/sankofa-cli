@@ -487,12 +487,6 @@ const CORE_CALLABLE_LIBRARIES = [
 // "A member with disambiguated name '[]' was not found in class '_List'".
 // Entries here must be verified against a real build; the parser is exact.
 const CORE_PRIVATE_CALLABLE: { library: string; className: string; member: string }[] = [
-  // Integer operators (int +,-,* etc. dispatch to _IntegerImplementation).
-  ...['+','-','*','~/','/','%','unary-','&','|','^','remainder']
-      .map((m) => ({ library: 'dart:core', className: '_IntegerImplementation', member: m })),
-  // String operators (concat, index, substring).
-  ...['+','[]','substring','compareTo']
-      .map((m) => ({ library: 'dart:core', className: '_StringBase', member: m })),
   // The concrete implementation dispatch lands on...
   ...['add', 'addAll', 'removeLast', 'removeAt', 'insert', 'clear', '[]', '[]=']
       .map((m) => ({ library: 'dart:core', className: '_GrowableList', member: m })),
