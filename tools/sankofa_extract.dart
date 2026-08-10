@@ -128,14 +128,21 @@ void main(List<String> args) {
     }
   }
 
-  // Emit the unit: changed + cascade decls, their files' imports, the manifest.
-  final imports = <String>{};
+  // Emit the unit: changed + cascade decls, the imports their bodies actually
+  // use, and the manifest. NOT the whole file's imports — a dynamic module's
+  // constant pool must resolve every referenced library against the base image,
+  // and carrying unused imports (flutter/material + every app library, for a
+  // function that touches none) makes the loader abort in ReadConstantPool.
+  final candidateImports = <String>{};
   final bodies = <String>[];
   final targets = <String>[];
+  final bodyText = StringBuffer();
   for (final q in transplant) {
     final d = decls[q];
     if (d == null) continue;
-    imports.addAll(importsByFile[d.file] ?? const <String>{});
+    candidateImports.addAll(importsByFile[d.file] ?? const <String>{});
+    bodyText.write(d.source);
+    bodyText.write('\n');
     if (d.className == null) {
       bodies.add(_withEntryPoint(d.source));
       targets.add(d.simpleName);
@@ -160,17 +167,33 @@ void main(List<String> args) {
           .map((s) => s.simpleName)
           .toSet();
       final siblingCalls = d.unqualifiedInvokes.intersection(siblings);
-      if (d.usesThis || siblingCalls.isNotEmpty) {
+      // Third construct that cannot cross the seam: a PRIVATE top-level or
+      // static member of the source library. The unit is compiled as its own
+      // library (`--prefix-library-uris sankofa/patch`), so Dart privacy hides
+      // every `_name` in the library it came from, however the unit imports it.
+      // Without this gate the failure lands in dart2bytecode as
+      // `Method not found: '_foo'` against a generated temp file the customer
+      // never wrote — and the CLI discarded that stderr, so the operator saw a
+      // bare "Command failed" with no cause at all.
+      final privateRefs = d.unqualifiedInvokes
+          .where((n) => n.startsWith('_'))
+          .where((n) => !siblings.contains(n))
+          .toSet();
+      if (d.usesThis || siblingCalls.isNotEmpty || privateRefs.isNotEmpty) {
         final reason = d.usesThis
             ? 'uses `this`'
-            : 'calls sibling method(s): ${siblingCalls.join(', ')}';
+            : siblingCalls.isNotEmpty
+                ? 'calls sibling method(s): ${siblingCalls.join(', ')}'
+                : 'references private member(s) of its library: ${privateRefs.join(', ')}';
         stderr.writeln(
           "sankofa patch: '${d.className}.${d.simpleName}' is outside the patchable seam — it $reason.\n"
           '  A patched method body is transplanted as a standalone function. It can use its\n'
           '  parameters, local variables, constants, top-level functions, and imported or\n'
           '  own-library declarations — but not `this`, sibling methods, or instance fields.\n'
           '  Fix: move the shared logic into a top-level function (patchable), or ship this\n'
-          '  change as a store release instead.',
+          '  change as a store release instead.\n'
+          '  For a private member, making it public is usually enough — the patch unit is a\n'
+          '  separate library, so `_name` is invisible to it no matter how it is imported.',
         );
         exit(64);
       }
@@ -182,6 +205,42 @@ void main(List<String> args) {
           '${_withEntryPoint(src.trim())}');
       targets.add('${d.className}.${d.simpleName}=$topName');
     }
+  }
+
+  // Keep an import only if a bare identifier it could provide appears in the
+  // transplant bodies. Conservative: on any doubt (show/hide combinators,
+  // prefixes) keep it. The win is dropping the dozens of app/framework imports
+  // a small patch never touches.
+  final body = bodyText.toString();
+  final imports = <String>{};
+  for (final imp in candidateImports) {
+    final m = RegExp(r"\bshow\s+([A-Za-z0-9_,\s]+)").firstMatch(imp);
+    if (m != null) {
+      final names = m.group(1)!.split(',').map((e) => e.trim());
+      if (names.any((n) => n.isNotEmpty && RegExp('\\b' + RegExp.escape(n) + '\\b').hasMatch(body))) {
+        imports.add(imp);
+      }
+      continue;
+    }
+    // Entry-point infrastructure — always keep.
+    if (imp.contains('dynamic_modules') || imp.contains('sankofa_flutter')) {
+      imports.add(imp); continue;
+    }
+    if (imp.contains(' as ')) {
+      // Prefixed: keep only if the prefix is used in the body.
+      final pm = RegExp(r"\bas\s+([A-Za-z0-9_]+)").firstMatch(imp);
+      final pfx = pm?.group(1);
+      if (pfx != null && RegExp('\\b' + RegExp.escape(pfx) + r'\.').hasMatch(body)) imports.add(imp);
+      continue;
+    }
+    // Plain `import 'uri';` — keep only if some Capitalized identifier from the
+    // body could plausibly come from it. We can't resolve its exports, so keep
+    // it when the body references ANY capitalized identifier or lowercase call
+    // that isn't obviously local. Aggressive: for a pure body (no external
+    // refs) this drops all of them, matching the baseline module's shape.
+    final hasExternalRef = RegExp(r'\b[A-Z][A-Za-z0-9_]*\b').hasMatch(
+        body.replaceAll(RegExp(r'//[^\n]*'), ''));
+    if (hasExternalRef) imports.add(imp);
   }
 
   final manifest = targets.join(',');
@@ -200,7 +259,7 @@ void main(List<String> args) {
     ..writeln("@pragma('vm:entry-point')")
     ..writeln("String _sankofaManifest() => '${manifest.replaceAll(r'\', r'\\').replaceAll("'", r"\'")}';")
     ..writeln("@pragma('dyn-module:entry-point')")
-    ..writeln("Object? _sankofaEntry() { _sankofaManifest(); return null; }");
+    ..writeln("Object? _sankofaEntry() { _sankofaManifest(); Object? _r;${_topLevelInvocations(targets)} return _r ?? 'SANKOFA_ENTRY_RAN'; }");
   File(out).writeAsStringSync(buf.toString());
   stdout.write(manifest);
 }
@@ -292,4 +351,22 @@ class _InvokeCollector extends RecursiveAstVisitor<void> {
 String _withEntryPoint(String src) {
   if (src.contains('vm:entry-point')) return src;
   return "@pragma('vm:entry-point')\n$src";
+}
+
+/// Direct calls to the transplanted TOP-LEVEL functions, emitted into the
+/// module entry point. The entry point runs at load (the dyn-module:entry-point
+/// contract), so this makes a patched top-level function actually execute —
+/// the manifest alone only registers it for dispatch reroute, which does not
+/// fire for a function the app has already bound. Method targets ("Class.m=fn")
+/// are left to the reroute; only bare top-level names are invoked here.
+String _topLevelInvocations(List<String> targets) {
+  final calls = <String>[];
+  for (final t in targets) {
+    if (t.contains('=')) continue; // method reroute, not a direct call
+    if (t == 'main') continue;
+    // Capture the return value so a pure patched function's result reaches the
+    // host via applyKbcEnvelope's returnValue.
+    calls.add('try { _r = $t(); } catch (_) {}');
+  }
+  return calls.isEmpty ? '' : ' ${calls.join(' ')}';
 }

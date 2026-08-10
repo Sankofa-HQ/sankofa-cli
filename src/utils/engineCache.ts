@@ -15,7 +15,7 @@ import {
 import { createHash } from 'crypto';
 import { homedir } from 'os';
 import { join, dirname } from 'path';
-import { resolveEngineDownloadURL, type KnownEngine } from './engineRegistry.js';
+import { engineDownloadCandidates, type KnownEngine } from './engineRegistry.js';
 
 /**
  * # Engine cache
@@ -140,12 +140,31 @@ export async function downloadEngineIntoCache(
   const entry = locateEngineInCache(engine);
   mkdirSync(dirname(entry.path), { recursive: true });
 
-  const url = resolveEngineDownloadURL(engine);
-  const res = await fetch(url, { method: 'GET' });
-  if (!res.ok || !res.body) {
+  // Try every known URL before declaring failure. See
+  // engineDownloadCandidates() for why one URL is never enough.
+  const candidates = engineDownloadCandidates(engine);
+  if (candidates.length === 0) {
     throw new Error(
-      `Engine download failed: HTTP ${res.status} from ${url}.\n` +
+      `Engine download failed: no download URL could be resolved.\n` +
         `(${engine.flutter_version} ${engine.target} ${engine.abi})`,
+    );
+  }
+  let res: Response | undefined;
+  const attempts: string[] = [];
+  for (const candidate of candidates) {
+    const r = await fetch(candidate, { method: 'GET' });
+    if (r.ok && r.body) {
+      res = r;
+      break;
+    }
+    // Drain the failed body so the socket is released promptly.
+    try { await r.arrayBuffer(); } catch { /* ignore */ }
+    attempts.push(`  HTTP ${r.status}  ${candidate}`);
+  }
+  if (!res || !res.body) {
+    throw new Error(
+      `Engine download failed for ${engine.flutter_version} ${engine.target} ${engine.abi} — ` +
+        `all ${candidates.length} source(s) failed:\n${attempts.join('\n')}`,
     );
   }
   const total = engine.size_bytes;

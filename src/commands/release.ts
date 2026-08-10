@@ -865,6 +865,10 @@ export async function flutterRelease(
       environment,
       runtime: 'flutter-code',
       engine_version: engineVersion,
+      // Without this the row lands with flavor='' — which gating.go treats as
+      // a WILDCARD, so a staging release is served to prod devices and vice
+      // versa. --flavor was only reaching the build, never the release record.
+      flavor: opts.flavor,
       ...previewArtifact,
     });
     uploadSpinner.succeed('Release uploaded.');
@@ -1154,6 +1158,9 @@ async function flutterReleaseIOS(
       environment,
       runtime: 'flutter-code',
       engine_version: engineVersion,
+      // See the Android path — an omitted flavor is a server-side wildcard,
+      // not a neutral default.
+      flavor: opts.flavor,
       ...previewArtifact,
     });
     uploadSpinner.succeed('Baseline registered.');

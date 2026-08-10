@@ -24,6 +24,11 @@ import {
   selectedProducts,
   type ProductId,
 } from '../utils/products.js';
+import {
+  findStaleInterfaceEntries,
+  renderDynamicInterfaceYaml,
+  scanPatchableLibraries,
+} from '../utils/dartLibraryScan.js';
 
 /**
  * The Sankofa-managed `.gitignore` block — ONE consolidated section. Only
@@ -215,7 +220,7 @@ export const initCommand = new Command('init')
     for (const productId of products) {
       console.log('');
       console.log(chalk.cyan(`  ▸ ${PRODUCTS[productId].name}`));
-      await installProduct(productId, project, endpoint, chalk);
+      await installProduct(productId, project, endpoint, chalk, environment);
     }
 
     // 5. Final verify hint.
@@ -230,10 +235,11 @@ async function installProduct(
   project: ProjectInfo,
   endpoint: string,
   chalk: any,
+  environment: 'live' | 'test' = 'live',
 ): Promise<void> {
   switch (productId) {
     case 'deploy':
-      return installDeploy(project, endpoint, chalk);
+      return installDeploy(project, endpoint, chalk, environment);
     case 'switch':
       return installSwitch(project, endpoint, chalk);
     case 'config':
@@ -245,11 +251,16 @@ async function installProduct(
 
 // ── Deploy ────────────────────────────────────────────────────────────────────
 
-async function installDeploy(project: ProjectInfo, endpoint: string, chalk: any) {
+async function installDeploy(
+  project: ProjectInfo,
+  endpoint: string,
+  chalk: any,
+  environment: 'live' | 'test' = 'live',
+) {
   if (project.stack === 'react-native') {
     await installDeployRN(project, endpoint, chalk);
   } else if (project.stack === 'flutter') {
-    await installDeployFlutter(project, endpoint, chalk);
+    await installDeployFlutter(project, endpoint, chalk, environment);
   } else {
     console.log(chalk.yellow(`  ⚠ Deploy is not yet available for ${STACK_LABELS[project.stack]}`));
   }
@@ -312,7 +323,12 @@ async function installDeployRN(project: ProjectInfo, endpoint: string, chalk: an
        deploy.notifyAppReady();`));
 }
 
-async function installDeployFlutter(project: ProjectInfo, endpoint: string, chalk: any) {
+async function installDeployFlutter(
+  project: ProjectInfo,
+  endpoint: string,
+  chalk: any,
+  environment: 'live' | 'test' = 'live',
+) {
   const result = patchFlutterNativeFiles(project.root, endpoint, chalk);
   const pubspecPath = join(project.root, 'pubspec.yaml');
 
@@ -340,10 +356,40 @@ async function installDeployFlutter(project: ProjectInfo, endpoint: string, chal
   //    + a clear "run login to finish" next step (login backfills them).
   const projectId = readProjectId(project.root) ?? '';
   const globalCfg = loadGlobalConfig();
-  const apiKey =
-    globalCfg.runtimeApiKey && globalCfg.projectId === projectId
-      ? globalCfg.runtimeApiKey
-      : '';
+  // The key decides which ENVIRONMENT the device polls — the server resolves
+  // project AND environment from it (`api_key = ? OR test_api_key = ?`). So a
+  // `--env test` setup that ships the live key points the app at live while the
+  // CLI publishes to test, and every check comes back `no_matching_release`.
+  // Pick the key that matches the environment being set up.
+  const sameProject = globalCfg.projectId === projectId;
+  const wantsTest = environment === 'test';
+  let apiKey = '';
+  if (sameProject) {
+    apiKey = wantsTest
+      ? globalCfg.runtimeTestApiKey || ''
+      : globalCfg.runtimeApiKey || '';
+    if (wantsTest && !apiKey && globalCfg.runtimeApiKey) {
+      // Session predates test-key capture (or the project has none). Fall back
+      // rather than leave a placeholder, but say so — silently writing a live
+      // key here is the failure this comment exists to prevent.
+      apiKey = globalCfg.runtimeApiKey;
+      console.log(
+        chalk.yellow(
+          '     ⚠  No sk_test_ key in this session — wrote the live key to sankofa.yaml.',
+        ),
+      );
+      console.log(
+        chalk.dim(
+          '        The app will poll the LIVE environment. Re-run `sankofa login`,',
+        ),
+      );
+      console.log(
+        chalk.dim(
+          '        or paste the project\'s sk_test_ key into sankofa.yaml by hand.',
+        ),
+      );
+    }
+  }
   tryCreateSankofaYaml(project.root, projectId, apiKey, endpoint, chalk);
 
   // 5b. Stamp the engine pin into sankofa.yaml right away. The SDK reports
@@ -801,10 +847,15 @@ function readProjectId(projectRoot: string): string | undefined {
  * file the CLI warns and builds without the flag, and patches that touch those
  * members fail to resolve at transplant time on device.
  *
- * The default declares the app's OWN entry library. `baseUri.resolve()` passes
- * `package:` URIs through unchanged, and an unresolvable library is a HARD
- * build error (LibraryIndex throws) — so only a library we know exists goes in.
- * Customers extend the lists as their patchable surface grows.
+ * The surface is DISCOVERED, not assumed: we walk the app's import graph from
+ * every entrypoint and emit the libraries reachable from all of them. An
+ * unresolvable library is a HARD build error (LibraryIndex throws), so only
+ * libraries we can prove the build contains go in. Customers trim or extend
+ * the lists as their patchable surface changes.
+ *
+ * This replaced a hardcoded `package:<name>/main.dart`, which silently
+ * scaffolded a build-breaking file for every project without a `lib/main.dart`
+ * — flavored apps (per-flavor `main_<flavor>.dart`) above all.
  */
 function tryCreateDynamicInterfaceYaml(
   projectRoot: string,
@@ -812,10 +863,6 @@ function tryCreateDynamicInterfaceYaml(
   chalk: any,
 ): void {
   const path = join(projectRoot, 'sankofa_dynamic_interface.yaml');
-  if (existsSync(path)) {
-    console.log(chalk.dim('     ✓ sankofa_dynamic_interface.yaml already present'));
-    return;
-  }
   if (!packageName) {
     // No pubspec name → we cannot name a library that provably exists, and a
     // wrong entry fails the build. Better to skip than to scaffold a landmine.
@@ -824,33 +871,56 @@ function tryCreateDynamicInterfaceYaml(
     );
     return;
   }
-  const lib = `package:${packageName}/main.dart`;
-  const body =
-    `# Sankofa Deploy — your app's PATCHABLE SURFACE.\n` +
-    `#\n` +
-    `# Passed to the compiler as --dynamic-interface. It keeps the code an OTA\n` +
-    `# patch may call from being tree-shaken out of the release build, so a\n` +
-    `# patch can resolve those references on device.\n` +
-    `#\n` +
-    `# Entries are { library, class?, member? }; 'library' accepts a package:\n` +
-    `# URI. A library listed here that does not exist FAILS the build, so keep\n` +
-    `# this in sync with your code. Add the libraries you intend to patch.\n` +
-    `#\n` +
-    `#   callable:          may be CALLED from a patch\n` +
-    `#   extendable:        may be SUBCLASSED by a patch\n` +
-    `#   can-be-overridden: its methods may be OVERRIDDEN by a patch\n` +
-    `\n` +
-    `callable:\n` +
-    `  - library: '${lib}'\n` +
-    `\n` +
-    `extendable:\n` +
-    `  - library: '${lib}'\n` +
-    `\n` +
-    `can-be-overridden:\n` +
-    `  - library: '${lib}'\n`;
+
+  const scan = scanPatchableLibraries(projectRoot, packageName);
+
+  // An existing file is the customer's to own — never rewrite it. But a file
+  // naming a library the build can't resolve is a guaranteed failure, so say
+  // so precisely instead of reporting a cheerful "already present".
+  if (existsSync(path)) {
+    let stale: string[] = [];
+    try {
+      stale = findStaleInterfaceEntries(readFileSync(path, 'utf-8'), packageName, scan);
+    } catch { /* unreadable — leave it alone */ }
+    if (stale.length === 0) {
+      console.log(chalk.dim('     ✓ sankofa_dynamic_interface.yaml already present'));
+      return;
+    }
+    console.log(chalk.yellow('     ⚠ sankofa_dynamic_interface.yaml names librar(ies) your build does not contain:'));
+    for (const uri of stale) console.log(chalk.yellow(`         ${uri}`));
+    console.log(chalk.yellow('       The release build FAILS on these ("has not been indexed").'));
+    if (scan.libraries.length > 0) {
+      console.log(chalk.dim(`       Reachable from every entrypoint (${scan.entrypoints.map((e) => `lib/${e}`).join(', ')}):`));
+      for (const uri of scan.libraries.slice(0, 8)) console.log(chalk.dim(`         ${uri}`));
+      if (scan.libraries.length > 8) {
+        console.log(chalk.dim(`         … and ${scan.libraries.length - 8} more`));
+      }
+    }
+    console.log(chalk.dim('       Delete the file and re-run this command to regenerate it.'));
+    return;
+  }
+
+  if (scan.libraries.length === 0) {
+    // No entrypoint, or nothing provably in the component. Scaffolding a guess
+    // here is what caused the bug this function was rewritten to fix.
+    console.log(
+      chalk.yellow('     ⚠ Could not find an entrypoint to scan — skipped sankofa_dynamic_interface.yaml.'),
+    );
+    console.log(chalk.dim('       Create it by hand before `sankofa release`, or patches may fail to resolve.'));
+    return;
+  }
+
   try {
-    writeFileSync(path, body);
-    console.log(chalk.dim('     ✓ Created sankofa_dynamic_interface.yaml (patchable surface)'));
+    writeFileSync(path, renderDynamicInterfaceYaml(scan));
+    const entries = scan.entrypoints.map((e) => `lib/${e}`).join(', ');
+    console.log(
+      chalk.dim(`     ✓ Created sankofa_dynamic_interface.yaml — ${scan.libraries.length} librar${scan.libraries.length === 1 ? 'y' : 'ies'} from ${entries}`),
+    );
+    if (scan.flavorSpecific.length > 0) {
+      console.log(
+        chalk.dim(`       ${scan.flavorSpecific.length} flavor-specific librar(ies) listed as comments — see the file header.`),
+      );
+    }
   } catch (err: any) {
     console.log(chalk.yellow(`     ⚠ Could not write sankofa_dynamic_interface.yaml: ${err.message}`));
   }
@@ -921,6 +991,33 @@ function tryWireFlutterMainDart(projectRoot: string, chalk: any): boolean {
     // exactly what to add. (This is REQUIRED — Deploy can't apply patches
     // without the wiring.)
     const entry = findFlutterStartupFile(projectRoot);
+    // Check the DETECTED startup file for existing wiring before nagging.
+    // The lib/main.dart path below has always done this; this branch didn't,
+    // so every flavored project was told on every run to add wiring it
+    // already had.
+    if (entry) {
+      let src = '';
+      try {
+        src = readFileSync(entry, 'utf-8');
+      } catch { /* unreadable — fall through to the manual snippet */ }
+      const hasPreFlight = src.includes('SankofaUpdater.preFlight');
+      const hasLoader = src.includes('SankofaUpdater.registerLoader');
+      const where = relative(projectRoot, entry);
+      if (hasPreFlight && hasLoader) {
+        console.log(chalk.dim(`     ✓ ${where} already wires SankofaUpdater (registerLoader + preFlight)`));
+        return false;
+      }
+      if (hasPreFlight || hasLoader) {
+        // Half-wired is worse than unwired: preFlight without a registered
+        // loader can't apply a patch, and a loader that is never pre-flighted
+        // never fetches one. Name the missing half instead of dumping the
+        // whole snippet as if nothing were there.
+        const missing = hasPreFlight ? 'SankofaUpdater.registerLoader(loadModuleFromBytes);' : 'await SankofaUpdater.preFlight();';
+        console.log(chalk.yellow(`     ⚠ ${where} is only half-wired — add the missing call:`));
+        console.log(chalk.dim(`         ${missing}`));
+        return false;
+      }
+    }
     printManualMainSnippet(chalk, entry ? relative(projectRoot, entry) : null);
     return false;
   }

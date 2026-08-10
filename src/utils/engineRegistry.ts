@@ -128,6 +128,11 @@ export function resolveEngineDownloadURL(engine: KnownEngine): string {
   // bucket and the 15-minute expiry racing a slow download.
   const cdn = cdnEngineDownloadURL(engine);
   if (cdn) return cdn;
+  return serverEngineDownloadURL(engine);
+}
+
+/** The registry-provided URL: absolute signed URL, or a dev-server path. */
+export function serverEngineDownloadURL(engine: KnownEngine): string {
   if (/^https?:\/\//i.test(engine.download_url)) {
     return engine.download_url;
   }
@@ -136,17 +141,68 @@ export function resolveEngineDownloadURL(engine: KnownEngine): string {
 }
 
 /**
- * Compose the download.sankofa.dev URL for an engine binary from its
- * `source_commit`. Returns null when the rev is missing/malformed (legacy
- * rows) — callers fall back to the server-provided download_url.
+ * Every URL worth trying for an engine, best first.
+ *
+ * One URL is not enough. The CDN key is composed client-side and can only
+ * be as right as the rev; the server-signed URL is presigned WITHOUT any
+ * existence check, so the server will happily hand out a signature for an
+ * object that was never uploaded (or was uploaded under a different
+ * prefix). Either can be the broken one, so try both before giving up —
+ * a download failure should mean "the bytes are nowhere", not "the first
+ * URL we picked was the bad one".
+ */
+export function engineDownloadCandidates(engine: KnownEngine): string[] {
+  const urls: string[] = [];
+  const push = (u: string | null) => {
+    if (u && !urls.includes(u)) urls.push(u);
+  };
+  push(cdnEngineDownloadURL(engine));
+  try {
+    push(serverEngineDownloadURL(engine));
+  } catch {
+    // resolveAuth() throws when not logged in and the row carries a
+    // relative URL — the CDN candidate (if any) still stands on its own.
+  }
+  return urls;
+}
+
+/**
+ * Resolve the 40-char engine-fork rev for a registry row, which is what
+ * every CDN key is built from.
+ *
+ * Prefers the declared `source_commit`, but falls back to the rev embedded
+ * in the object key. That fallback is load-bearing: when `source_commit` is
+ * short the CDN path is skipped, and the only thing left is the server-signed
+ * URL — which is exactly the URL that has shipped mis-keyed. Recovering the
+ * rev here keeps the CDN path (the one we can compose correctly ourselves)
+ * available regardless of what the registry row declares.
+ */
+export function engineSourceRev(engine: KnownEngine): string | null {
+  const declared = (engine.source_commit || '').trim();
+  if (/^[0-9a-f]{40}$/i.test(declared)) return declared;
+
+  // Recover from the object key. Rows have shipped with `source_commit`
+  // truncated to 12 chars — the register endpoint never validated the
+  // width, and its own API docs used a 7-char example ("deadbee") — but
+  // the key itself always carries the full rev, under either the current
+  // `flutter_infra_release/flutter/<rev>/` layout or the older
+  // `flutter/<rev>/` one.
+  const m = /\/flutter\/([0-9a-f]{40})\//i.exec(engine.download_url || '');
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * Compose the download.sankofa.dev URL for an engine binary from its rev.
+ * Returns null only when no 40-char rev can be recovered at all — callers
+ * fall back to the server-provided download_url.
  *
  * Key layout must mirror what `upload-to-b2.sh` publishes:
  *   android  flutter_infra_release/flutter/<rev>/android-<slug>-<mode>/libflutter.so
  *   ios      flutter_infra_release/flutter/<rev>/<ios-dir>/Flutter.framework/Flutter
  */
 export function cdnEngineDownloadURL(engine: KnownEngine): string | null {
-  const rev = engine.source_commit;
-  if (!rev || !/^[0-9a-f]{40}$/i.test(rev)) return null;
+  const rev = engineSourceRev(engine);
+  if (!rev) return null;
   const base = `https://download.sankofa.dev/flutter_infra_release/flutter/${rev}`;
   if (engine.target === 'android') {
     const slug =

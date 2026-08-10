@@ -3,6 +3,43 @@
 All notable changes to `sankofa-cli`. This project uses semver (pre-1.0: minor
 bumps may include breaking changes).
 
+## 0.1.22 — Engine downloads survive a bad registry row
+
+A registry row for `3.44.1+sankofa-2` shipped with `source_commit` truncated to
+12 chars and an object key missing its `flutter_infra_release/` prefix. That
+combination made every Android engine undownloadable, and each layer that could
+have caught it instead hid it. These changes make the CLI resilient to the row
+being wrong, rather than relying on it being right.
+
+### Fixed
+- **Engine downloads no longer depend on a well-formed `source_commit`.** The CDN
+  URL is composed from the engine rev; when the declared rev was abbreviated the
+  CLI silently skipped the CDN and fell back to the server-signed URL — the one
+  that was mis-keyed. The rev is now recovered from the object key, which always
+  carries it in full.
+- **Downloads try every known source before failing.** The signed URL is presigned
+  without an existence check, so the server returns a valid signature for an
+  object that isn't there. CDN and signed URL are now both attempted, and a
+  failure reports each URL with its status instead of a bare `HTTP 404`.
+- **One bad ABI no longer aborts the batch.** `engine download` / `engine install`
+  exited on the first failure, so an Android-only outage looked total and hid the
+  fact that iOS was fine. They now continue, summarize, and exit non-zero.
+- **`engine install` no longer prints "✓ ready" over a partial install.** That
+  message is why a half-populated engine cache could go unnoticed until
+  `sankofa release`.
+- **`doctor`'s bundled-Flutter check actually runs.** It used `require()` in an
+  ESM build, so it threw `ReferenceError` on every run and reported it as a
+  benign "check skipped" — the check was structurally incapable of failing.
+
+### Added
+- **`engine register` validates its input.** An abbreviated `--source-commit` is
+  rejected outright, and an object key missing the `flutter_infra_release/`
+  prefix is repaired before the write. This is the path the bad rows came in
+  through.
+- **A test suite** — `npm test`, Node's built-in runner via `tsx`, no new
+  dependencies. 23 tests over the engine registry and cache, including download
+  failover in both directions and SHA-mismatch rejection.
+
 ## 0.1.21 — Windows fresh-machine onboarding (create + Android build)
 
 Certified end-to-end by the Windows pristine-rehearsal gate (fresh HOME, empty

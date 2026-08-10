@@ -18,6 +18,15 @@ export interface GlobalConfig {
    */
   runtimeApiKey?: string;
   /**
+   * The project's `sk_test_*` runtime key, captured alongside `runtimeApiKey`
+   * so `sankofa init --env test` can write the key that actually resolves to
+   * the test environment. The device derives BOTH project and environment from
+   * this one key (server: `api_key = ? OR test_api_key = ?`), so writing the
+   * live key into a test setup silently points the app at live and every check
+   * returns `no_matching_release`.
+   */
+  runtimeTestApiKey?: string;
+  /**
    * Long-lived session JWT from the browser login, persisted so `sankofa
    * switch` can list projects and mint a new Deploy Token without forcing
    * another browser round-trip. Cleared by `sankofa logout` (any scope that
@@ -36,6 +45,8 @@ export interface ProjectConfig {
   environment?: 'live' | 'test';
   /** Runtime publishable key for sankofa.yaml — see GlobalConfig.runtimeApiKey. */
   runtimeApiKey?: string;
+  /** Test-environment runtime key — see GlobalConfig.runtimeTestApiKey. */
+  runtimeTestApiKey?: string;
   /**
    * Product IDs the user explicitly installed via `sankofa init`. Doctor
    * uses this as ground truth — without it we can't reliably distinguish
