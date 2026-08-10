@@ -479,6 +479,50 @@ export function stampSigningPubkeyInYaml(projectRoot: string, pubkeyB64: string)
 }
 
 /**
+ * Read the product `flavor` pinned in `<projectRoot>/sankofa.yaml`, or null.
+ * This is the single source of truth for a project's flavor: the SDK's
+ * bootstrap reads it at runtime and the CLI stamps the release record from it,
+ * so the flavor the app REPORTS and the flavor the server SCOPES releases by
+ * cannot drift. Returns null when the yaml or the key is absent.
+ */
+export function readFlavorFromYaml(projectRoot: string): string | null {
+  const yamlPath = join(projectRoot, 'sankofa.yaml');
+  if (!existsSync(yamlPath)) return null;
+  try {
+    const m = readFileSync(yamlPath, 'utf-8').match(/^\s*flavor:\s*(.+?)\s*$/m);
+    const v = m?.[1]?.trim().replace(/^['"]|['"]$/g, '');
+    return v && v.length > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist the product `flavor` into `<projectRoot>/sankofa.yaml` (replace an
+ * existing key in place, else append). Called from `sankofa release --flavor`
+ * so the flavor is remembered for later patches AND picked up by the SDK at
+ * runtime — keeping runtime-reported flavor and release-record flavor in
+ * lockstep without depending on the build's SANKOFA_FLAVOR dart-define. No-op
+ * when the yaml doesn't exist or the flavor is empty.
+ */
+export function stampFlavorInYaml(projectRoot: string, flavor: string): boolean {
+  const yamlPath = join(projectRoot, 'sankofa.yaml');
+  if (!existsSync(yamlPath) || !flavor || !flavor.trim()) return false;
+  try {
+    const text = readFileSync(yamlPath, 'utf-8');
+    const line = `flavor: ${flavor.trim()}`;
+    const updated = /^\s*#?\s*flavor:.*$/m.test(text)
+      ? text.replace(/^\s*#?\s*flavor:.*$/m, line)
+      : `${text.replace(/\n*$/, '\n')}${line}\n`;
+    if (updated === text) return true;
+    writeFileSync(yamlPath, updated);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Download + verify + unpack the SDK tarball for `version` into `root`.
  * Returns a provenance string on success; throws when the manifest has
  * no sdk_url (pre-tarball release) or any download/verify step fails.

@@ -36,6 +36,7 @@ import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompt
 import { resolveProjectRoot, type ProjectInfo } from '../utils/stack.js';
 import { parseRollout } from '../utils/validation.js';
 import { buildFlutterAOT, buildFlutterIPA, detectFlutterAppVersion, detectFlutterEngineInfo, resolveFlutterPlatform, type BuildIpaResult } from '../utils/flutterBundler.js';
+import { readFlavorFromYaml, stampFlavorInYaml } from '../utils/flutterBundleCache.js';
 import { captureFlutterBaseline, type BaselineManifest } from '../utils/baseline.js';
 import { writeAutoDiffBase, autoDiffBaseSize } from '../utils/autodiffBase.js';
 import { captureBaseNoAotKernel } from '../utils/flutterAutoDiffCompile.js';
@@ -597,6 +598,21 @@ export async function flutterRelease(
     console.log('');
   }
 
+  // Flavor is the band a release (and its future patches) is scoped to.
+  // Persist an explicit --flavor into sankofa.yaml so (a) the SDK reports the
+  // same flavor at runtime — keeping the app's reported flavor and the release
+  // record in lockstep without depending on the build's SANKOFA_FLAVOR
+  // dart-define — and (b) later `sankofa patch` inherits it. The record flavor
+  // itself is resolved at the upload sites from --flavor OR that yaml pin.
+  if (opts.flavor) stampFlavorInYaml(project.root, opts.flavor);
+  if (!(opts.flavor || readFlavorFromYaml(project.root))) {
+    console.log('');
+    console.log(chalk.yellow('  ⚠  No flavor set — this release is a WILDCARD, served to every'));
+    console.log(chalk.yellow('     flavor\'s devices. Scope it with --flavor <name> (remembered in'));
+    console.log(chalk.dim('     sankofa.yaml for future patches and read by the SDK at runtime).'));
+    console.log('');
+  }
+
   // iOS takes the .ipa + KBC-baseline path; Android continues below.
   if (platform === 'ios') {
     return flutterReleaseIOS(project, opts, environment as string, rollout as number);
@@ -868,7 +884,7 @@ export async function flutterRelease(
       // Without this the row lands with flavor='' — which gating.go treats as
       // a WILDCARD, so a staging release is served to prod devices and vice
       // versa. --flavor was only reaching the build, never the release record.
-      flavor: opts.flavor,
+      flavor: opts.flavor || readFlavorFromYaml(project.root) || undefined,
       ...previewArtifact,
     });
     uploadSpinner.succeed('Release uploaded.');
@@ -1160,7 +1176,7 @@ async function flutterReleaseIOS(
       engine_version: engineVersion,
       // See the Android path — an omitted flavor is a server-side wildcard,
       // not a neutral default.
-      flavor: opts.flavor,
+      flavor: opts.flavor || readFlavorFromYaml(project.root) || undefined,
       ...previewArtifact,
     });
     uploadSpinner.succeed('Baseline registered.');
