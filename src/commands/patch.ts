@@ -15,6 +15,7 @@ import { listReleases, uploadRelease } from '../utils/api.js';
 import { requireAuth, findProjectConfig } from '../utils/config.js';
 import { resolveEnvironmentPrompt, resolvePlatformPrompt } from '../utils/prompts.js';
 import { resolveProjectRoot, type ProjectInfo } from '../utils/stack.js';
+import { readFlavorFromYaml } from '../utils/flutterBundleCache.js';
 import { escapeRegExp, parseRollout } from '../utils/validation.js';
 import { buildFlutterAOT, buildFlutterIPA, detectFlutterEngineInfo, resolveFlutterPlatform } from '../utils/flutterBundler.js';
 import { readBaselineManifest } from '../utils/baseline.js';
@@ -786,9 +787,10 @@ async function runFlutterPatch(
       engine_version: engineVersion,
       // A patch must land in the same flavor band as the baseline it targets,
       // otherwise gating.go's empty-flavor WILDCARD serves it to every flavor.
-      // Prefer the resolved base release's flavor over --flavor: the patch
-      // belongs to whatever band its base is in.
-      flavor: selectedRelease?.flavor || opts.flavor,
+      // Prefer the resolved base release's flavor, then --flavor, then the
+      // project's pinned sankofa.yaml flavor — so a patch is never accidentally
+      // published untagged (wildcard) on top of a flavored project.
+      flavor: selectedRelease?.flavor || opts.flavor || readFlavorFromYaml(project.root) || undefined,
     });
     uploadSpinner.succeed('Patch uploaded.');
     console.log('');
